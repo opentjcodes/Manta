@@ -44,7 +44,7 @@ impl DisplayListFrame {
         let mut commands = Vec::with_capacity(64);
         let mut cursor_y = 16.0f32;
         let horizontal_padding = 16.0f32;
-        let mut page_bg = 0xFF09090B; // Manta pure obsidian dark background
+        let mut page_bg = 0xFF09090B;
 
         if !dom.nodes().is_empty() {
             layout_node_recursive(
@@ -70,8 +70,7 @@ impl DisplayListFrame {
         }
     }
 
-    /// Serializes the frame into a compact, zero-JSON-overhead binary buffer for JNI transfer,
-    /// or a human-readable structured summary for inspection.
+    /// Serializes the frame into a compact wire format for instant JNI transfer.
     pub fn to_compact_wire_string(&self) -> String {
         let mut out = String::with_capacity(256 + self.commands.len() * 48);
         out.push_str(&format!(

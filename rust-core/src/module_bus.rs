@@ -59,6 +59,12 @@ pub struct ModuleBus {
     modules: Vec<Box<dyn MantaFeatureModule>>,
 }
 
+impl Default for ModuleBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModuleBus {
     pub fn new() -> Self {
         Self {

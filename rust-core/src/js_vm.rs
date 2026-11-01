@@ -44,7 +44,6 @@ pub struct MantaJsSandbox {
 impl MantaJsSandbox {
     pub fn new(max_fuel: u32) -> Self {
         let mut globals = HashMap::with_capacity(16);
-        // Built-in anti-detection & privacy environment constants
         globals.insert("navigator.webdriver".to_string(), JsValue::Bool(false));
         globals.insert("navigator.cookieEnabled".to_string(), JsValue::Bool(false));
         globals.insert(
@@ -102,7 +101,6 @@ impl MantaJsSandbox {
         dom: &mut ZeroCopyDomArena,
         clipboard: &mut ClipboardSandbox,
     ) -> Result<JsValue, &'static str> {
-        // 1. Variable declaration: `let x = ...` / `const x = ...` / `var x = ...`
         if let Some(rest) = stmt
             .strip_prefix("let ")
             .or_else(|| stmt.strip_prefix("const "))
@@ -117,7 +115,6 @@ impl MantaJsSandbox {
             }
         }
 
-        // 2. DOM mutation: `document.getElementById("...").textContent = "..."` or `querySelector`
         if (stmt.starts_with("document.getElementById(")
             || stmt.starts_with("document.querySelector("))
             && stmt.contains(".textContent")
@@ -142,7 +139,6 @@ impl MantaJsSandbox {
             }
         }
 
-        // 3. `document.title = "..."`
         if let Some(rhs) = stmt.strip_prefix("document.title") {
             let trimmed = rhs.trim();
             if let Some(val_expr) = trimmed.strip_prefix('=') {
@@ -152,7 +148,6 @@ impl MantaJsSandbox {
             }
         }
 
-        // 4. `navigator.clipboard.writeText("...")`
         if let Some(inner) = stmt
             .strip_prefix("navigator.clipboard.writeText(")
             .and_then(|s| s.strip_suffix(')'))
@@ -162,7 +157,6 @@ impl MantaJsSandbox {
             return Ok(JsValue::Undefined);
         }
 
-        // 5. `console.log(...)`
         if let Some(inner) = stmt
             .strip_prefix("console.log(")
             .and_then(|s| s.strip_suffix(')'))
@@ -200,7 +194,6 @@ impl MantaJsSandbox {
             return Ok(JsValue::Number(num));
         }
 
-        // Binary addition (numeric or string concatenation)
         if let Some(plus_idx) = e.find('+') {
             let left = self.eval_expr(&e[..plus_idx], dom)?;
             let right = self.eval_expr(&e[plus_idx + 1..], dom)?;
@@ -210,7 +203,6 @@ impl MantaJsSandbox {
             };
         }
 
-        // DOM text query: `document.getElementById("...").textContent`
         if let Some(rest) = e.strip_prefix("document.getElementById(") {
             if let Some(end_paren) = rest.find(')') {
                 let id = unquote(rest[..end_paren].trim());

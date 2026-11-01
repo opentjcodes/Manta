@@ -56,7 +56,7 @@ impl MantaEngine {
             vault: VolatileRamVault::new(vault_limit),
             tabs: TabManager::new(per_tab_limit),
             modules,
-            clipboard: ClipboardSandbox::new(64 * 1024), // 64 KB max clipboard buffer
+            clipboard: ClipboardSandbox::new(64 * 1024),
         }
     }
 
@@ -85,7 +85,14 @@ mod tests {
 
         let frame = engine
             .tabs
-            .load_stream_chunk(tab_id, "https://manta.local/test", html, true, &mut engine.modules, &mut engine.vault)
+            .load_stream_chunk(
+                tab_id,
+                "https://manta.local/test",
+                html,
+                true,
+                &mut engine.modules,
+                &mut engine.vault,
+            )
             .expect("stream load should succeed");
 
         assert!(!frame.commands.is_empty());

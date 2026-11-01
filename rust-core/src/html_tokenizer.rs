@@ -41,6 +41,12 @@ pub struct StreamingHtmlTokenizer {
     text_buf: String,
 }
 
+impl Default for StreamingHtmlTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingHtmlTokenizer {
     pub fn new() -> Self {
         Self {

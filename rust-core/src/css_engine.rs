@@ -36,6 +36,12 @@ pub struct MicroCssEngine {
     rules: Vec<CssRule>,
 }
 
+impl Default for MicroCssEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MicroCssEngine {
     pub fn new() -> Self {
         Self { rules: Vec::new() }
@@ -113,7 +119,7 @@ impl MicroCssEngine {
                 style.margin_vertical = 10.0;
             }
             "a" => {
-                style.text_color = 0xFF38BDF8; // Manta cyan accent
+                style.text_color = 0xFF38BDF8;
             }
             "button" => {
                 style.background_color = 0xFF1E293B;

@@ -88,7 +88,6 @@ impl TabManager {
         if !self.tabs.contains_key(&target_id) {
             return false;
         }
-        // Hibernate previous active tab to keep global RAM footprint minimal
         if let Some(prev_id) = self.active_tab_id {
             if prev_id != target_id {
                 if let Some(prev_tab) = self.tabs.get_mut(&prev_id) {
@@ -139,7 +138,6 @@ impl TabManager {
         let clean_url = PrivacyShieldModule::sanitize_url(url);
 
         if tab.current_url != clean_url {
-            // Navigating to a new page: wipe previous page's RAM immediately
             tab.dom.zeroize_and_clear();
             tab.dom = ZeroCopyDomArena::new(self.per_tab_ram_ceiling);
             tab.css.clear();

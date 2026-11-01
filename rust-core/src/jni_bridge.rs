@@ -5,11 +5,13 @@ use crate::MantaEngine;
 
 // =============================================================================
 // ZERO-DEPENDENCY RAW JNI C-ABI DEFINITIONS
-// Eliminates the external `jni` crate for ultra-fast builds and tiny `.so` size.
+// Matches the exact `const struct JNINativeInterface_ **` ABI from `jni.h`.
+// Index 167 = NewStringUTF, 168 = GetStringUTFLength,
+// Index 169 = GetStringUTFChars, 170 = ReleaseStringUTFChars.
 // =============================================================================
 #[repr(transparent)]
 #[derive(Copy, Clone)]
-pub struct JNIEnv(*const JNINativeInterface);
+pub struct JNIEnv(pub *const *const JNINativeInterface);
 
 pub type JObject = *mut c_void;
 pub type JClass = *mut c_void;
@@ -18,20 +20,26 @@ pub type JBoolean = u8;
 pub type JInt = i32;
 
 #[repr(C)]
+#[allow(dead_code)]
 pub struct JNINativeInterface {
-    reserved: [*const c_void; 165],
-    new_string_utf: unsafe extern "system" fn(JNIEnv, *const c_char) -> JString,
-    get_string_utf_length: unsafe extern "system" fn(JNIEnv, JString) -> JInt,
-    get_string_utf_chars: unsafe extern "system" fn(JNIEnv, JString, *mut JBoolean) -> *const c_char,
-    release_string_utf_chars: unsafe extern "system" fn(JNIEnv, JString, *const c_char),
+    pub reserved: [*const c_void; 167],
+    pub new_string_utf: unsafe extern "system" fn(JNIEnv, *const c_char) -> JString,
+    pub get_string_utf_length: unsafe extern "system" fn(JNIEnv, JString) -> JInt,
+    pub get_string_utf_chars:
+        unsafe extern "system" fn(JNIEnv, JString, *mut JBoolean) -> *const c_char,
+    pub release_string_utf_chars: unsafe extern "system" fn(JNIEnv, JString, *const c_char),
 }
 
 impl JNIEnv {
-    unsafe fn get_rust_string(self, jstr: JString) -> String {
+    pub unsafe fn get_rust_string(self, jstr: JString) -> String {
         if jstr.is_null() || self.0.is_null() {
             return String::new();
         }
-        let table = unsafe { &*(*self.0) };
+        let table_ptr = unsafe { *self.0 };
+        if table_ptr.is_null() {
+            return String::new();
+        }
+        let table = unsafe { &*table_ptr };
         let mut is_copy: JBoolean = 0;
         let ptr = unsafe { (table.get_string_utf_chars)(self, jstr, &mut is_copy) };
         if ptr.is_null() {
@@ -42,11 +50,15 @@ impl JNIEnv {
         rust_str
     }
 
-    unsafe fn new_java_string(self, text: &str) -> JString {
+    pub unsafe fn new_java_string(self, text: &str) -> JString {
         if self.0.is_null() {
             return ptr::null_mut();
         }
-        let table = unsafe { &*(*self.0) };
+        let table_ptr = unsafe { *self.0 };
+        if table_ptr.is_null() {
+            return ptr::null_mut();
+        }
+        let table = unsafe { &*table_ptr };
         let sanitized = text.replace('\0', "");
         match CString::new(sanitized) {
             Ok(cstr) => unsafe { (table.new_string_utf)(self, cstr.as_ptr()) },
@@ -146,4 +158,74 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_getEngineR
 ) -> JInt {
     let engine = MantaEngine::global().lock().unwrap();
     (engine.tabs.total_allocated_bytes() + engine.vault.used_bytes()) as JInt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "system" fn mock_new_string_utf(_env: JNIEnv, utf: *const c_char) -> JString {
+        if utf.is_null() {
+            return ptr::null_mut();
+        }
+        let s = unsafe { CStr::from_ptr(utf).to_owned() };
+        s.into_raw() as JString
+    }
+
+    unsafe extern "system" fn mock_get_string_utf_len(_env: JNIEnv, jstr: JString) -> JInt {
+        if jstr.is_null() {
+            return 0;
+        }
+        let cstr = unsafe { CStr::from_ptr(jstr as *const c_char) };
+        cstr.to_bytes().len() as JInt
+    }
+
+    unsafe extern "system" fn mock_get_string_utf_chars(
+        _env: JNIEnv,
+        jstr: JString,
+        is_copy: *mut JBoolean,
+    ) -> *const c_char {
+        if !is_copy.is_null() {
+            unsafe { *is_copy = 0 };
+        }
+        jstr as *const c_char
+    }
+
+    unsafe extern "system" fn mock_release_string_utf_chars(
+        _env: JNIEnv,
+        _jstr: JString,
+        _chars: *const c_char,
+    ) {
+    }
+
+    #[test]
+    fn test_jni_bridge_roundtrip_and_zeroize() {
+        let table = JNINativeInterface {
+            reserved: [ptr::null(); 167],
+            new_string_utf: mock_new_string_utf,
+            get_string_utf_length: mock_get_string_utf_len,
+            get_string_utf_chars: mock_get_string_utf_chars,
+            release_string_utf_chars: mock_release_string_utf_chars,
+        };
+        let table_ptr: *const JNINativeInterface = &table;
+        let env = JNIEnv(&table_ptr);
+
+        unsafe {
+            let tab_id = Java_app_manta_browser_core_MantaNative_initEngine(env, ptr::null_mut(), 1);
+            assert!(tab_id >= 1);
+
+            let url_c = CString::new("https://example.com/?utm_source=ads&ok=1").unwrap();
+            let clean_jstr = Java_app_manta_browser_core_MantaNative_sanitizeAndCheckUrl(
+                env,
+                ptr::null_mut(),
+                url_c.as_ptr() as JString,
+            );
+            let clean_owned = CString::from_raw(clean_jstr as *mut c_char);
+            assert_eq!(clean_owned.to_str().unwrap(), "https://example.com/?ok=1");
+
+            Java_app_manta_browser_core_MantaNative_purgeAllVolatileRam(env, ptr::null_mut());
+            let ram = Java_app_manta_browser_core_MantaNative_getEngineRamBytes(env, ptr::null_mut());
+            assert_eq!(ram, 0);
+        }
+    }
 }

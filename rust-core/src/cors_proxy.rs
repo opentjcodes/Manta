@@ -31,8 +31,6 @@ impl MantaFeatureModule for CorsDeveloperModule {
     }
 
     fn on_before_request(&self, req: &mut InterceptedRequest) -> ModuleDecision {
-        // If a web app under test sends an OPTIONS preflight request, synthesize an instant
-        // 0ms 204 No Content permissive response so preflights never fail or add latency.
         if req.method.eq_ignore_ascii_case("OPTIONS") || req.is_cors_preflight {
             let mut headers = HashMap::new();
             let origin = req
@@ -88,7 +86,6 @@ impl MantaFeatureModule for CorsDeveloperModule {
             "true".to_string(),
         );
 
-        // Remove restrictive framing headers during local/dev site testing
         res.headers.remove("X-Frame-Options");
         res.headers.remove("x-frame-options");
         res.headers.remove("Cross-Origin-Resource-Policy");

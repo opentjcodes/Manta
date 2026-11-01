@@ -145,7 +145,6 @@ impl MantaFeatureModule for PrivacyShieldModule {
         req.headers.insert("DNT".to_string(), "1".to_string());
         req.headers.insert("Sec-GPC".to_string(), "1".to_string());
 
-        // Standardized clean User-Agent that prevents bot-detection blocks while revealing zero device entropy
         req.headers.entry("User-Agent".to_string()).or_insert_with(|| {
             "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36".to_string()
         });
@@ -166,15 +165,13 @@ impl MantaFeatureModule for PrivacyShieldModule {
         if !self.block_fingerprinting {
             return true;
         }
-        // Block known aggressive fingerprinting & bot-probing payloads immediately
         let lower = script_source.to_ascii_lowercase();
         if lower.contains("fingerprintjs")
-            || lower.contains("canvas.todataurl") && lower.contains("audiocontext")
+            || (lower.contains("canvas.todataurl") && lower.contains("audiocontext"))
         {
             return false;
         }
 
-        // Neutralize inline webdriver / automation detection checks
         if script_source.contains("navigator.webdriver") {
             *script_source = script_source.replace("navigator.webdriver", "false");
         }

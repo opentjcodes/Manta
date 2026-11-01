@@ -91,7 +91,6 @@ impl VolatileRamVault {
     /// entries first. Never touches disk.
     pub fn put_ephemeral(&mut self, tab_id: u32, key: &str, payload: &[u8]) -> bool {
         if payload.len() > self.max_bytes / 2 {
-            // Refuse oversized blobs to keep RAM flat.
             return false;
         }
 

@@ -113,7 +113,6 @@ impl ZeroCopyDomArena {
                 }
             }
             HtmlToken::EndTag { name } => {
-                // Pop back to matching open tag
                 if let Some(pos) = self.open_stack.iter().rposition(|&nid| {
                     matches!(
                         &self.nodes[nid as usize].kind,
