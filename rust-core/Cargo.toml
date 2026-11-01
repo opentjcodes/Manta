@@ -1,0 +1,13 @@
+[package]
+name = "manta-core"
+version = "0.1.0"
+edition = "2021"
+description = "Manta Browser Core: Zero-persistence, streaming-first, ultra-low-RAM Rust browser engine"
+license = "MIT"
+
+[lib]
+name = "manta_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Zero external crates by design: 100% pure Rust std + raw C-ABI JNI for sub-200KB binary size and zero supply-chain telemetry.

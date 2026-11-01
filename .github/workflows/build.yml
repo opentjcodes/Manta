@@ -1,0 +1,62 @@
+name: Build Manta Rust Core & Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-manta:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Manta Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Rust Stable & Android Targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Run Manta Rust Core Unit Tests
+        run: cargo test --manifest-path Cargo.toml --verbose
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Compile Rust Core (libmanta_core.so) for Android ABIs
+        run: |
+          cargo ndk \
+            -t arm64-v8a \
+            -t x86_64 \
+            -o app/src/main/jniLibs \
+            build --release --manifest-path Cargo.toml
+
+      - name: Inspect Compiled Rust Engine Binary Size
+        run: ls -lh app/src/main/jniLibs/arm64-v8a/libmanta_core.so
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build R8-Minified Release & Debug APKs
+        run: gradle assembleRelease assembleDebug --no-daemon
+
+      - name: Upload Manta Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manta-Release-APK
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: Upload Manta Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manta-Debug-APK
+          path: app/build/outputs/apk/debug/*.apk
