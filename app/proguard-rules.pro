@@ -1,11 +1,11 @@
 # ==============================================================================
-# MANTA BROWSER — SAFE R8 OPTIMIZATION & JNI PRESERVATION RULES
+# MANTA BROWSER — SAFE R8 OPTIMIZATION & JNI / JS-BRIDGE PRESERVATION RULES
 # ==============================================================================
 -optimizationpasses 5
 -dontusemixedcaseclassnames
 -dontskipnonpubliclibraryclasses
 -dontpreverify
--keepattributes *Annotation*,InnerClasses,EnclosingMethod,Signature
+-keepattributes *Annotation*,JavascriptInterface,InnerClasses,EnclosingMethod,Signature
 
 # Strip debug logging in release builds
 -assumenosideeffects class android.util.Log {
@@ -21,6 +21,15 @@
 
 -keepclasseswithmembernames class * {
     native <methods>;
+}
+
+# Preserve @JavascriptInterface methods on MantaJsBridge for Rust runtime script calls
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+
+-keep class app.manta.browser.ui.render.EphemeralWebSandbox$MantaJsBridge {
+    *;
 }
 
 # Preserve Activity and custom Views

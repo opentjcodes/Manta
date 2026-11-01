@@ -8,6 +8,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Toast
 import app.manta.browser.core.MantaNative
+import app.manta.browser.core.ZeroDiskJanitor
 import app.manta.browser.ui.components.MiniStatusPill
 import app.manta.browser.ui.components.SlidingBottomDock
 import app.manta.browser.ui.screens.EphemeralTabInfo
@@ -21,7 +22,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * Manta Main Activity:
  * Hosts the 3 workspace screens (Home | Search | Library), the floating Muse-style
  * `MiniStatusPill`, and the draggable/slidable `SlidingBottomDock`.
- * Automatically zeroizes all volatile RAM in Rust when the user closes the app.
+ * Automatically wipes all volatile RAM in Rust AND any transient WebView cache on exit.
  */
 class MainActivity : Activity() {
 
@@ -45,8 +46,8 @@ class MainActivity : Activity() {
         openTabs.add(
             EphemeralTabInfo(
                 id = activeTabId,
-                title = "Manta Rust Core",
-                url = "manta://benchmark"
+                title = "Manta Browser",
+                url = "https://duckduckgo.com"
             )
         )
 
@@ -72,9 +73,9 @@ class MainActivity : Activity() {
         // 2. Initialize the 3 Dock Screens
         val home = HomeScreen(
             context = this,
-            onLaunchUrl = { url, preferRustStream ->
+            onLaunchUrl = { url, preferRustReader ->
                 switchDockSection(1, animateDock = true)
-                searchScreen?.loadInputUrlOrQuery(url, preferRustStream)
+                searchScreen?.loadInputUrlOrQuery(url, preferRustReader)
             },
             onToggleCorsDev = { enabled ->
                 corsDevPermissive = enabled
@@ -121,8 +122,8 @@ class MainActivity : Activity() {
             onCreateNewTab = {
                 val newId = MantaNative.createNewTab()
                 activeTabId = newId
-                openTabs.add(EphemeralTabInfo(newId, "New Manta Tab", "manta://benchmark"))
-                search.loadInputUrlOrQuery("manta://benchmark", true)
+                openTabs.add(EphemeralTabInfo(newId, "New Manta Tab", "https://duckduckgo.com"))
+                search.loadInputUrlOrQuery("https://duckduckgo.com", false)
                 switchDockSection(1, animateDock = true)
             },
             onCloseTab = { tabId ->
@@ -130,7 +131,7 @@ class MainActivity : Activity() {
                 openTabs.removeAll { it.id == tabId }
                 if (openTabs.isEmpty()) {
                     val freshId = MantaNative.createNewTab()
-                    openTabs.add(EphemeralTabInfo(freshId, "Manta Rust Core", "manta://benchmark"))
+                    openTabs.add(EphemeralTabInfo(freshId, "Manta Browser", "https://duckduckgo.com"))
                 }
                 activeTabId = openTabs.last().id
                 MantaNative.switchTab(activeTabId)
@@ -181,7 +182,6 @@ class MainActivity : Activity() {
         rootContainer.addView(bottomFloatingStack)
         setContentView(rootContainer)
 
-        // 3. Now that all views are attached, boot the initial Rust stream page
         search.bootInitialPage()
         switchDockSection(0, animateDock = false)
         refreshStatusPill()
@@ -206,7 +206,7 @@ class MainActivity : Activity() {
         val activeTab = openTabs.find { it.id == activeTabId }
         val ramBytes = MantaNative.getEngineRamBytes()
         miniStatusPill?.updateStatus(
-            title = activeTab?.title ?: "Manta Rust Core",
+            title = activeTab?.title ?: "Manta Browser",
             ramBytes = ramBytes,
             corsEnabled = corsDevPermissive,
             tabCount = openTabs.size
@@ -214,8 +214,8 @@ class MainActivity : Activity() {
     }
 
     private fun performInstantZeroizePurge() {
-        MantaNative.purgeAllVolatileRam()
         searchScreen?.wipeSandboxMemory()
+        ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
         openTabs.clear()
         shieldLogs.clear()
 
@@ -225,7 +225,7 @@ class MainActivity : Activity() {
         refreshStatusPill()
         Toast.makeText(
             this,
-            "All Volatile RAM & Ephemeral Tabs Zeroized (0 KB)",
+            "All Volatile RAM & Disk Cache Zeroized (0 B)",
             Toast.LENGTH_SHORT
         ).show()
     }
@@ -239,19 +239,19 @@ class MainActivity : Activity() {
             switchDockSection(0, animateDock = true)
             return
         }
-        MantaNative.purgeAllVolatileRam()
+        ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
         super.onBackPressed()
     }
 
     override fun onStop() {
         super.onStop()
         if (isFinishing) {
-            MantaNative.purgeAllVolatileRam()
+            ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
         }
     }
 
     override fun onDestroy() {
-        MantaNative.purgeAllVolatileRam()
+        ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
         super.onDestroy()
     }
 }

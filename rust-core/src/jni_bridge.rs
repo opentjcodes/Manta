@@ -1,6 +1,7 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
+use crate::page_compiler::PageRuntimeCompiler;
 use crate::MantaEngine;
 
 // =============================================================================
@@ -129,6 +130,54 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetC
         engine.config.dev_cors_permissive = active;
         engine.modules.set_module_enabled("cors_dev", active);
     }
+}
+
+/// Returns the Rust-compiled Anti-Detection, Cosmetic Ad-Zapper, Volatile Cookie, and CORS script.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetRuntimeScript(
+    env: JNIEnv,
+    _class: JClass,
+    cors_dev_enabled: JBoolean,
+) -> JString {
+    let script = PageRuntimeCompiler::compile_runtime_script(cors_dev_enabled != 0);
+    unsafe { env.new_java_string(&script) }
+}
+
+/// Stores an ephemeral cookie inside Rust's `VolatileRamVault` (never touches disk).
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetVolatileCookie(
+    env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+    j_host: JString,
+    j_cookie: JString,
+) {
+    let host = unsafe { env.get_rust_string(j_host) };
+    let cookie = unsafe { env.get_rust_string(j_cookie) };
+    if let Ok(mut engine) = MantaEngine::global().lock() {
+        PageRuntimeCompiler::store_volatile_cookie(
+            &mut engine.vault,
+            tab_id as u32,
+            &host,
+            &cookie,
+        );
+    }
+}
+
+/// Reads ephemeral cookies for a host from Rust's `VolatileRamVault`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetVolatileCookie(
+    env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+    j_host: JString,
+) -> JString {
+    let host = unsafe { env.get_rust_string(j_host) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    let val = PageRuntimeCompiler::read_volatile_cookie(&engine.vault, tab_id as u32, &host);
+    unsafe { env.new_java_string(&val) }
 }
 
 /// Streams a chunk of HTML/data into a tab and returns the serialized `MANTA_FRAME` DisplayList.

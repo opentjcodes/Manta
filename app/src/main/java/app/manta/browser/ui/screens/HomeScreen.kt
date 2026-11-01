@@ -19,14 +19,13 @@ data class QuickLaunchSite(
 
 /**
  * Muse-Inspired Home Screen:
- * - Bold `MANTA` brand bar + top-right developer controls icon
- * - Horizontal scrollable filter pills (like `All Curated`, `Malayalam`, `Hindi` in Muse)
- * - Featured Collections & Dev Sandboxes (large gradient/accent rounded cards with Play/Launch badge)
- * - Speed Dial & Privacy Verification cards
+ * - Bold `MANTA` brand bar + top-right developer CORS toggle
+ * - Horizontal scrollable filter pills
+ * - Featured Workspaces & Full-Fidelity Speed Dial cards
  */
 class HomeScreen(
     context: Context,
-    private val onLaunchUrl: (url: String, preferRustStream: Boolean) -> Unit,
+    private val onLaunchUrl: (url: String, preferRustReader: Boolean) -> Unit,
     private val onToggleCorsDev: (Boolean) -> Unit,
     private val onTriggerZeroize: () -> Unit
 ) : ScrollView(context) {
@@ -101,7 +100,7 @@ class HomeScreen(
         }
         val categories = listOf(
             "All Curated",
-            "Rust Stream",
+            "Full Engine",
             "CORS Dev Test",
             "Zero-Cookie Shield",
             "Instant Wipe"
@@ -136,7 +135,7 @@ class HomeScreen(
         selectCategoryChip(0)
 
         // 3. Section: FEATURED ENGINE WORKSPACES
-        root.addView(makeOverline(context, "RUST NATIVE ENGINE"))
+        root.addView(makeOverline(context, "RUST-ACCELERATED FULL ENGINE"))
         root.addView(makeSectionTitle(context, "Developer & Zero-Trace Workspaces"))
 
         val featuredScroll = HorizontalScrollView(context).apply {
@@ -155,21 +154,21 @@ class HomeScreen(
 
         val featuredCards = listOf(
             QuickLaunchSite(
-                title = "Manta Rust Benchmark",
-                subtitle = "12 KB RAM • Direct Rust DOM",
-                url = "manta://benchmark",
+                title = "DuckDuckGo Search",
+                subtitle = "Full UI • Rust Shield Active",
+                url = "https://duckduckgo.com",
                 accentColor = 0xFF1E3A2F.toInt(),
-                badge = "RUST"
+                badge = "SEARCH"
             ),
             QuickLaunchSite(
-                title = "CORS API Sandbox",
-                subtitle = "Preflight 204 • Open Headers",
+                title = "CORS & Bot Shield Lab",
+                subtitle = "Verify Webdriver=false & CORS",
                 url = "manta://cors-lab",
                 accentColor = 0xFF2E1F47.toInt(),
                 badge = "CORS"
             ),
             QuickLaunchSite(
-                title = "Localhost Dev Runner",
+                title = "Localhost Dev Server",
                 subtitle = "http://localhost:3000",
                 url = "http://localhost:3000",
                 accentColor = 0xFF172554.toInt(),
@@ -183,42 +182,49 @@ class HomeScreen(
         featuredScroll.addView(featuredRow)
         root.addView(featuredScroll)
 
-        // 4. Section: SPEED DIAL & WEB LAUNCHPAD
-        root.addView(makeSectionTitle(context, "Fast Stream Launchpad"))
-        root.addView(makeSubtitleText(context, "Zero cookies saved • Automatic RAM wipe on close"))
+        // 4. Section: SPEED DIAL & WEB LAUNCHPAD (Opens in Full Chrome-Grade Engine with Rust Shield)
+        root.addView(makeSectionTitle(context, "Full-Fidelity Web Launchpad"))
+        root.addView(makeSubtitleText(context, "Full CSS/JS rendering • Ad/Tracker Shield • Zero disk cache"))
 
         val speedDialSites = listOf(
             QuickLaunchSite(
-                title = "DuckDuckGo Lite",
-                subtitle = "Zero-tracking instant web search",
-                url = "https://lite.duckduckgo.com/lite/",
+                title = "Google Search",
+                subtitle = "google.com • Full mobile layout with trackers stripped",
+                url = "https://www.google.com",
                 accentColor = 0xFF1E293B.toInt(),
-                badge = "SEARCH"
+                badge = "WEB"
+            ),
+            QuickLaunchSite(
+                title = "GitHub",
+                subtitle = "github.com • Full interactive repositories & code",
+                url = "https://github.com",
+                accentColor = 0xFF18181B.toInt(),
+                badge = "CODE"
+            ),
+            QuickLaunchSite(
+                title = "YouTube Mobile",
+                subtitle = "m.youtube.com • Ad-shielded video & media test",
+                url = "https://m.youtube.com",
+                accentColor = 0xFF3B1219.toInt(),
+                badge = "MEDIA"
             ),
             QuickLaunchSite(
                 title = "Hacker News",
-                subtitle = "news.ycombinator.com • Ultra-fast load",
+                subtitle = "news.ycombinator.com • Instant zero-bloat load",
                 url = "https://news.ycombinator.com",
                 accentColor = 0xFF27272A.toInt(),
                 badge = "TECH"
             ),
             QuickLaunchSite(
                 title = "MDN Web Docs",
-                subtitle = "developer.mozilla.org • Web API reference",
+                subtitle = "developer.mozilla.org • Full CSS/JS documentation",
                 url = "https://developer.mozilla.org/en-US/",
                 accentColor = 0xFF1E1B4B.toInt(),
                 badge = "DOCS"
             ),
             QuickLaunchSite(
-                title = "GitHub Mobile",
-                subtitle = "github.com • Repositories & Actions",
-                url = "https://github.com",
-                accentColor = 0xFF18181B.toInt(),
-                badge = "CODE"
-            ),
-            QuickLaunchSite(
-                title = "HTTPBin Inspector",
-                subtitle = "httpbin.org/headers • Verify zero-cookie headers",
+                title = "HTTPBin Headers Inspector",
+                subtitle = "httpbin.org/headers • Verify DNT, Sec-GPC & Zero Cookies",
                 url = "https://httpbin.org/headers",
                 accentColor = 0xFF0F2922.toInt(),
                 badge = "TEST"
@@ -395,6 +401,7 @@ class HomeScreen(
                 bottomMargin = MantaTheme.dp(context, 10f)
             }
             setOnClickListener {
+                // Launch all real websites in Full Chrome-Grade Engine (`preferRustReader = false`)
                 onLaunchUrl(site.url, false)
             }
 

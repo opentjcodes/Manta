@@ -30,6 +30,15 @@ object MantaNative {
     private external fun nativeSetCorsDevMode(enabled: Boolean)
 
     @JvmStatic
+    private external fun nativeGetRuntimeScript(corsDevEnabled: Boolean): String
+
+    @JvmStatic
+    private external fun nativeSetVolatileCookie(tabId: Int, host: String, cookie: String)
+
+    @JvmStatic
+    private external fun nativeGetVolatileCookie(tabId: Int, host: String): String
+
+    @JvmStatic
     private external fun nativeStreamHtmlChunk(
         tabId: Int,
         url: String,
@@ -92,6 +101,35 @@ object MantaNative {
             } catch (_: Throwable) {
             }
         }
+    }
+
+    fun getRuntimeScript(corsDevEnabled: Boolean): String {
+        return if (isLoaded) {
+            try {
+                nativeGetRuntimeScript(corsDevEnabled)
+            } catch (_: Throwable) {
+                ""
+            }
+        } else ""
+    }
+
+    fun setVolatileCookie(tabId: Int, host: String, cookie: String) {
+        if (isLoaded) {
+            try {
+                nativeSetVolatileCookie(tabId, host, cookie)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun getVolatileCookie(tabId: Int, host: String): String {
+        return if (isLoaded) {
+            try {
+                nativeGetVolatileCookie(tabId, host)
+            } catch (_: Throwable) {
+                ""
+            }
+        } else ""
     }
 
     fun streamHtmlChunk(tabId: Int, url: String, htmlChunk: String, isEof: Boolean): String {

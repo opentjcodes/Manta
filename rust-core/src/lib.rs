@@ -10,6 +10,7 @@ pub mod jni_bridge;
 pub mod js_vm;
 pub mod module_bus;
 pub mod net_stream;
+pub mod page_compiler;
 pub mod ram_vault;
 pub mod render_list;
 pub mod shield;
