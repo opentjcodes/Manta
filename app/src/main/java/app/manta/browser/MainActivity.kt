@@ -15,6 +15,7 @@ import app.manta.browser.ui.screens.HomeScreen
 import app.manta.browser.ui.screens.LibraryTabsScreen
 import app.manta.browser.ui.screens.SearchBrowserScreen
 import app.manta.browser.ui.theme.MantaTheme
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Manta Main Activity:
@@ -24,17 +25,17 @@ import app.manta.browser.ui.theme.MantaTheme
  */
 class MainActivity : Activity() {
 
-    private val openTabs = mutableListOf<EphemeralTabInfo>()
-    private val shieldLogs = mutableListOf<String>()
+    private val openTabs = CopyOnWriteArrayList<EphemeralTabInfo>()
+    private val shieldLogs = CopyOnWriteArrayList<String>()
     private var activeTabId: Int = 1
     private var corsDevPermissive: Boolean = true
     private var currentDockSection: Int = 0
 
-    private lateinit var homeScreen: HomeScreen
-    private lateinit var searchScreen: SearchBrowserScreen
-    private lateinit var libraryScreen: LibraryTabsScreen
-    private lateinit var miniStatusPill: MiniStatusPill
-    private lateinit var bottomDock: SlidingBottomDock
+    private var homeScreen: HomeScreen? = null
+    private var searchScreen: SearchBrowserScreen? = null
+    private var libraryScreen: LibraryTabsScreen? = null
+    private var miniStatusPill: MiniStatusPill? = null
+    private var bottomDock: SlidingBottomDock? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,12 +54,27 @@ class MainActivity : Activity() {
             setBackgroundColor(MantaTheme.BG_OBSIDIAN)
         }
 
-        // 1. Initialize the 3 Dock Screens
-        homeScreen = HomeScreen(
+        // 1. Construct Bottom Floating Stack first so `miniStatusPill` and `bottomDock`
+        // are always non-null before any screen callbacks fire.
+        val pill = MiniStatusPill(
+            context = this,
+            onOpenActivePage = { switchDockSection(1, animateDock = true) },
+            onReloadPage = { searchScreen?.reloadCurrentPage() },
+            onZeroizeRam = { performInstantZeroizePurge() }
+        )
+        miniStatusPill = pill
+
+        val dock = SlidingBottomDock(this) { sectionIndex ->
+            switchDockSection(sectionIndex, animateDock = false)
+        }
+        bottomDock = dock
+
+        // 2. Initialize the 3 Dock Screens
+        val home = HomeScreen(
             context = this,
             onLaunchUrl = { url, preferRustStream ->
                 switchDockSection(1, animateDock = true)
-                searchScreen.loadInputUrlOrQuery(url, preferRustStream)
+                searchScreen?.loadInputUrlOrQuery(url, preferRustStream)
             },
             onToggleCorsDev = { enabled ->
                 corsDevPermissive = enabled
@@ -70,8 +86,9 @@ class MainActivity : Activity() {
                 performInstantZeroizePurge()
             }
         )
+        homeScreen = home
 
-        searchScreen = SearchBrowserScreen(
+        val search = SearchBrowserScreen(
             context = this,
             getActiveTabId = { activeTabId },
             isCorsDevEnabled = { corsDevPermissive },
@@ -86,8 +103,9 @@ class MainActivity : Activity() {
                 shieldLogs.add(event)
             }
         )
+        searchScreen = search
 
-        libraryScreen = LibraryTabsScreen(
+        val library = LibraryTabsScreen(
             context = this,
             tabs = openTabs,
             getActiveTabId = { activeTabId },
@@ -96,7 +114,7 @@ class MainActivity : Activity() {
                 MantaNative.switchTab(tabId)
                 val tab = openTabs.find { it.id == tabId }
                 if (tab != null) {
-                    searchScreen.loadInputUrlOrQuery(tab.url, tab.url.startsWith("manta://"))
+                    search.loadInputUrlOrQuery(tab.url, tab.url.startsWith("manta://"))
                 }
                 switchDockSection(1, animateDock = true)
             },
@@ -104,7 +122,7 @@ class MainActivity : Activity() {
                 val newId = MantaNative.createNewTab()
                 activeTabId = newId
                 openTabs.add(EphemeralTabInfo(newId, "New Manta Tab", "manta://benchmark"))
-                searchScreen.loadInputUrlOrQuery("manta://benchmark", true)
+                search.loadInputUrlOrQuery("manta://benchmark", true)
                 switchDockSection(1, animateDock = true)
             },
             onCloseTab = { tabId ->
@@ -116,19 +134,19 @@ class MainActivity : Activity() {
                 }
                 activeTabId = openTabs.last().id
                 MantaNative.switchTab(activeTabId)
-                libraryScreen.refreshLibraryState(shieldLogs)
+                libraryScreen?.refreshLibraryState(shieldLogs)
                 refreshStatusPill()
             },
             onZeroizeAll = {
                 performInstantZeroizePurge()
             }
         )
+        libraryScreen = library
 
-        rootContainer.addView(homeScreen)
-        rootContainer.addView(searchScreen)
-        rootContainer.addView(libraryScreen)
+        rootContainer.addView(home)
+        rootContainer.addView(search)
+        rootContainer.addView(library)
 
-        // 2. Bottom Floating Stack (Muse-style MiniStatusPill + SlidingBottomDock)
         val bottomFloatingStack = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val marginH = MantaTheme.dp(this@MainActivity, 12f)
@@ -142,14 +160,8 @@ class MainActivity : Activity() {
             }
         }
 
-        miniStatusPill = MiniStatusPill(
-            context = this,
-            onOpenActivePage = { switchDockSection(1, animateDock = true) },
-            onReloadPage = { searchScreen.reloadCurrentPage() },
-            onZeroizeRam = { performInstantZeroizePurge() }
-        )
         bottomFloatingStack.addView(
-            miniStatusPill,
+            pill,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -158,11 +170,8 @@ class MainActivity : Activity() {
             }
         )
 
-        bottomDock = SlidingBottomDock(this) { sectionIndex ->
-            switchDockSection(sectionIndex, animateDock = false)
-        }
         bottomFloatingStack.addView(
-            bottomDock,
+            dock,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 MantaTheme.dp(this, 60f)
@@ -172,21 +181,23 @@ class MainActivity : Activity() {
         rootContainer.addView(bottomFloatingStack)
         setContentView(rootContainer)
 
+        // 3. Now that all views are attached, boot the initial Rust stream page
+        search.bootInitialPage()
         switchDockSection(0, animateDock = false)
         refreshStatusPill()
     }
 
     private fun switchDockSection(index: Int, animateDock: Boolean) {
         currentDockSection = index
-        homeScreen.visibility = if (index == 0) View.VISIBLE else View.GONE
-        searchScreen.visibility = if (index == 1) View.VISIBLE else View.GONE
-        libraryScreen.visibility = if (index == 2) View.VISIBLE else View.GONE
+        homeScreen?.visibility = if (index == 0) View.VISIBLE else View.GONE
+        searchScreen?.visibility = if (index == 1) View.VISIBLE else View.GONE
+        libraryScreen?.visibility = if (index == 2) View.VISIBLE else View.GONE
 
         if (index == 2) {
-            libraryScreen.refreshLibraryState(shieldLogs)
+            libraryScreen?.refreshLibraryState(shieldLogs)
         }
         if (animateDock) {
-            bottomDock.setSelectedSection(index, animate = true)
+            bottomDock?.setSelectedSection(index, animate = true)
         }
         refreshStatusPill()
     }
@@ -194,7 +205,7 @@ class MainActivity : Activity() {
     private fun refreshStatusPill() {
         val activeTab = openTabs.find { it.id == activeTabId }
         val ramBytes = MantaNative.getEngineRamBytes()
-        miniStatusPill.updateStatus(
+        miniStatusPill?.updateStatus(
             title = activeTab?.title ?: "Manta Rust Core",
             ramBytes = ramBytes,
             corsEnabled = corsDevPermissive,
@@ -204,13 +215,13 @@ class MainActivity : Activity() {
 
     private fun performInstantZeroizePurge() {
         MantaNative.purgeAllVolatileRam()
-        searchScreen.wipeSandboxMemory()
+        searchScreen?.wipeSandboxMemory()
         openTabs.clear()
         shieldLogs.clear()
 
         activeTabId = MantaNative.initEngine(corsDevPermissive)
         openTabs.add(EphemeralTabInfo(activeTabId, "Manta Zeroized", "manta://benchmark"))
-        libraryScreen.refreshLibraryState(shieldLogs)
+        libraryScreen?.refreshLibraryState(shieldLogs)
         refreshStatusPill()
         Toast.makeText(
             this,
@@ -221,7 +232,7 @@ class MainActivity : Activity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (currentDockSection == 1 && searchScreen.handleBackNavigation()) {
+        if (currentDockSection == 1 && searchScreen?.handleBackNavigation() == true) {
             return
         }
         if (currentDockSection != 0) {

@@ -25,8 +25,8 @@ import kotlin.concurrent.thread
  * Search & Active Browser Screen (Dock Section 1):
  * - Top Omnibox with instant URL / Search resolution and tracking-param stripping in Rust.
  * - Mode Switcher:
- *   1. `RUST STREAM`: Renders directly via `libmanta_core.so` (`MantaRenderView`) using < 50 KB RAM.
- *   2. `DEV SANDBOX`: Full JS/CSS execution in `EphemeralWebSandbox` with Rust Shield & CORS bypass.
+ *   1. `RUST`: Renders directly via `libmanta_core.so` (`MantaRenderView`) using < 50 KB RAM.
+ *   2. `SANDBOX`: Full JS/CSS execution in `EphemeralWebSandbox` with Rust Shield & CORS bypass.
  */
 class SearchBrowserScreen(
     context: Context,
@@ -40,7 +40,7 @@ class SearchBrowserScreen(
     private val modeToggleBtn: TextView
     private val viewportContainer: FrameLayout
     private val rustRenderView: MantaRenderView
-    private val webSandbox: EphemeralWebSandbox
+    private var webSandbox: EphemeralWebSandbox? = null
 
     private var useRustStreamMode: Boolean = true
     private var currentUrl: String = "manta://benchmark"
@@ -92,7 +92,7 @@ class SearchBrowserScreen(
         }
         topBar.addView(urlInput)
 
-        // Engine Mode Switcher Button (`RUST` vs `WEB`)
+        // Engine Mode Switcher Button (`RUST` vs `SANDBOX`)
         modeToggleBtn = TextView(context).apply {
             text = "RUST"
             setTextColor(MantaTheme.ACCENT_EMERALD)
@@ -132,7 +132,7 @@ class SearchBrowserScreen(
         topBar.addView(copyBtn)
         addView(topBar)
 
-        // 2. Viewport Container holding both `MantaRenderView` and `EphemeralWebSandbox`
+        // 2. Viewport Container (WebSandbox is created lazily only when needed, keeping boot 0ms & crash-free)
         viewportContainer = FrameLayout(context).apply {
             layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f).apply {
                 bottomMargin = MantaTheme.dp(context, 134f)
@@ -141,31 +141,45 @@ class SearchBrowserScreen(
 
         rustRenderView = MantaRenderView(
             context = context,
-            onLinkClicked = { href -> loadInputUrlOrQuery(href, useRustStreamMode) },
+            onLinkClicked = { href -> loadInputUrlOrQuery(href, href.startsWith("manta://")) },
             onTextCopied = { copied ->
                 MantaNative.copyToClipboard(copied)
                 Toast.makeText(context, "Copied paragraph to Rust Vault", Toast.LENGTH_SHORT).show()
             }
         )
 
-        webSandbox = EphemeralWebSandbox(
-            context = context,
-            isCorsDevEnabled = isCorsDevEnabled,
-            onPageMetaUpdate = { title, url ->
-                currentTitle = title
-                currentUrl = url
-                urlInput.setText(url)
-                onStateUpdated(title, url)
-            },
-            onShieldEvent = onShieldLog
-        )
-
         viewportContainer.addView(rustRenderView)
-        viewportContainer.addView(webSandbox)
         addView(viewportContainer)
+    }
 
+    /**
+     * Called by MainActivity after all UI views (`miniStatusPill`, `bottomDock`) are attached.
+     */
+    fun bootInitialPage() {
         setEngineMode(true)
         loadBuiltInRustPage("manta://benchmark")
+    }
+
+    private fun getOrCreateWebSandbox(): EphemeralWebSandbox? {
+        if (webSandbox != null) return webSandbox
+        return try {
+            val created = EphemeralWebSandbox(
+                context = context,
+                isCorsDevEnabled = isCorsDevEnabled,
+                onPageMetaUpdate = { title, url ->
+                    currentTitle = title
+                    currentUrl = url
+                    urlInput.setText(url)
+                    onStateUpdated(title, url)
+                },
+                onShieldEvent = onShieldLog
+            )
+            viewportContainer.addView(created)
+            webSandbox = created
+            created
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     fun setEngineMode(rustMode: Boolean) {
@@ -175,7 +189,11 @@ class SearchBrowserScreen(
             if (rustMode) MantaTheme.ACCENT_EMERALD else MantaTheme.ACCENT_CYAN
         )
         rustRenderView.visibility = if (rustMode) View.VISIBLE else View.GONE
-        webSandbox.visibility = if (rustMode) View.GONE else View.VISIBLE
+        if (!rustMode) {
+            getOrCreateWebSandbox()?.visibility = View.VISIBLE
+        } else {
+            webSandbox?.visibility = View.GONE
+        }
     }
 
     fun loadInputUrlOrQuery(rawInput: String, preferRustMode: Boolean) {
@@ -199,13 +217,14 @@ class SearchBrowserScreen(
     }
 
     fun wipeSandboxMemory() {
-        webSandbox.wipeAllEphemeralData()
+        webSandbox?.wipeAllEphemeralData()
         loadBuiltInRustPage("manta://benchmark")
     }
 
     fun handleBackNavigation(): Boolean {
-        if (!useRustStreamMode && webSandbox.canGoBack()) {
-            webSandbox.goBack()
+        val sandbox = webSandbox
+        if (!useRustStreamMode && sandbox != null && sandbox.canGoBack()) {
+            sandbox.goBack()
             return true
         }
         return false
@@ -231,7 +250,13 @@ class SearchBrowserScreen(
         if (useRustStreamMode) {
             streamRemoteUrlViaRust(verdict)
         } else {
-            webSandbox.loadUrl(verdict)
+            val sandbox = getOrCreateWebSandbox()
+            if (sandbox != null) {
+                sandbox.loadUrl(verdict)
+            } else {
+                setEngineMode(true)
+                streamRemoteUrlViaRust(verdict)
+            }
         }
     }
 
@@ -341,7 +366,7 @@ class SearchBrowserScreen(
                     rustRenderView.setFrame(parsed)
                     onStateUpdated(parsed.title, cleanUrl)
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 val errHtml = "<html><body><h1>Stream Notice</h1><p>${e.message ?: "Connection failed"}</p><p>Tip: Tap RUST -> SANDBOX in the top bar for TLS/SPA sites.</p></body></html>"
                 val wire = MantaNative.streamHtmlChunk(tabId, cleanUrl, errHtml, true)
                 val parsed = DisplayListParser.parse(wire)

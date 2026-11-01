@@ -5,9 +5,8 @@
 
     <application
         android:allowBackup="false"
-        android:fullBackupContent="false"
-        android:dataExtractionRules="@null"
         android:hasFragileUserData="false"
+        android:hardwareAccelerated="true"
         android:icon="@drawable/ic_manta_logo"
         android:label="Manta"
         android:supportsRtl="true"

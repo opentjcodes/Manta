@@ -20,9 +20,8 @@ import java.net.URL
  * Rust-Shielded Ephemeral Web Sandbox:
  * - Zero disk cache (`LOAD_NO_CACHE`), zero cookies, zero DOM storage persistence.
  * - Routes every request through `MantaNative.sanitizeAndCheckUrl` in Rust.
- * - Synthesizes 0ms `OPTIONS` CORS preflights and injects permissive CORS headers
- *   (`Access-Control-Allow-Origin: *`, etc.) so developers can test any site or API.
- * - Injects anti-JS-detection script (`navigator.webdriver = false`).
+ * - Synthesizes 0ms `OPTIONS` CORS preflights and injects permissive CORS headers.
+ * - Marshals all background thread events safely to the Android UI thread via `post { ... }`.
  */
 @SuppressLint("SetJavaScriptEnabled")
 class EphemeralWebSandbox(
@@ -35,11 +34,13 @@ class EphemeralWebSandbox(
     init {
         setBackgroundColor(MantaTheme.BG_OBSIDIAN)
 
-        // Strictly disable all cookies & third-party persistence
-        CookieManager.getInstance().apply {
-            setAcceptCookie(false)
-            setAcceptThirdPartyCookies(this@EphemeralWebSandbox, false)
-            removeAllCookies(null)
+        try {
+            CookieManager.getInstance().apply {
+                setAcceptCookie(false)
+                setAcceptThirdPartyCookies(this@EphemeralWebSandbox, false)
+                removeAllCookies(null)
+            }
+        } catch (_: Throwable) {
         }
 
         settings.apply {
@@ -60,12 +61,13 @@ class EphemeralWebSandbox(
                 view: WebView,
                 request: WebResourceRequest
             ): WebResourceResponse? {
-                val rawUrl = request.url.toString()
+                val rawUrl = request.url?.toString() ?: return null
                 val verdict = MantaNative.sanitizeAndCheckUrl(rawUrl)
 
                 // 1. Blocked tracker domain in Rust Shield
                 if (verdict == "BLOCKED") {
-                    onShieldEvent("Blocked Tracker: ${request.url.host}")
+                    val host = request.url?.host ?: rawUrl
+                    post { onShieldEvent("Blocked Tracker: $host") }
                     return WebResourceResponse(
                         "text/plain",
                         "UTF-8",
@@ -78,7 +80,8 @@ class EphemeralWebSandbox(
 
                 // 2. Developer CORS OPTIONS Preflight Synthesizer
                 if (isCorsDevEnabled() && request.method.equals("OPTIONS", ignoreCase = true)) {
-                    onShieldEvent("CORS Preflight Allowed: ${request.url.host}")
+                    val host = request.url?.host ?: rawUrl
+                    post { onShieldEvent("CORS Preflight Allowed: $host") }
                     return WebResourceResponse(
                         "text/plain",
                         "UTF-8",
@@ -89,9 +92,9 @@ class EphemeralWebSandbox(
                     )
                 }
 
-                // 3. For XHR/Fetch requests when CORS Dev Mode is ON, proxy with CORS headers
+                // 3. For XHR/Fetch subresource requests when CORS Dev Mode is ON, inject CORS headers
                 val accept = request.requestHeaders["Accept"] ?: ""
-                val isSubresourceApi = ! request.isForMainFrame &&
+                val isSubresourceApi = !request.isForMainFrame &&
                     (accept.contains("application/json") || request.requestHeaders.containsKey("Origin"))
 
                 if (isCorsDevEnabled() && isSubresourceApi && verdict.startsWith("http")) {
@@ -103,12 +106,12 @@ class EphemeralWebSandbox(
 
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                // Inject Anti-Bot / Anti-JS-Detection Shield before page scripts run
                 val antiDetectionJs = """
                     (function() {
-                        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                        Object.defineProperty(navigator, 'GlobalPrivacyControl', { get: () => true });
-                        window.chrome = { runtime: {} };
+                        try {
+                            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                            Object.defineProperty(navigator, 'GlobalPrivacyControl', { get: () => true });
+                        } catch (e) {}
                     })();
                 """.trimIndent()
                 view.evaluateJavascript(antiDetectionJs, null)
@@ -141,7 +144,8 @@ class EphemeralWebSandbox(
             val contentType = (conn.contentType ?: "application/json").split(';')[0].trim()
             val stream = if (status in 200..399) conn.inputStream else conn.errorStream
             val bytes = stream?.readBytes() ?: ByteArray(0)
-            onShieldEvent("CORS Header Injected: ${URL(cleanUrl).host}")
+            val host = URL(cleanUrl).host
+            post { onShieldEvent("CORS Header Injected: $host") }
 
             WebResourceResponse(
                 contentType,
@@ -151,7 +155,7 @@ class EphemeralWebSandbox(
                 corsPermissiveHeaders(),
                 ByteArrayInputStream(bytes)
             )
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -165,12 +169,15 @@ class EphemeralWebSandbox(
     )
 
     fun wipeAllEphemeralData() {
-        stopLoading()
-        loadUrl("about:blank")
-        clearHistory()
-        clearFormData()
-        clearCache(true)
-        CookieManager.getInstance().removeAllCookies(null)
-        WebStorage.getInstance().deleteAllData()
+        try {
+            stopLoading()
+            loadUrl("about:blank")
+            clearHistory()
+            clearFormData()
+            clearCache(true)
+            CookieManager.getInstance().removeAllCookies(null)
+            WebStorage.getInstance().deleteAllData()
+        } catch (_: Throwable) {
+        }
     }
 }
