@@ -1,8 +1,7 @@
 package app.manta.browser.core
 
 /**
- * Minimal Kotlin JNI Bridge to `libmanta_core.so` (Rust).
- * Full Kotlin UI & Muse-style sliding bottom dock will connect here in Phase 2.
+ * Direct Zero-Overhead JNI Bridge to `libmanta_core.so` (Rust).
  */
 object MantaNative {
     init {
@@ -11,6 +10,15 @@ object MantaNative {
 
     @JvmStatic
     external fun initEngine(devCorsPermissive: Boolean): Int
+
+    @JvmStatic
+    external fun createNewTab(): Int
+
+    @JvmStatic
+    external fun switchTab(tabId: Int): Boolean
+
+    @JvmStatic
+    external fun setCorsDevMode(enabled: Boolean)
 
     @JvmStatic
     external fun streamHtmlChunk(
@@ -22,6 +30,12 @@ object MantaNative {
 
     @JvmStatic
     external fun sanitizeAndCheckUrl(url: String): String
+
+    @JvmStatic
+    external fun copyToClipboard(text: String): Boolean
+
+    @JvmStatic
+    external fun getClipboardText(): String
 
     @JvmStatic
     external fun closeTabAndZeroize(tabId: Int)

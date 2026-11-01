@@ -82,6 +82,48 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_initEngine
     engine.tabs.create_tab() as JInt
 }
 
+/// Creates a new isolated tab sandbox and returns its TabId.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_createNewTab(
+    _env: JNIEnv,
+    _class: JClass,
+) -> JInt {
+    let mut engine = MantaEngine::global().lock().unwrap();
+    engine.tabs.create_tab() as JInt
+}
+
+/// Switches active tab and automatically hibernates the previous tab in Rust RAM.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_switchTab(
+    _env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+) -> JBoolean {
+    let mut engine = MantaEngine::global().lock().unwrap();
+    let engine_ref = &mut *engine;
+    if engine_ref
+        .tabs
+        .switch_to_tab(tab_id as u32, &mut engine_ref.vault)
+    {
+        1
+    } else {
+        0
+    }
+}
+
+/// Toggles Developer CORS Permissive mode at runtime.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_setCorsDevMode(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: JBoolean,
+) {
+    let mut engine = MantaEngine::global().lock().unwrap();
+    let active = enabled != 0;
+    engine.config.dev_cors_permissive = active;
+    engine.modules.set_module_enabled("cors_dev", active);
+}
+
 /// Streams a chunk of HTML/data into a tab and returns the serialized `MANTA_FRAME` DisplayList.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_streamHtmlChunk(
@@ -124,6 +166,32 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_sanitizeAn
     }
     let clean = crate::shield::PrivacyShieldModule::sanitize_url(&raw);
     unsafe { env.new_java_string(&clean) }
+}
+
+/// Copies text into Manta's size-capped, zeroizable Rust ClipboardSandbox.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_copyToClipboard(
+    env: JNIEnv,
+    _class: JClass,
+    j_text: JString,
+) -> JBoolean {
+    let text = unsafe { env.get_rust_string(j_text) };
+    let mut engine = MantaEngine::global().lock().unwrap();
+    if engine.clipboard.copy_text(&text) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Reads the current text stored in Manta's Rust ClipboardSandbox.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_getClipboardText(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let engine = MantaEngine::global().lock().unwrap();
+    unsafe { env.new_java_string(engine.clipboard.paste_text()) }
 }
 
 /// Closes a tab and immediately zeroizes its RAM buffers.
@@ -211,7 +279,8 @@ mod tests {
         let env = JNIEnv(&table_ptr);
 
         unsafe {
-            let tab_id = Java_app_manta_browser_core_MantaNative_initEngine(env, ptr::null_mut(), 1);
+            let tab_id =
+                Java_app_manta_browser_core_MantaNative_initEngine(env, ptr::null_mut(), 1);
             assert!(tab_id >= 1);
 
             let url_c = CString::new("https://example.com/?utm_source=ads&ok=1").unwrap();
@@ -224,7 +293,8 @@ mod tests {
             assert_eq!(clean_owned.to_str().unwrap(), "https://example.com/?ok=1");
 
             Java_app_manta_browser_core_MantaNative_purgeAllVolatileRam(env, ptr::null_mut());
-            let ram = Java_app_manta_browser_core_MantaNative_getEngineRamBytes(env, ptr::null_mut());
+            let ram =
+                Java_app_manta_browser_core_MantaNative_getEngineRamBytes(env, ptr::null_mut());
             assert_eq!(ram, 0);
         }
     }
