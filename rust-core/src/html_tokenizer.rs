@@ -46,7 +46,7 @@ pub struct StreamingHtmlTokenizer {
     text_buf: String,
     rawtext_end_tag: String,
     comment_tail: [u8; 2],
-    utf8_Carry: Vec<u8>,
+    utf8_carry: Vec<u8>,
 }
 
 impl Default for StreamingHtmlTokenizer {
@@ -68,7 +68,7 @@ impl StreamingHtmlTokenizer {
             text_buf: String::with_capacity(128),
             rawtext_end_tag: String::new(),
             comment_tail: [0, 0],
-            utf8_Carry: Vec::with_capacity(4),
+            utf8_carry: Vec::with_capacity(4),
         }
     }
 
@@ -78,10 +78,10 @@ impl StreamingHtmlTokenizer {
         F: FnMut(HtmlToken),
     {
         let combined: Vec<u8>;
-        let input_bytes: &[u8] = if self.utf8_Carry.is_empty() {
+        let input_bytes: &[u8] = if self.utf8_carry.is_empty() {
             chunk
         } else {
-            let mut tmp = std::mem::take(&mut self.utf8_Carry);
+            let mut tmp = std::mem::take(&mut self.utf8_carry);
             tmp.extend_from_slice(chunk);
             combined = tmp;
             &combined
@@ -92,7 +92,7 @@ impl StreamingHtmlTokenizer {
             Err(e) => {
                 let valid_up_to = e.valid_up_to();
                 if !is_eof && e.error_len().is_none() {
-                    self.utf8_Carry.extend_from_slice(&input_bytes[valid_up_to..]);
+                    self.utf8_carry.extend_from_slice(&input_bytes[valid_up_to..]);
                 }
                 std::str::from_utf8(&input_bytes[..valid_up_to]).unwrap_or("")
             }

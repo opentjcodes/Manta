@@ -479,6 +479,7 @@ impl JsBytecodeCompiler {
             }
             _ => {
                 self.compile_expr()?;
+                self.program.instructions.push(OpCode::Pop);
                 self.consume_optional_semicolons();
                 Ok(())
             }
@@ -503,7 +504,11 @@ impl JsBytecodeCompiler {
                         self.advance();
                     }
                     if let Token::Ident(prop) = self.peek().clone() {
-                        if prop == ".textContent" || prop == ".innerText" || prop == ".innerHTML" {
+                        let clean_prop = prop.trim_start_matches('.');
+                        if clean_prop == "textContent"
+                            || clean_prop == "innerText"
+                            || clean_prop == "innerHTML"
+                        {
                             self.advance();
                             if self.peek() == &Token::Assign {
                                 self.advance();
@@ -809,6 +814,7 @@ impl MantaJsSandbox {
     ) -> Result<JsValue, &'static str> {
         self.fuel_remaining = self.max_fuel;
         let mut stack: Vec<JsValue> = Vec::with_capacity(32);
+        let mut last_popped = JsValue::Undefined;
         let mut pc = 0usize;
 
         while pc < program.instructions.len() {
@@ -975,7 +981,9 @@ impl MantaJsSandbox {
                     pc += 1;
                 }
                 OpCode::Pop => {
-                    stack.pop();
+                    if let Some(v) = stack.pop() {
+                        last_popped = v;
+                    }
                     pc += 1;
                 }
                 OpCode::Halt => {
@@ -984,7 +992,7 @@ impl MantaJsSandbox {
             }
         }
 
-        Ok(stack.pop().unwrap_or(JsValue::Undefined))
+        Ok(stack.pop().unwrap_or(last_popped))
     }
 
     fn invoke_host_fn(
