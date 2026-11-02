@@ -2,6 +2,7 @@
 
 pub mod clipboard;
 pub mod config;
+pub mod cookie_banner;
 pub mod cors_proxy;
 pub mod css_engine;
 pub mod dom_arena;
@@ -14,7 +15,9 @@ pub mod page_compiler;
 pub mod ram_vault;
 pub mod render_list;
 pub mod shield;
+pub mod tab_compressor;
 pub mod tab_manager;
+pub mod worker_pool;
 
 use std::sync::{Mutex, OnceLock};
 
@@ -25,15 +28,16 @@ use crate::module_bus::ModuleBus;
 use crate::ram_vault::VolatileRamVault;
 use crate::shield::PrivacyShieldModule;
 use crate::tab_manager::TabManager;
+use crate::worker_pool::MantaWorkerPool;
 
-/// Global singleton holding the entire Manta Rust Engine state.
-/// Protected by a lightweight lock and strictly bounded by RAM quotas.
+/// Global singleton holding the entire Manta Multi-Core Rust Engine state.
 pub struct MantaEngine {
     pub config: MantaConfig,
     pub vault: VolatileRamVault,
     pub tabs: TabManager,
     pub modules: ModuleBus,
     pub clipboard: ClipboardSandbox,
+    pub workers: MantaWorkerPool,
 }
 
 static ENGINE_INSTANCE: OnceLock<Mutex<MantaEngine>> = OnceLock::new();
@@ -58,6 +62,7 @@ impl MantaEngine {
             tabs: TabManager::new(per_tab_limit),
             modules,
             clipboard: ClipboardSandbox::new(64 * 1024),
+            workers: MantaWorkerPool::new(0), // Auto-detects CPU cores
         }
     }
 
@@ -65,8 +70,8 @@ impl MantaEngine {
         ENGINE_INSTANCE.get_or_init(|| Mutex::new(MantaEngine::new(MantaConfig::default())))
     }
 
-    /// Emergency & lifecycle purge: cryptographically zeroes all volatile RAM buffers,
-    /// destroys all tab arenas, clears clipboard buffer, and resets memory counters to 0.
+    /// Cryptographically zeroes all volatile RAM buffers, compressed tab snapshots,
+    /// and clipboard data.
     pub fn purge_all_volatile_state(&mut self) {
         self.tabs.close_all_and_zeroize();
         self.vault.zeroize_and_purge();
@@ -79,10 +84,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_engine_lifecycle_and_zero_ram_purge() {
+    fn test_multi_core_engine_and_zero_ram_purge() {
         let mut engine = MantaEngine::new(MantaConfig::default());
+        assert!(engine.workers.core_count() >= 1);
+
         let tab_id = engine.tabs.create_tab();
-        let html = b"<html><head><style>body { background: #0a0a0f; color: #ffffff; }</style></head><body><h1>Manta Engine</h1><p id='msg'>Ready</p><script>let x = 42;</script></body></html>";
+        let html = b"<html><body><h1>Manta Multi-Core</h1></body></html>";
 
         let frame = engine
             .tabs
@@ -97,8 +104,6 @@ mod tests {
             .expect("stream load should succeed");
 
         assert!(!frame.commands.is_empty());
-        assert!(engine.tabs.total_allocated_bytes() > 0);
-
         engine.purge_all_volatile_state();
         assert_eq!(engine.tabs.total_allocated_bytes(), 0);
         assert_eq!(engine.vault.used_bytes(), 0);

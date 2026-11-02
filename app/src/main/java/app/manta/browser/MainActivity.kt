@@ -20,9 +20,8 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Manta Main Activity:
- * Hosts the 3 workspace screens (Home | Search | Library), the floating Muse-style
- * `MiniStatusPill`, and the draggable/slidable `SlidingBottomDock`.
- * Automatically wipes all volatile RAM in Rust AND any transient WebView cache on exit.
+ * Orchestrates the Multi-Tab Rust-Accelerated Browser, the Muse-inspired
+ * `MiniStatusPill`, and the draggable/slidable `SlidingBottomDock` (Home | Search | Library).
  */
 class MainActivity : Activity() {
 
@@ -41,7 +40,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Initialize Rust Engine (`libmanta_core.so`) with Developer CORS enabled
         activeTabId = MantaNative.initEngine(corsDevPermissive)
         openTabs.add(
             EphemeralTabInfo(
@@ -55,8 +53,6 @@ class MainActivity : Activity() {
             setBackgroundColor(MantaTheme.BG_OBSIDIAN)
         }
 
-        // 1. Construct Bottom Floating Stack first so `miniStatusPill` and `bottomDock`
-        // are always non-null before any screen callbacks fire.
         val pill = MiniStatusPill(
             context = this,
             onOpenActivePage = { switchDockSection(1, animateDock = true) },
@@ -70,7 +66,6 @@ class MainActivity : Activity() {
         }
         bottomDock = dock
 
-        // 2. Initialize the 3 Dock Screens
         val home = HomeScreen(
             context = this,
             onLaunchUrl = { url, preferRustReader ->
@@ -91,7 +86,9 @@ class MainActivity : Activity() {
 
         val search = SearchBrowserScreen(
             context = this,
+            openTabs = openTabs,
             getActiveTabId = { activeTabId },
+            setActiveTabId = { newId -> activeTabId = newId },
             isCorsDevEnabled = { corsDevPermissive },
             onStateUpdated = { title, url ->
                 openTabs.find { it.id == activeTabId }?.let {
@@ -111,30 +108,15 @@ class MainActivity : Activity() {
             tabs = openTabs,
             getActiveTabId = { activeTabId },
             onSelectTab = { tabId ->
-                activeTabId = tabId
-                MantaNative.switchTab(tabId)
-                val tab = openTabs.find { it.id == tabId }
-                if (tab != null) {
-                    search.loadInputUrlOrQuery(tab.url, tab.url.startsWith("manta://"))
-                }
+                search.switchToExistingTab(tabId)
                 switchDockSection(1, animateDock = true)
             },
             onCreateNewTab = {
-                val newId = MantaNative.createNewTab()
-                activeTabId = newId
-                openTabs.add(EphemeralTabInfo(newId, "New Manta Tab", "https://duckduckgo.com"))
-                search.loadInputUrlOrQuery("https://duckduckgo.com", false)
+                search.createNewTabAndSwitch("https://duckduckgo.com")
                 switchDockSection(1, animateDock = true)
             },
             onCloseTab = { tabId ->
-                MantaNative.closeTabAndZeroize(tabId)
-                openTabs.removeAll { it.id == tabId }
-                if (openTabs.isEmpty()) {
-                    val freshId = MantaNative.createNewTab()
-                    openTabs.add(EphemeralTabInfo(freshId, "Manta Browser", "https://duckduckgo.com"))
-                }
-                activeTabId = openTabs.last().id
-                MantaNative.switchTab(activeTabId)
+                search.closeTabById(tabId)
                 libraryScreen?.refreshLibraryState(shieldLogs)
                 refreshStatusPill()
             },
@@ -193,7 +175,9 @@ class MainActivity : Activity() {
         searchScreen?.visibility = if (index == 1) View.VISIBLE else View.GONE
         libraryScreen?.visibility = if (index == 2) View.VISIBLE else View.GONE
 
-        if (index == 2) {
+        if (index == 1) {
+            searchScreen?.renderTabStrip()
+        } else if (index == 2) {
             libraryScreen?.refreshLibraryState(shieldLogs)
         }
         if (animateDock) {
@@ -214,18 +198,19 @@ class MainActivity : Activity() {
     }
 
     private fun performInstantZeroizePurge() {
-        searchScreen?.wipeSandboxMemory()
+        searchScreen?.wipeAllTabsAndSandboxes()
         ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
         openTabs.clear()
         shieldLogs.clear()
 
         activeTabId = MantaNative.initEngine(corsDevPermissive)
         openTabs.add(EphemeralTabInfo(activeTabId, "Manta Zeroized", "manta://benchmark"))
+        searchScreen?.renderTabStrip()
         libraryScreen?.refreshLibraryState(shieldLogs)
         refreshStatusPill()
         Toast.makeText(
             this,
-            "All Volatile RAM & Disk Cache Zeroized (0 B)",
+            "All Volatile RAM, Tabs & Cookies Zeroized (0 B)",
             Toast.LENGTH_SHORT
         ).show()
     }

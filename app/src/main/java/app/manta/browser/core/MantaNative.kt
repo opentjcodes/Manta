@@ -1,8 +1,7 @@
 package app.manta.browser.core
 
 /**
- * Direct Zero-Overhead JNI Bridge to `libmanta_core.so` (Rust).
- * Includes defensive fallback guards so JNI calls remain 100% crash-safe.
+ * Direct Zero-Overhead JNI Bridge to `libmanta_core.so` (Multi-Core Rust Engine).
  */
 object MantaNative {
     var isLoaded: Boolean = false
@@ -21,7 +20,24 @@ object MantaNative {
     private external fun nativeInitEngine(devCorsPermissive: Boolean): Int
 
     @JvmStatic
+    private external fun nativeGetWorkerCoreCount(): Int
+
+    @JvmStatic
+    private external fun nativePrewarmDns(url: String)
+
+    @JvmStatic
     private external fun nativeCreateNewTab(): Int
+
+    @JvmStatic
+    private external fun nativeCompressTabState(
+        tabId: Int,
+        url: String,
+        title: String,
+        scrollY: Int
+    ): Int
+
+    @JvmStatic
+    private external fun nativeRestoreTabState(tabId: Int): String
 
     @JvmStatic
     private external fun nativeSwitchTab(tabId: Int): Boolean
@@ -31,6 +47,9 @@ object MantaNative {
 
     @JvmStatic
     private external fun nativeGetRuntimeScript(corsDevEnabled: Boolean): String
+
+    @JvmStatic
+    private external fun nativeIsChallengeUrl(url: String): Boolean
 
     @JvmStatic
     private external fun nativeSetVolatileCookie(tabId: Int, host: String, cookie: String)
@@ -64,141 +83,70 @@ object MantaNative {
     @JvmStatic
     private external fun nativeGetEngineRamBytes(): Int
 
-    fun initEngine(devCorsPermissive: Boolean): Int {
-        return if (isLoaded) {
-            try {
-                nativeInitEngine(devCorsPermissive)
-            } catch (_: Throwable) {
-                1
-            }
-        } else 1
+    fun initEngine(devCorsPermissive: Boolean): Int =
+        if (isLoaded) runCatching { nativeInitEngine(devCorsPermissive) }.getOrDefault(1) else 1
+
+    fun getWorkerCoreCount(): Int =
+        if (isLoaded) runCatching { nativeGetWorkerCoreCount() }.getOrDefault(4) else 4
+
+    fun prewarmDns(url: String) {
+        if (isLoaded) runCatching { nativePrewarmDns(url) }
     }
 
-    fun createNewTab(): Int {
-        return if (isLoaded) {
-            try {
-                nativeCreateNewTab()
-            } catch (_: Throwable) {
-                1
-            }
-        } else 1
-    }
+    fun createNewTab(): Int =
+        if (isLoaded) runCatching { nativeCreateNewTab() }.getOrDefault(1) else 1
 
-    fun switchTab(tabId: Int): Boolean {
-        return if (isLoaded) {
-            try {
-                nativeSwitchTab(tabId)
-            } catch (_: Throwable) {
-                false
-            }
-        } else false
-    }
+    fun compressTabState(tabId: Int, url: String, title: String, scrollY: Int): Int =
+        if (isLoaded) runCatching { nativeCompressTabState(tabId, url, title, scrollY) }.getOrDefault(0) else 0
+
+    fun restoreTabState(tabId: Int): String =
+        if (isLoaded) runCatching { nativeRestoreTabState(tabId) }.getOrDefault("") else ""
+
+    fun switchTab(tabId: Int): Boolean =
+        if (isLoaded) runCatching { nativeSwitchTab(tabId) }.getOrDefault(false) else false
 
     fun setCorsDevMode(enabled: Boolean) {
-        if (isLoaded) {
-            try {
-                nativeSetCorsDevMode(enabled)
-            } catch (_: Throwable) {
-            }
-        }
+        if (isLoaded) runCatching { nativeSetCorsDevMode(enabled) }
     }
 
-    fun getRuntimeScript(corsDevEnabled: Boolean): String {
-        return if (isLoaded) {
-            try {
-                nativeGetRuntimeScript(corsDevEnabled)
-            } catch (_: Throwable) {
-                ""
-            }
-        } else ""
-    }
+    fun getRuntimeScript(corsDevEnabled: Boolean): String =
+        if (isLoaded) runCatching { nativeGetRuntimeScript(corsDevEnabled) }.getOrDefault("") else ""
+
+    fun isChallengeUrl(url: String): Boolean =
+        if (isLoaded) runCatching { nativeIsChallengeUrl(url) }.getOrDefault(false) else false
 
     fun setVolatileCookie(tabId: Int, host: String, cookie: String) {
+        if (isLoaded) runCatching { nativeSetVolatileCookie(tabId, host, cookie) }
+    }
+
+    fun getVolatileCookie(tabId: Int, host: String): String =
+        if (isLoaded) runCatching { nativeGetVolatileCookie(tabId, host) }.getOrDefault("") else ""
+
+    fun streamHtmlChunk(tabId: Int, url: String, htmlChunk: String, isEof: Boolean): String =
         if (isLoaded) {
-            try {
-                nativeSetVolatileCookie(tabId, host, cookie)
-            } catch (_: Throwable) {
-            }
-        }
-    }
-
-    fun getVolatileCookie(tabId: Int, host: String): String {
-        return if (isLoaded) {
-            try {
-                nativeGetVolatileCookie(tabId, host)
-            } catch (_: Throwable) {
-                ""
-            }
-        } else ""
-    }
-
-    fun streamHtmlChunk(tabId: Int, url: String, htmlChunk: String, isEof: Boolean): String {
-        return if (isLoaded) {
-            try {
-                nativeStreamHtmlChunk(tabId, url, htmlChunk, isEof)
-            } catch (t: Throwable) {
-                "MANTA_ERR|JNI Error: ${t.message}"
-            }
+            runCatching { nativeStreamHtmlChunk(tabId, url, htmlChunk, isEof) }
+                .getOrElse { "MANTA_ERR|JNI Error: ${it.message}" }
         } else {
             "MANTA_FRAME|title=Manta|bg=#FF09090B|height=300.0|nodes=1|ramKB=0.0\nTEXT|16.0|24.0|16.0|1|#FFF8FAFC||Manta Core Active\n"
         }
-    }
 
-    fun sanitizeAndCheckUrl(url: String): String {
-        return if (isLoaded) {
-            try {
-                nativeSanitizeAndCheckUrl(url)
-            } catch (_: Throwable) {
-                url
-            }
-        } else url
-    }
+    fun sanitizeAndCheckUrl(url: String): String =
+        if (isLoaded) runCatching { nativeSanitizeAndCheckUrl(url) }.getOrDefault(url) else url
 
-    fun copyToClipboard(text: String): Boolean {
-        return if (isLoaded) {
-            try {
-                nativeCopyToClipboard(text)
-            } catch (_: Throwable) {
-                false
-            }
-        } else false
-    }
+    fun copyToClipboard(text: String): Boolean =
+        if (isLoaded) runCatching { nativeCopyToClipboard(text) }.getOrDefault(false) else false
 
-    fun getClipboardText(): String {
-        return if (isLoaded) {
-            try {
-                nativeGetClipboardText()
-            } catch (_: Throwable) {
-                ""
-            }
-        } else ""
-    }
+    fun getClipboardText(): String =
+        if (isLoaded) runCatching { nativeGetClipboardText() }.getOrDefault("") else ""
 
     fun closeTabAndZeroize(tabId: Int) {
-        if (isLoaded) {
-            try {
-                nativeCloseTabAndZeroize(tabId)
-            } catch (_: Throwable) {
-            }
-        }
+        if (isLoaded) runCatching { nativeCloseTabAndZeroize(tabId) }
     }
 
     fun purgeAllVolatileRam() {
-        if (isLoaded) {
-            try {
-                nativePurgeAllVolatileRam()
-            } catch (_: Throwable) {
-            }
-        }
+        if (isLoaded) runCatching { nativePurgeAllVolatileRam() }
     }
 
-    fun getEngineRamBytes(): Int {
-        return if (isLoaded) {
-            try {
-                nativeGetEngineRamBytes()
-            } catch (_: Throwable) {
-                0
-            }
-        } else 0
-    }
+    fun getEngineRamBytes(): Int =
+        if (isLoaded) runCatching { nativeGetEngineRamBytes() }.getOrDefault(0) else 0
 }

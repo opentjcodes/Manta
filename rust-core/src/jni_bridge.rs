@@ -2,14 +2,9 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
 use crate::page_compiler::PageRuntimeCompiler;
+use crate::tab_compressor::TabCompressor;
 use crate::MantaEngine;
 
-// =============================================================================
-// ZERO-DEPENDENCY RAW JNI C-ABI DEFINITIONS
-// Matches the exact `const struct JNINativeInterface_ **` ABI from `jni.h`.
-// Index 167 = NewStringUTF, 168 = GetStringUTFLength,
-// Index 169 = GetStringUTFChars, 170 = ReleaseStringUTFChars.
-// =============================================================================
 #[repr(transparent)]
 #[derive(Copy, Clone)]
 pub struct JNIEnv(pub *const *const JNINativeInterface);
@@ -68,7 +63,7 @@ impl JNIEnv {
     }
 }
 
-/// Initializes Manta Rust Engine and returns the initial tab ID.
+/// Initializes Manta Multi-Core Rust Engine and returns the initial tab ID.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInitEngine(
     _env: JNIEnv,
@@ -85,6 +80,31 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInit
     engine.tabs.create_tab() as JInt
 }
 
+/// Returns the number of active Rust worker cores in `MantaWorkerPool`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetWorkerCoreCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> JInt {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return 2;
+    };
+    engine.workers.core_count() as JInt
+}
+
+/// Pre-warms DNS resolution for a URL on a background Rust worker thread.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativePrewarmDns(
+    env: JNIEnv,
+    _class: JClass,
+    j_url: JString,
+) {
+    let url = unsafe { env.get_rust_string(j_url) };
+    if let Ok(engine) = MantaEngine::global().lock() {
+        engine.workers.prewarm_url_dns(&url);
+    }
+}
+
 /// Creates a new isolated tab sandbox and returns its TabId.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCreateNewTab(
@@ -97,7 +117,45 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCrea
     engine.tabs.create_tab() as JInt
 }
 
-/// Switches active tab and automatically hibernates the previous tab in Rust RAM.
+/// Compresses and stores a tab's state in Rust's VolatileRamVault when switching tabs.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCompressTabState(
+    env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+    j_url: JString,
+    j_title: JString,
+    scroll_y: JInt,
+) -> JInt {
+    let url = unsafe { env.get_rust_string(j_url) };
+    let title = unsafe { env.get_rust_string(j_title) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    TabCompressor::store_tab_snapshot(&mut engine.vault, tab_id as u32, &url, &title, scroll_y)
+        as JInt
+}
+
+/// Restores a tab's compressed snapshot (`scrollY|title|url`) from Rust's VolatileRamVault.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeRestoreTabState(
+    env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    match TabCompressor::restore_tab_snapshot(&engine.vault, tab_id as u32) {
+        Some((scroll_y, title, url)) => {
+            let formatted = format!("{}|{}|{}", scroll_y, title, url);
+            unsafe { env.new_java_string(&formatted) }
+        }
+        None => unsafe { env.new_java_string("") },
+    }
+}
+
+/// Switches active tab and automatically hibernates the previous tab's DOM arena in Rust RAM.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSwitchTab(
     _env: JNIEnv,
@@ -132,7 +190,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetC
     }
 }
 
-/// Returns the Rust-compiled Anti-Detection, Cosmetic Ad-Zapper, Volatile Cookie, and CORS script.
+/// Returns the Rust-compiled Anti-Detection, Cookie-Banner Eliminator, and CORS runtime script.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetRuntimeScript(
     env: JNIEnv,
@@ -141,6 +199,21 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetR
 ) -> JString {
     let script = PageRuntimeCompiler::compile_runtime_script(cors_dev_enabled != 0);
     unsafe { env.new_java_string(&script) }
+}
+
+/// Checks if a URL is a Cloudflare Turnstile, hCaptcha, or reCAPTCHA verification endpoint.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeIsChallengeUrl(
+    env: JNIEnv,
+    _class: JClass,
+    j_url: JString,
+) -> JBoolean {
+    let url = unsafe { env.get_rust_string(j_url) };
+    if PageRuntimeCompiler::is_verification_challenge_url(&url) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Stores an ephemeral cookie inside Rust's `VolatileRamVault` (never touches disk).
@@ -219,6 +292,9 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSani
     j_url: JString,
 ) -> JString {
     let raw = unsafe { env.get_rust_string(j_url) };
+    if PageRuntimeCompiler::is_verification_challenge_url(&raw) {
+        return unsafe { env.new_java_string(&raw) };
+    }
     if crate::shield::PrivacyShieldModule::is_blocked_domain(&raw) {
         return unsafe { env.new_java_string("BLOCKED") };
     }
@@ -348,6 +424,10 @@ mod tests {
             let tab_id =
                 Java_app_manta_browser_core_MantaNative_nativeInitEngine(env, ptr::null_mut(), 1);
             assert!(tab_id >= 1);
+
+            let cores =
+                Java_app_manta_browser_core_MantaNative_nativeGetWorkerCoreCount(env, ptr::null_mut());
+            assert!(cores >= 1);
 
             let url_c = CString::new("https://example.com/?utm_source=ads&ok=1").unwrap();
             let clean_jstr = Java_app_manta_browser_core_MantaNative_nativeSanitizeAndCheckUrl(
