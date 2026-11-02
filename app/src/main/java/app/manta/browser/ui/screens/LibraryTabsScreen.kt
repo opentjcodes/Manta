@@ -2,12 +2,18 @@ package app.manta.browser.ui.screens
 
 import android.content.Context
 import android.graphics.Typeface
+import android.text.TextUtils
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import app.manta.browser.core.MantaNative
 import app.manta.browser.ui.theme.MantaTheme
+import kotlin.math.abs
 
 data class EphemeralTabInfo(
     val id: Int,
@@ -16,10 +22,10 @@ data class EphemeralTabInfo(
 )
 
 /**
- * Library & Ephemeral Sandbox Screen (Dock Section 2):
- * - Manage isolated Rust Tab Sandboxes (background tabs auto-hibernate in < 1 KB RAM)
- * - Inspect or zeroize the Rust `ClipboardSandbox`
- * - View live Anti-Fingerprinting & CORS Dev logs
+ * M3 Expressive Tab Chooser Grid Screen (`LibraryTabsScreen.kt`):
+ * - Borderless 2-column squircle tab cards with tonal elevation.
+ * - Supports horizontal swipe-to-dismiss gestures on any tab card!
+ * - Floating bottom pill action bar with `+ New Tab`, `Zeroize All`, and `Done`.
  */
 class LibraryTabsScreen(
     context: Context,
@@ -28,247 +34,284 @@ class LibraryTabsScreen(
     private val onSelectTab: (Int) -> Unit,
     private val onCreateNewTab: () -> Unit,
     private val onCloseTab: (Int) -> Unit,
-    private val onZeroizeAll: () -> Unit
-) : ScrollView(context) {
+    private val onZeroizeAll: () -> Unit,
+    private val onDismissSheet: () -> Unit
+) : FrameLayout(context) {
 
-    private val tabsListContainer: LinearLayout
-    private val clipboardPreview: TextView
-    private val shieldLogContainer: LinearLayout
-    private val ramStatsText: TextView
+    private val tabsGrid: GridLayout
+    private val ramSubheader: TextView
 
     init {
         setBackgroundColor(MantaTheme.BG_OBSIDIAN)
-        isVerticalScrollBarEnabled = false
+        visibility = View.GONE
 
-        val root = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            val padH = MantaTheme.dp(context, 18f)
-            setPadding(padH, MantaTheme.dp(context, 22f), padH, MantaTheme.dp(context, 160f))
+        val scrollView = ScrollView(context).apply {
+            isVerticalScrollBarEnabled = false
+            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         }
 
-        // Header + "+ New Tab" Button
-        val header = LinearLayout(context).apply {
+        val contentCol = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            val padH = MantaTheme.dp(context, 16f)
+            setPadding(padH, MantaTheme.dp(context, 28f), padH, MantaTheme.dp(context, 120f))
+        }
+
+        // 1. Minimalist Header
+        val headerRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            val pH = MantaTheme.dp(context, 6f)
+            setPadding(pH, 0, pH, MantaTheme.dp(context, 18f))
         }
-        header.addView(TextView(context).apply {
-            text = "Ephemeral Library"
-            setTextColor(MantaTheme.TEXT_PRIMARY)
-            textSize = 22f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+
+        val titleCol = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        titleCol.addView(TextView(context).apply {
+            text = "Open Tabs"
+            setTextColor(MantaTheme.TEXT_PRIMARY)
+            textSize = 24f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         })
 
-        val newTabBtn = TextView(context).apply {
-            text = "+ New Tab"
-            setTextColor(MantaTheme.BG_OBSIDIAN)
-            textSize = 12.5f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            val pH = MantaTheme.dp(context, 14f)
-            val pV = MantaTheme.dp(context, 8f)
-            setPadding(pH, pV, pH, pV)
-            background = MantaTheme.roundedBg(MantaTheme.TEXT_PRIMARY, 16f, context)
-            setOnClickListener { onCreateNewTab() }
-        }
-        header.addView(newTabBtn)
-        root.addView(header)
-
-        // Live Memory Telemetry Card
-        val memCard = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val p = MantaTheme.dp(context, 14f)
-            setPadding(p, p, p, p)
-            background = MantaTheme.roundedBg(
-                fillColor = MantaTheme.BG_CARD,
-                radiusDp = 16f,
-                context = context,
-                strokeColor = MantaTheme.BORDER_SUBTLE,
-                strokeWidthDp = 1f
-            )
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = MantaTheme.dp(context, 16f)
-                bottomMargin = MantaTheme.dp(context, 20f)
-            }
-        }
-
-        ramStatsText = TextView(context).apply {
-            text = "Volatile Arena: 0.0 KB • Disk Cache: 0 Bytes"
-            setTextColor(MantaTheme.ACCENT_EMERALD)
-            textSize = 13f
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        memCard.addView(ramStatsText)
-
-        val zeroizeBtn = TextView(context).apply {
-            text = "Wipe All RAM"
-            setTextColor(MantaTheme.ACCENT_ROSE)
-            textSize = 12f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            val pH = MantaTheme.dp(context, 12f)
-            val pV = MantaTheme.dp(context, 7f)
-            setPadding(pH, pV, pH, pV)
-            background = MantaTheme.roundedBg(0xFF2A1219.toInt(), 12f, context)
-            setOnClickListener { onZeroizeAll() }
-        }
-        memCard.addView(zeroizeBtn)
-        root.addView(memCard)
-
-        // Active & Hibernated Tabs List
-        root.addView(makeSectionLabel(context, "ACTIVE & HIBERNATED TABS"))
-        tabsListContainer = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = MantaTheme.dp(context, 8f)
-                bottomMargin = MantaTheme.dp(context, 22f)
-            }
-        }
-        root.addView(tabsListContainer)
-
-        // Sandboxed Rust Clipboard Vault
-        root.addView(makeSectionLabel(context, "RUST SANDBOXED CLIPBOARD"))
-        val clipCard = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            val p = MantaTheme.dp(context, 14f)
-            setPadding(p, p, p, p)
-            background = MantaTheme.roundedBg(
-                fillColor = MantaTheme.BG_CARD,
-                radiusDp = 16f,
-                context = context,
-                strokeColor = MantaTheme.BORDER_SUBTLE,
-                strokeWidthDp = 1f
-            )
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = MantaTheme.dp(context, 8f)
-                bottomMargin = MantaTheme.dp(context, 22f)
-            }
-        }
-        clipboardPreview = TextView(context).apply {
-            text = "(Clipboard Vault Empty)"
+        ramSubheader = TextView(context).apply {
+            text = "0.0 KB Volatile RAM • Swipe card to close"
             setTextColor(MantaTheme.TEXT_SECONDARY)
             textSize = 12.5f
-            typeface = Typeface.MONOSPACE
         }
-        clipCard.addView(clipboardPreview)
-        root.addView(clipCard)
+        titleCol.addView(ramSubheader)
+        headerRow.addView(titleCol)
 
-        // Shield & CORS Intercept Log
-        root.addView(makeSectionLabel(context, "SHIELD & CORS STREAM LOG"))
-        shieldLogContainer = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
+        val zeroizePill = TextView(context).apply {
+            text = "Zeroize All"
+            setTextColor(MantaTheme.ON_CONTAINER_TERTIARY)
+            textSize = 12.5f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            val pH = MantaTheme.dp(context, 16f)
+            val pV = MantaTheme.dp(context, 10f)
+            setPadding(pH, pV, pH, pV)
+            background = MantaTheme.roundedBg(MantaTheme.CONTAINER_TERTIARY, 20f, context)
+            setOnClickListener { onZeroizeAll() }
+        }
+        headerRow.addView(zeroizePill)
+        contentCol.addView(headerRow)
+
+        // 2. 2-Column M3 Expressive Tab Cards Grid
+        tabsGrid = GridLayout(context).apply {
+            columnCount = 2
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        contentCol.addView(tabsGrid)
+        scrollView.addView(contentCol)
+        addView(scrollView)
+
+        // 3. Floating Bottom Expressive Pill Bar (`+ New Tab` | `Done`)
+        val bottomBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            val margin = MantaTheme.dp(context, 18f)
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT,
+                LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM
             ).apply {
-                topMargin = MantaTheme.dp(context, 8f)
+                setMargins(margin, 0, margin, margin)
             }
         }
-        root.addView(shieldLogContainer)
 
-        addView(root)
+        val newTabFab = TextView(context).apply {
+            text = "+  New Tab"
+            setTextColor(MantaTheme.BG_OBSIDIAN)
+            textSize = 14.5f
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            val pH = MantaTheme.dp(context, 28f)
+            val pV = MantaTheme.dp(context, 15f)
+            setPadding(pH, pV, pH, pV)
+            background = MantaTheme.roundedBg(MantaTheme.ACCENT_PRIMARY, 28f, context)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = MantaTheme.dp(context, 10f)
+            }
+            setOnClickListener { onCreateNewTab() }
+        }
+        bottomBar.addView(newTabFab)
+
+        val donePill = TextView(context).apply {
+            text = "Done"
+            setTextColor(MantaTheme.TEXT_PRIMARY)
+            textSize = 14.5f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            gravity = Gravity.CENTER
+            val pH = MantaTheme.dp(context, 24f)
+            val pV = MantaTheme.dp(context, 15f)
+            setPadding(pH, pV, pH, pV)
+            background = MantaTheme.roundedBg(MantaTheme.BG_CONTAINER_HIGH, 28f, context)
+            setOnClickListener { onDismissSheet() }
+        }
+        bottomBar.addView(donePill)
+        addView(bottomBar)
     }
 
     fun refreshLibraryState(logs: List<String>) {
         val ramBytes = MantaNative.getEngineRamBytes()
-        ramStatsText.text = String.format(
-            "Volatile Arena: %.1f KB • Disk: 0 B",
-            ramBytes / 1024f
+        ramSubheader.text = String.format(
+            "%.1f KB Volatile RAM • %d Shield Events • Swipe card to close",
+            ramBytes / 1024f,
+            logs.size
         )
 
-        val clip = MantaNative.getClipboardText()
-        clipboardPreview.text = if (clip.isBlank()) "(Clipboard Vault Empty)" else clip
-
-        tabsListContainer.removeAllViews()
+        tabsGrid.removeAllViews()
         val activeId = getActiveTabId()
+
         for (tab in tabs) {
             val isActive = tab.id == activeId
-            val row = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                val p = MantaTheme.dp(context, 13f)
-                setPadding(p, p, p, p)
-                background = MantaTheme.roundedBg(
-                    fillColor = if (isActive) MantaTheme.BG_DOCK_PILL else MantaTheme.BG_CARD,
-                    radiusDp = 14f,
-                    context = context,
-                    strokeColor = if (isActive) MantaTheme.ACCENT_CYAN else MantaTheme.BORDER_SUBTLE,
-                    strokeWidthDp = 1f
-                )
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    bottomMargin = MantaTheme.dp(context, 8f)
-                }
-                setOnClickListener { onSelectTab(tab.id) }
-            }
-
-            val col = LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            }
-            col.addView(TextView(context).apply {
-                text = "${tab.title} ${if (isActive) "• ACTIVE" else "• HIBERNATED"}"
-                setTextColor(MantaTheme.TEXT_PRIMARY)
-                textSize = 13.5f
-                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            })
-            col.addView(TextView(context).apply {
-                text = tab.url
-                setTextColor(MantaTheme.TEXT_SECONDARY)
-                textSize = 11.5f
-            })
-            row.addView(col)
-
-            val closeBtn = TextView(context).apply {
-                text = "✕"
-                setTextColor(MantaTheme.TEXT_SECONDARY)
-                textSize = 14f
-                val pad = MantaTheme.dp(context, 8f)
-                setPadding(pad, pad, pad, pad)
-                setOnClickListener { onCloseTab(tab.id) }
-            }
-            row.addView(closeBtn)
-            tabsListContainer.addView(row)
-        }
-
-        shieldLogContainer.removeAllViews()
-        if (logs.isEmpty()) {
-            shieldLogContainer.addView(TextView(context).apply {
-                text = "No trackers encountered yet • Zero-Cookie Shield active"
-                setTextColor(MantaTheme.TEXT_MUTED)
-                textSize = 12f
-            })
-        } else {
-            for (entry in logs.takeLast(8).reversed()) {
-                shieldLogContainer.addView(TextView(context).apply {
-                    text = "• $entry"
-                    setTextColor(MantaTheme.ACCENT_CYAN)
-                    textSize = 12f
-                    typeface = Typeface.MONOSPACE
-                    setPadding(0, MantaTheme.dp(context, 3f), 0, MantaTheme.dp(context, 3f))
-                })
-            }
+            val card = makeExpressiveTabCard(tab, isActive)
+            tabsGrid.addView(card)
         }
     }
 
-    private fun makeSectionLabel(context: Context, text: String): TextView {
-        return TextView(context).apply {
-            this.text = text
-            setTextColor(MantaTheme.TEXT_MUTED)
-            textSize = 11f
+    private fun makeExpressiveTabCard(tab: EphemeralTabInfo, isActive: Boolean): View {
+        val cardColor = if (isActive) MantaTheme.CONTAINER_PRIMARY else MantaTheme.BG_CARD
+        val card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = MantaTheme.dp(context, 16f)
+            setPadding(p, p, p, p)
+            background = MantaTheme.roundedBg(cardColor, 26f, context)
+            val m = MantaTheme.dp(context, 6f)
+            layoutParams = GridLayout.LayoutParams().apply {
+                width = 0
+                height = MantaTheme.dp(context, 164f)
+                columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                setMargins(m, m, m, m)
+            }
+        }
+
+        // Top Row inside Card: Domain Monogram Pill + Close `✕`
+        val topRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val cleanHost = MantaTheme.extractCleanHost(tab.url)
+        val monogram = cleanHost.firstOrNull()?.uppercaseChar()?.toString() ?: "M"
+
+        val badge = TextView(context).apply {
+            text = monogram
+            setTextColor(if (isActive) MantaTheme.ON_CONTAINER_PRIMARY else MantaTheme.ACCENT_PRIMARY)
+            textSize = 12f
             typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            letterSpacing = 0.1f
+            gravity = Gravity.CENTER
+            background = MantaTheme.roundedBg(
+                if (isActive) MantaTheme.BG_OBSIDIAN else MantaTheme.BG_CONTAINER_HIGH,
+                12f,
+                context
+            )
+            val s = MantaTheme.dp(context, 28f)
+            layoutParams = LinearLayout.LayoutParams(s, s)
+        }
+        topRow.addView(badge)
+
+        val hostLabel = TextView(context).apply {
+            text = cleanHost
+            setTextColor(if (isActive) MantaTheme.ON_CONTAINER_PRIMARY else MantaTheme.TEXT_SECONDARY)
+            textSize = 11.5f
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = MantaTheme.dp(context, 8f)
+            }
+        }
+        topRow.addView(hostLabel)
+
+        val closeBtn = TextView(context).apply {
+            text = "✕"
+            setTextColor(if (isActive) MantaTheme.ON_CONTAINER_PRIMARY else MantaTheme.TEXT_SECONDARY)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            val s = MantaTheme.dp(context, 26f)
+            layoutParams = LinearLayout.LayoutParams(s, s)
+            setOnClickListener { onCloseTab(tab.id) }
+        }
+        topRow.addView(closeBtn)
+        card.addView(topRow)
+
+        // Middle: Page Title
+        val titleTv = TextView(context).apply {
+            text = tab.title.ifBlank { "New Tab" }
+            setTextColor(MantaTheme.TEXT_PRIMARY)
+            textSize = 15f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            maxLines = 3
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            ).apply {
+                topMargin = MantaTheme.dp(context, 14f)
+            }
+        }
+        card.addView(titleTv)
+
+        // Bottom: Status Pill (`Active` or `Hibernated in RAM`)
+        val statusPill = TextView(context).apply {
+            text = if (isActive) "Active Tab" else "Saved in Rust RAM"
+            setTextColor(if (isActive) MantaTheme.ACCENT_EMERALD else MantaTheme.TEXT_MUTED)
+            textSize = 11f
+        }
+        card.addView(statusPill)
+
+        // Attach Swipe-to-Dismiss & Tap Gesture Listener to Card
+        attachSwipeToDismissGesture(card, tab.id)
+        return card
+    }
+
+    private fun attachSwipeToDismissGesture(card: View, tabId: Int) {
+        var downX = 0f
+        var downY = 0f
+        var swiping = false
+
+        card.setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = ev.rawX
+                    downY = ev.rawY
+                    swiping = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = ev.rawX - downX
+                    val dy = ev.rawY - downY
+                    if (abs(dx) > MantaTheme.dpF(context, 14f) && abs(dx) > abs(dy)) {
+                        swiping = true
+                        v.parent?.requestDisallowInterceptTouchEvent(true)
+                    }
+                    if (swiping) {
+                        v.translationX = dx
+                        v.alpha = (1f - abs(dx) / (v.width.coerceAtLeast(200) * 0.9f)).coerceIn(0.2f, 1f)
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val dx = ev.rawX - downX
+                    val dy = ev.rawY - downY
+                    if (swiping && abs(dx) > v.width * 0.38f) {
+                        onCloseTab(tabId)
+                    } else {
+                        if (!swiping && abs(dx) < MantaTheme.dpF(context, 10f) && abs(dy) < MantaTheme.dpF(context, 10f)) {
+                            onSelectTab(tabId)
+                        }
+                        v.animate().translationX(0f).alpha(1f).setDuration(180L).start()
+                    }
+                    true
+                }
+                else -> false
+            }
         }
     }
 }

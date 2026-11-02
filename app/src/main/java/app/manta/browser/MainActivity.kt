@@ -5,14 +5,12 @@ import android.os.Bundle
 import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.Toast
 import app.manta.browser.core.MantaNative
 import app.manta.browser.core.ZeroDiskJanitor
 import app.manta.browser.ui.components.MiniStatusPill
 import app.manta.browser.ui.components.SlidingBottomDock
 import app.manta.browser.ui.screens.EphemeralTabInfo
-import app.manta.browser.ui.screens.HomeScreen
 import app.manta.browser.ui.screens.LibraryTabsScreen
 import app.manta.browser.ui.screens.SearchBrowserScreen
 import app.manta.browser.ui.theme.MantaTheme
@@ -20,8 +18,10 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Manta Main Activity:
- * Orchestrates the Multi-Tab Rust-Accelerated Browser, the Muse-inspired
- * `MiniStatusPill`, and the draggable/slidable `SlidingBottomDock` (Home | Search | Library).
+ * - Full-screen edge-to-edge browser viewport (`SearchBrowserScreen`).
+ * - Single auto-hiding M3 Expressive Gesture Dock (`SlidingBottomDock`) at the bottom.
+ * - Floating Google Omnibox & Quick Settings Sheet (`MiniStatusPill`).
+ * - Full-screen M3 Expressive 2-Column Tab Chooser Grid (`LibraryTabsScreen`).
  */
 class MainActivity : Activity() {
 
@@ -29,12 +29,11 @@ class MainActivity : Activity() {
     private val shieldLogs = CopyOnWriteArrayList<String>()
     private var activeTabId: Int = 1
     private var corsDevPermissive: Boolean = true
-    private var currentDockSection: Int = 0
+    private var activeLoadProgress: Int = 100
 
-    private var homeScreen: HomeScreen? = null
     private var searchScreen: SearchBrowserScreen? = null
-    private var libraryScreen: LibraryTabsScreen? = null
-    private var miniStatusPill: MiniStatusPill? = null
+    private var tabChooserScreen: LibraryTabsScreen? = null
+    private var omniboxSheet: MiniStatusPill? = null
     private var bottomDock: SlidingBottomDock? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,8 +43,8 @@ class MainActivity : Activity() {
         openTabs.add(
             EphemeralTabInfo(
                 id = activeTabId,
-                title = "Manta Browser",
-                url = "https://duckduckgo.com"
+                title = "New Tab",
+                url = "manta://start"
             )
         )
 
@@ -53,146 +52,191 @@ class MainActivity : Activity() {
             setBackgroundColor(MantaTheme.BG_OBSIDIAN)
         }
 
-        val pill = MiniStatusPill(
+        // 1. Construct Floating Gesture Bottom Dock
+        val dock = SlidingBottomDock(
             context = this,
-            onOpenActivePage = { switchDockSection(1, animateDock = true) },
-            onReloadPage = { searchScreen?.reloadCurrentPage() },
-            onZeroizeRam = { performInstantZeroizePurge() }
+            onAddressBarTap = {
+                val curUrl = searchScreen?.currentUrl ?: ""
+                omniboxSheet?.showOmnibox(curUrl, focusKeyboard = true)
+            },
+            onTabSwitcherTap = {
+                openTabChooser()
+            },
+            onMenuTap = {
+                val curUrl = searchScreen?.currentUrl ?: ""
+                omniboxSheet?.showOmnibox(curUrl, focusKeyboard = false)
+            },
+            onHorizontalTabSwipe = { direction ->
+                searchScreen?.cycleTabByOffset(direction)
+                syncDockAndTelemetry()
+            },
+            onBackTap = {
+                if (searchScreen?.handleBackNavigation() != true) {
+                    searchScreen?.loadInputUrlOrQuery("manta://start", false)
+                }
+                syncDockAndTelemetry()
+            }
         )
-        miniStatusPill = pill
-
-        val dock = SlidingBottomDock(this) { sectionIndex ->
-            switchDockSection(sectionIndex, animateDock = false)
-        }
         bottomDock = dock
 
-        val home = HomeScreen(
+        // 2. Construct Floating Omnibox & Command Sheet
+        val omni = MiniStatusPill(
             context = this,
-            onLaunchUrl = { url, preferRustReader ->
-                switchDockSection(1, animateDock = true)
-                searchScreen?.loadInputUrlOrQuery(url, preferRustReader)
+            onNavigateToUrlOrSearch = { queryOrUrl, forceReader ->
+                searchScreen?.loadInputUrlOrQuery(queryOrUrl, forceReader)
+                syncDockAndTelemetry()
             },
-            onToggleCorsDev = { enabled ->
+            onReloadPage = {
+                searchScreen?.reloadCurrentPage()
+            },
+            onToggleReaderMode = {
+                searchScreen?.toggleReaderMode()
+            },
+            onToggleCorsMode = { enabled ->
                 corsDevPermissive = enabled
                 MantaNative.setCorsDevMode(enabled)
-                shieldLogs.add("Developer CORS Mode set to: ${if (enabled) "OPEN" else "STRICT"}")
-                refreshStatusPill()
+                shieldLogs.add("CORS Bypass: ${if (enabled) "ON" else "OFF"}")
+                syncDockAndTelemetry()
             },
-            onTriggerZeroize = {
+            onZeroizeRam = {
                 performInstantZeroizePurge()
             }
         )
-        homeScreen = home
+        omniboxSheet = omni
 
-        val search = SearchBrowserScreen(
+        // 3. Construct Full-Screen Browser Viewport
+        val browser = SearchBrowserScreen(
             context = this,
             openTabs = openTabs,
             getActiveTabId = { activeTabId },
             setActiveTabId = { newId -> activeTabId = newId },
             isCorsDevEnabled = { corsDevPermissive },
-            onStateUpdated = { title, url ->
+            onStateUpdated = { title, url, progress ->
+                activeLoadProgress = progress
                 openTabs.find { it.id == activeTabId }?.let {
                     it.title = title
                     it.url = url
                 }
-                refreshStatusPill()
+                syncDockAndTelemetry()
+            },
+            onScrollDirectionChanged = { scrollingDown ->
+                dock.setDockVisible(!scrollingDown)
+            },
+            onOpenOmnibox = {
+                val curUrl = searchScreen?.currentUrl ?: ""
+                omni.showOmnibox(curUrl, focusKeyboard = true)
             },
             onShieldLog = { event ->
                 shieldLogs.add(event)
             }
         )
-        searchScreen = search
+        searchScreen = browser
 
-        val library = LibraryTabsScreen(
+        // 4. Construct M3 Expressive 2-Column Tab Chooser Screen
+        val tabChooser = LibraryTabsScreen(
             context = this,
             tabs = openTabs,
             getActiveTabId = { activeTabId },
             onSelectTab = { tabId ->
-                search.switchToExistingTab(tabId)
-                switchDockSection(1, animateDock = true)
+                closeTabChooser()
+                browser.switchToExistingTab(tabId)
+                syncDockAndTelemetry()
             },
             onCreateNewTab = {
-                search.createNewTabAndSwitch("https://duckduckgo.com")
-                switchDockSection(1, animateDock = true)
+                closeTabChooser()
+                browser.createNewTabAndSwitch("manta://start")
+                syncDockAndTelemetry()
             },
             onCloseTab = { tabId ->
-                search.closeTabById(tabId)
-                libraryScreen?.refreshLibraryState(shieldLogs)
-                refreshStatusPill()
+                browser.closeTabById(tabId)
+                tabChooserScreen?.refreshLibraryState(shieldLogs)
+                syncDockAndTelemetry()
             },
             onZeroizeAll = {
+                closeTabChooser()
                 performInstantZeroizePurge()
+            },
+            onDismissSheet = {
+                closeTabChooser()
             }
         )
-        libraryScreen = library
+        tabChooserScreen = tabChooser
 
-        rootContainer.addView(home)
-        rootContainer.addView(search)
-        rootContainer.addView(library)
-
-        val bottomFloatingStack = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            val marginH = MantaTheme.dp(this@MainActivity, 12f)
-            val marginB = MantaTheme.dp(this@MainActivity, 10f)
-            layoutParams = FrameLayout.LayoutParams(
+        // Assemble layers: Fullscreen Browser -> Floating Dock -> Omnibox Overlay -> Tab Chooser Overlay
+        rootContainer.addView(
+            browser,
+            FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM
-            ).apply {
-                setMargins(marginH, 0, marginH, marginB)
-            }
-        }
-
-        bottomFloatingStack.addView(
-            pill,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = MantaTheme.dp(this@MainActivity, 8f)
-            }
-        )
-
-        bottomFloatingStack.addView(
-            dock,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                MantaTheme.dp(this, 60f)
+                FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
 
-        rootContainer.addView(bottomFloatingStack)
+        val dockMarginH = MantaTheme.dp(this, 14f)
+        val dockMarginB = MantaTheme.dp(this, 12f)
+        rootContainer.addView(
+            dock,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                MantaTheme.dp(this, 56f),
+                Gravity.BOTTOM
+            ).apply {
+                setMargins(dockMarginH, 0, dockMarginH, dockMarginB)
+            }
+        )
+
+        rootContainer.addView(
+            omni,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        rootContainer.addView(
+            tabChooser,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
         setContentView(rootContainer)
 
-        search.bootInitialPage()
-        switchDockSection(0, animateDock = false)
-        refreshStatusPill()
+        browser.bootInitialPage()
+        syncDockAndTelemetry()
     }
 
-    private fun switchDockSection(index: Int, animateDock: Boolean) {
-        currentDockSection = index
-        homeScreen?.visibility = if (index == 0) View.VISIBLE else View.GONE
-        searchScreen?.visibility = if (index == 1) View.VISIBLE else View.GONE
-        libraryScreen?.visibility = if (index == 2) View.VISIBLE else View.GONE
-
-        if (index == 1) {
-            searchScreen?.renderTabStrip()
-        } else if (index == 2) {
-            libraryScreen?.refreshLibraryState(shieldLogs)
+    private fun openTabChooser() {
+        omniboxSheet?.dismissOverlay()
+        tabChooserScreen?.refreshLibraryState(shieldLogs)
+        tabChooserScreen?.apply {
+            alpha = 0f
+            translationY = MantaTheme.dpF(context, 40f)
+            visibility = View.VISIBLE
+            animate().alpha(1f).translationY(0f).setDuration(200L).start()
         }
-        if (animateDock) {
-            bottomDock?.setSelectedSection(index, animate = true)
-        }
-        refreshStatusPill()
     }
 
-    private fun refreshStatusPill() {
+    private fun closeTabChooser() {
+        tabChooserScreen?.visibility = View.GONE
+    }
+
+    private fun syncDockAndTelemetry() {
         val activeTab = openTabs.find { it.id == activeTabId }
+        val urlOrTitle = activeTab?.url ?: "manta://start"
         val ramBytes = MantaNative.getEngineRamBytes()
-        miniStatusPill?.updateStatus(
-            title = activeTab?.title ?: "Manta Browser",
+
+        bottomDock?.updateDockState(
+            urlOrTitle = urlOrTitle,
+            tabsCount = openTabs.size,
+            progress = activeLoadProgress,
+            isCorsEnabled = corsDevPermissive
+        )
+
+        omniboxSheet?.updateStatus(
+            title = activeTab?.title ?: "Manta",
             ramBytes = ramBytes,
-            corsEnabled = corsDevPermissive,
+            isCorsOn = corsDevPermissive,
             tabCount = openTabs.size
         )
     }
@@ -204,24 +248,29 @@ class MainActivity : Activity() {
         shieldLogs.clear()
 
         activeTabId = MantaNative.initEngine(corsDevPermissive)
-        openTabs.add(EphemeralTabInfo(activeTabId, "Manta Zeroized", "manta://benchmark"))
-        searchScreen?.renderTabStrip()
-        libraryScreen?.refreshLibraryState(shieldLogs)
-        refreshStatusPill()
+        openTabs.add(EphemeralTabInfo(activeTabId, "New Tab", "manta://start"))
+        searchScreen?.bootInitialPage()
+        tabChooserScreen?.refreshLibraryState(shieldLogs)
+        syncDockAndTelemetry()
         Toast.makeText(
             this,
-            "All Volatile RAM, Tabs & Cookies Zeroized (0 B)",
+            "Zeroized All Volatile RAM, Cookies & Tabs (0 B)",
             Toast.LENGTH_SHORT
         ).show()
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (currentDockSection == 1 && searchScreen?.handleBackNavigation() == true) {
+        if (omniboxSheet?.visibility == View.VISIBLE) {
+            omniboxSheet?.dismissOverlay()
             return
         }
-        if (currentDockSection != 0) {
-            switchDockSection(0, animateDock = true)
+        if (tabChooserScreen?.visibility == View.VISIBLE) {
+            closeTabChooser()
+            return
+        }
+        if (searchScreen?.handleBackNavigation() == true) {
+            syncDockAndTelemetry()
             return
         }
         ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)

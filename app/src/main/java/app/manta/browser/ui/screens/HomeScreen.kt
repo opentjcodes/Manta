@@ -3,10 +3,11 @@ package app.manta.browser.ui.screens
 import android.content.Context
 import android.graphics.Typeface
 import android.view.Gravity
-import android.widget.HorizontalScrollView
+import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import app.manta.browser.core.MantaNative
 import app.manta.browser.ui.theme.MantaTheme
 
 data class QuickLaunchSite(
@@ -18,431 +19,163 @@ data class QuickLaunchSite(
 )
 
 /**
- * Muse-Inspired Home Screen:
- * - Bold `MANTA` brand bar + top-right developer CORS toggle
- * - Horizontal scrollable filter pills
- * - Featured Workspaces & Full-Fidelity Speed Dial cards
+ * Minimalist Native Browser Start Page (`HomeScreen.kt`):
+ * - Displayed only on a fresh blank tab (`manta://start`).
+ * - Borderless M3 Expressive aesthetics: clean Google Search trigger pill,
+ *   8 minimalist squircle speed-dials, and a subtle Rust Core status pill.
  */
 class HomeScreen(
     context: Context,
-    private val onLaunchUrl: (url: String, preferRustReader: Boolean) -> Unit,
-    private val onToggleCorsDev: (Boolean) -> Unit,
-    private val onTriggerZeroize: () -> Unit
+    private val onOpenOmniboxSearch: () -> Unit,
+    private val onLaunchUrl: (url: String, preferRustReader: Boolean) -> Unit
 ) : ScrollView(context) {
 
-    private var corsEnabled = true
-    private var selectedCategoryIndex = 0
-    private val categoryChipViews = ArrayList<TextView>()
+    private val telemetryPill: TextView
 
     init {
         setBackgroundColor(MantaTheme.BG_OBSIDIAN)
         isVerticalScrollBarEnabled = false
+        isFillViewport = true
 
-        val root = LinearLayout(context).apply {
+        val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            val padH = MantaTheme.dp(context, 18f)
-            setPadding(padH, MantaTheme.dp(context, 22f), padH, MantaTheme.dp(context, 160f))
+            gravity = Gravity.CENTER_HORIZONTAL
+            val padH = MantaTheme.dp(context, 24f)
+            setPadding(padH, MantaTheme.dp(context, 84f), padH, MantaTheme.dp(context, 120f))
         }
 
-        // 1. Top Header Bar (`MANTA` + Settings/CORS toggle button)
-        val headerRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val brandTitle = TextView(context).apply {
-            text = "M A N T A"
+        // 1. Minimalist Wordmark
+        val logoBadge = TextView(context).apply {
+            text = "manta"
             setTextColor(MantaTheme.TEXT_PRIMARY)
-            textSize = 22f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            textSize = 36f
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            letterSpacing = 0.08f
+            gravity = Gravity.CENTER
         }
-        headerRow.addView(brandTitle)
+        container.addView(logoBadge)
 
-        val corsBadgeBtn = TextView(context).apply {
-            text = "CORS: OPEN"
-            setTextColor(MantaTheme.ACCENT_EMERALD)
-            textSize = 11.5f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            val pH = MantaTheme.dp(context, 12f)
-            val pV = MantaTheme.dp(context, 7f)
-            setPadding(pH, pV, pH, pV)
-            background = MantaTheme.roundedBg(
-                fillColor = MantaTheme.BG_SURFACE,
-                radiusDp = 14f,
-                context = context,
-                strokeColor = MantaTheme.BORDER_SUBTLE,
-                strokeWidthDp = 1f
-            )
-            setOnClickListener {
-                corsEnabled = !corsEnabled
-                text = if (corsEnabled) "CORS: OPEN" else "CORS: STRICT"
-                setTextColor(if (corsEnabled) MantaTheme.ACCENT_EMERALD else MantaTheme.TEXT_SECONDARY)
-                onToggleCorsDev(corsEnabled)
+        telemetryPill = TextView(context).apply {
+            val cores = MantaNative.getWorkerCoreCount()
+            text = "$cores Rust Cores • Zero Cookie Tracking • CORS Unlocked"
+            setTextColor(MantaTheme.TEXT_MUTED)
+            textSize = 12f
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = MantaTheme.dp(context, 6f)
+                bottomMargin = MantaTheme.dp(context, 34f)
             }
         }
-        headerRow.addView(corsBadgeBtn)
-        root.addView(headerRow)
+        container.addView(telemetryPill)
 
-        // 2. Horizontal Category Chips Row (Muse-style)
-        val chipsScroll = HorizontalScrollView(context).apply {
-            isHorizontalScrollBarEnabled = false
+        // 2. Expressive Pill Search Bar Trigger (Defaults to Google Search)
+        val searchPill = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val pH = MantaTheme.dp(context, 20f)
+            val pV = MantaTheme.dp(context, 16f)
+            setPadding(pH, pV, pH, pV)
+            background = MantaTheme.roundedBg(MantaTheme.BG_CARD, 32f, context)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = MantaTheme.dp(context, 18f)
-                bottomMargin = MantaTheme.dp(context, 22f)
+                bottomMargin = MantaTheme.dp(context, 36f)
+            }
+            setOnClickListener { onOpenOmniboxSearch() }
+        }
+
+        val gIcon = TextView(context).apply {
+            text = "G"
+            setTextColor(MantaTheme.ACCENT_PRIMARY)
+            textSize = 18f
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginEnd = MantaTheme.dp(context, 14f)
             }
         }
-        val chipsRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
+        searchPill.addView(gIcon)
+
+        val promptTv = TextView(context).apply {
+            text = "Search Google or type URL"
+            setTextColor(MantaTheme.TEXT_SECONDARY)
+            textSize = 15.5f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val categories = listOf(
-            "All Curated",
-            "Full Engine",
-            "CORS Dev Test",
-            "Zero-Cookie Shield",
-            "Instant Wipe"
+        searchPill.addView(promptTv)
+        container.addView(searchPill)
+
+        // 3. Minimalist 4-Column Squircle Speed Dials (Zero lines, pure tonal squircles)
+        val grid = GridLayout(context).apply {
+            columnCount = 4
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val dials = listOf(
+            QuickLaunchSite("Google", "", "https://www.google.com", MantaTheme.CONTAINER_PRIMARY, "G"),
+            QuickLaunchSite("GitHub", "", "https://github.com", MantaTheme.BG_CARD, "GH"),
+            QuickLaunchSite("YouTube", "", "https://m.youtube.com", MantaTheme.CONTAINER_TERTIARY, "▶"),
+            QuickLaunchSite("DuckDuckGo", "", "https://duckduckgo.com", MantaTheme.CONTAINER_SECONDARY, "DDG"),
+            QuickLaunchSite("HackerNews", "", "https://news.ycombinator.com", MantaTheme.BG_CARD, "Y"),
+            QuickLaunchSite("Wikipedia", "", "https://www.wikipedia.org", MantaTheme.BG_CARD, "W"),
+            QuickLaunchSite("Localhost", "", "http://localhost:3000", MantaTheme.CONTAINER_PRIMARY, "DEV"),
+            QuickLaunchSite("CORS Lab", "", "manta://cors-lab", MantaTheme.CONTAINER_SECONDARY, "LAB")
         )
-        categories.forEachIndexed { idx, label ->
-            val chip = TextView(context).apply {
-                text = label
-                textSize = 13.5f
+
+        for (dial in dials) {
+            val itemLayout = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                val pad = MantaTheme.dp(context, 8f)
+                setPadding(pad, pad, pad, MantaTheme.dp(context, 16f))
+                layoutParams = GridLayout.LayoutParams().apply {
+                    width = 0
+                    columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                }
+                setOnClickListener {
+                    onLaunchUrl(dial.url, false)
+                }
+            }
+
+            val squircle = TextView(context).apply {
+                text = dial.badge
+                setTextColor(MantaTheme.TEXT_PRIMARY)
+                textSize = 14f
                 typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-                val pH = MantaTheme.dp(context, 18f)
-                val pV = MantaTheme.dp(context, 9f)
-                setPadding(pH, pV, pH, pV)
+                gravity = Gravity.CENTER
+                background = MantaTheme.roundedBg(dial.accentColor, 20f, context)
+                val s = MantaTheme.dp(context, 56f)
+                layoutParams = LinearLayout.LayoutParams(s, s)
+            }
+            itemLayout.addView(squircle)
+
+            val label = TextView(context).apply {
+                text = dial.title
+                setTextColor(MantaTheme.TEXT_SECONDARY)
+                textSize = 11.5f
+                gravity = Gravity.CENTER
+                maxLines = 1
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    marginEnd = MantaTheme.dp(context, 10f)
-                }
-                setOnClickListener {
-                    if (idx == 4) {
-                        onTriggerZeroize()
-                    } else {
-                        selectCategoryChip(idx)
-                    }
+                    topMargin = MantaTheme.dp(context, 7f)
                 }
             }
-            categoryChipViews.add(chip)
-            chipsRow.addView(chip)
-        }
-        chipsScroll.addView(chipsRow)
-        root.addView(chipsScroll)
-        selectCategoryChip(0)
-
-        // 3. Section: FEATURED ENGINE WORKSPACES
-        root.addView(makeOverline(context, "RUST-ACCELERATED FULL ENGINE"))
-        root.addView(makeSectionTitle(context, "Developer & Zero-Trace Workspaces"))
-
-        val featuredScroll = HorizontalScrollView(context).apply {
-            isHorizontalScrollBarEnabled = false
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = MantaTheme.dp(context, 12f)
-                bottomMargin = MantaTheme.dp(context, 26f)
-            }
-        }
-        val featuredRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
+            itemLayout.addView(label)
+            grid.addView(itemLayout)
         }
 
-        val featuredCards = listOf(
-            QuickLaunchSite(
-                title = "DuckDuckGo Search",
-                subtitle = "Full UI • Rust Shield Active",
-                url = "https://duckduckgo.com",
-                accentColor = 0xFF1E3A2F.toInt(),
-                badge = "SEARCH"
-            ),
-            QuickLaunchSite(
-                title = "CORS & Bot Shield Lab",
-                subtitle = "Verify Webdriver=false & CORS",
-                url = "manta://cors-lab",
-                accentColor = 0xFF2E1F47.toInt(),
-                badge = "CORS"
-            ),
-            QuickLaunchSite(
-                title = "Localhost Dev Server",
-                subtitle = "http://localhost:3000",
-                url = "http://localhost:3000",
-                accentColor = 0xFF172554.toInt(),
-                badge = "DEV"
-            )
-        )
-
-        for (item in featuredCards) {
-            featuredRow.addView(makeFeaturedCard(context, item))
-        }
-        featuredScroll.addView(featuredRow)
-        root.addView(featuredScroll)
-
-        // 4. Section: SPEED DIAL & WEB LAUNCHPAD (Opens in Full Chrome-Grade Engine with Rust Shield)
-        root.addView(makeSectionTitle(context, "Full-Fidelity Web Launchpad"))
-        root.addView(makeSubtitleText(context, "Full CSS/JS rendering • Ad/Tracker Shield • Zero disk cache"))
-
-        val speedDialSites = listOf(
-            QuickLaunchSite(
-                title = "Google Search",
-                subtitle = "google.com • Full mobile layout with trackers stripped",
-                url = "https://www.google.com",
-                accentColor = 0xFF1E293B.toInt(),
-                badge = "WEB"
-            ),
-            QuickLaunchSite(
-                title = "GitHub",
-                subtitle = "github.com • Full interactive repositories & code",
-                url = "https://github.com",
-                accentColor = 0xFF18181B.toInt(),
-                badge = "CODE"
-            ),
-            QuickLaunchSite(
-                title = "YouTube Mobile",
-                subtitle = "m.youtube.com • Ad-shielded video & media test",
-                url = "https://m.youtube.com",
-                accentColor = 0xFF3B1219.toInt(),
-                badge = "MEDIA"
-            ),
-            QuickLaunchSite(
-                title = "Hacker News",
-                subtitle = "news.ycombinator.com • Instant zero-bloat load",
-                url = "https://news.ycombinator.com",
-                accentColor = 0xFF27272A.toInt(),
-                badge = "TECH"
-            ),
-            QuickLaunchSite(
-                title = "MDN Web Docs",
-                subtitle = "developer.mozilla.org • Full CSS/JS documentation",
-                url = "https://developer.mozilla.org/en-US/",
-                accentColor = 0xFF1E1B4B.toInt(),
-                badge = "DOCS"
-            ),
-            QuickLaunchSite(
-                title = "HTTPBin Headers Inspector",
-                subtitle = "httpbin.org/headers • Verify DNT, Sec-GPC & Zero Cookies",
-                url = "https://httpbin.org/headers",
-                accentColor = 0xFF0F2922.toInt(),
-                badge = "TEST"
-            )
-        )
-
-        for (site in speedDialSites) {
-            root.addView(makeSpeedDialRowCard(context, site))
-        }
-
-        addView(root)
-    }
-
-    private fun selectCategoryChip(index: Int) {
-        selectedCategoryIndex = index
-        categoryChipViews.forEachIndexed { i, tv ->
-            val active = i == index
-            tv.setTextColor(if (active) MantaTheme.BG_OBSIDIAN else MantaTheme.TEXT_SECONDARY)
-            tv.background = MantaTheme.roundedBg(
-                fillColor = if (active) MantaTheme.BG_CHIP_ACTIVE else MantaTheme.BG_CHIP_INACTIVE,
-                radiusDp = 20f,
-                context = context,
-                strokeColor = if (active) 0 else MantaTheme.BORDER_SUBTLE,
-                strokeWidthDp = if (active) 0f else 1f
-            )
-        }
-    }
-
-    private fun makeOverline(context: Context, text: String): TextView {
-        return TextView(context).apply {
-            this.text = text
-            setTextColor(MantaTheme.TEXT_MUTED)
-            textSize = 11f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            letterSpacing = 0.12f
-        }
-    }
-
-    private fun makeSectionTitle(context: Context, text: String): TextView {
-        return TextView(context).apply {
-            this.text = text
-            setTextColor(MantaTheme.TEXT_PRIMARY)
-            textSize = 20f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = MantaTheme.dp(context, 3f)
-            }
-        }
-    }
-
-    private fun makeSubtitleText(context: Context, text: String): TextView {
-        return TextView(context).apply {
-            this.text = text
-            setTextColor(MantaTheme.TEXT_SECONDARY)
-            textSize = 12.5f
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = MantaTheme.dp(context, 2f)
-                bottomMargin = MantaTheme.dp(context, 12f)
-            }
-        }
-    }
-
-    private fun makeFeaturedCard(context: Context, item: QuickLaunchSite): LinearLayout {
-        val cardWidth = MantaTheme.dp(context, 168f)
-        val cardHeight = MantaTheme.dp(context, 168f)
-
-        val wrapper = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(cardWidth, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                marginEnd = MantaTheme.dp(context, 14f)
-            }
-            setOnClickListener {
-                onLaunchUrl(item.url, item.url.startsWith("manta://"))
-            }
-        }
-
-        val artworkBox = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.BOTTOM
-            val p = MantaTheme.dp(context, 14f)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(cardWidth, cardHeight)
-            background = MantaTheme.roundedBg(
-                fillColor = item.accentColor,
-                radiusDp = 18f,
-                context = context,
-                strokeColor = MantaTheme.BORDER_SUBTLE,
-                strokeWidthDp = 1f
-            )
-        }
-
-        val badgeTv = TextView(context).apply {
-            text = item.badge
-            setTextColor(MantaTheme.TEXT_PRIMARY)
-            textSize = 11f
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-        }
-        val centerLabel = TextView(context).apply {
-            text = item.title
-            setTextColor(MantaTheme.TEXT_PRIMARY)
-            textSize = 18f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            ).apply {
-                topMargin = MantaTheme.dp(context, 14f)
-            }
-        }
-        val playBadge = TextView(context).apply {
-            text = "▶"
-            setTextColor(MantaTheme.TEXT_PRIMARY)
-            textSize = 13f
-            gravity = Gravity.CENTER
-            background = MantaTheme.roundedBg(0xFF09090B.toInt(), 10f, context)
-            val s = MantaTheme.dp(context, 34f)
-            layoutParams = LinearLayout.LayoutParams(s, s).apply {
-                gravity = Gravity.END
-            }
-        }
-
-        artworkBox.addView(badgeTv)
-        artworkBox.addView(centerLabel)
-        artworkBox.addView(playBadge)
-        wrapper.addView(artworkBox)
-
-        val titleTv = TextView(context).apply {
-            text = item.title
-            setTextColor(MantaTheme.TEXT_PRIMARY)
-            textSize = 14f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = MantaTheme.dp(context, 8f)
-            }
-        }
-        val subTv = TextView(context).apply {
-            text = item.subtitle
-            setTextColor(MantaTheme.TEXT_SECONDARY)
-            textSize = 12f
-        }
-        wrapper.addView(titleTv)
-        wrapper.addView(subTv)
-
-        return wrapper
-    }
-
-    private fun makeSpeedDialRowCard(context: Context, site: QuickLaunchSite): LinearLayout {
-        return LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val p = MantaTheme.dp(context, 14f)
-            setPadding(p, p, p, p)
-            background = MantaTheme.roundedBg(
-                fillColor = MantaTheme.BG_CARD,
-                radiusDp = 16f,
-                context = context,
-                strokeColor = MantaTheme.BORDER_SUBTLE,
-                strokeWidthDp = 1f
-            )
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = MantaTheme.dp(context, 10f)
-            }
-            setOnClickListener {
-                // Launch all real websites in Full Chrome-Grade Engine (`preferRustReader = false`)
-                onLaunchUrl(site.url, false)
-            }
-
-            val badge = TextView(context).apply {
-                text = site.badge
-                setTextColor(MantaTheme.ACCENT_CYAN)
-                textSize = 10.5f
-                typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-                gravity = Gravity.CENTER
-                background = MantaTheme.roundedBg(site.accentColor, 10f, context)
-                layoutParams = LinearLayout.LayoutParams(
-                    MantaTheme.dp(context, 56f),
-                    MantaTheme.dp(context, 42f)
-                )
-            }
-            addView(badge)
-
-            val col = LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = MantaTheme.dp(context, 12f)
-                }
-            }
-            col.addView(TextView(context).apply {
-                text = site.title
-                setTextColor(MantaTheme.TEXT_PRIMARY)
-                textSize = 14.5f
-                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            })
-            col.addView(TextView(context).apply {
-                text = site.subtitle
-                setTextColor(MantaTheme.TEXT_SECONDARY)
-                textSize = 12f
-            })
-            addView(col)
-
-            addView(TextView(context).apply {
-                text = "→"
-                setTextColor(MantaTheme.TEXT_SECONDARY)
-                textSize = 16f
-            })
-        }
+        container.addView(grid)
+        addView(container)
     }
 }
