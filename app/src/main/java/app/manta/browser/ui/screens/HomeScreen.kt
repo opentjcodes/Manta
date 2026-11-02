@@ -57,7 +57,7 @@ class HomeScreen(
 
         telemetryPill = TextView(context).apply {
             val cores = MantaNative.getWorkerCoreCount()
-            text = "$cores Rust Cores • Zero Cookie Tracking • CORS Unlocked"
+            text = "$cores Rust Cores • Site Isolation • Zero Disk Cache"
             setTextColor(MantaTheme.TEXT_MUTED)
             textSize = 12f
             gravity = Gravity.CENTER
@@ -127,8 +127,8 @@ class HomeScreen(
             QuickLaunchSite("DuckDuckGo", "", "https://duckduckgo.com", MantaTheme.CONTAINER_SECONDARY, "DDG"),
             QuickLaunchSite("HackerNews", "", "https://news.ycombinator.com", MantaTheme.BG_CARD, "Y"),
             QuickLaunchSite("Wikipedia", "", "https://www.wikipedia.org", MantaTheme.BG_CARD, "W"),
-            QuickLaunchSite("Localhost", "", "http://localhost:3000", MantaTheme.CONTAINER_PRIMARY, "DEV"),
-            QuickLaunchSite("CORS Lab", "", "manta://cors-lab", MantaTheme.CONTAINER_SECONDARY, "LAB")
+            QuickLaunchSite("MDN Docs", "", "https://developer.mozilla.org", MantaTheme.CONTAINER_PRIMARY, "MDN"),
+            QuickLaunchSite("Rust Docs", "", "https://www.rust-lang.org", MantaTheme.CONTAINER_SECONDARY, "RS")
         )
 
         for (dial in dials) {

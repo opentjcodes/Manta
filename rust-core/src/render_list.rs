@@ -162,6 +162,19 @@ fn layout_node_recursive(
                 }
             }
         }
+        if tag == "hr" {
+            *cursor_y += 8.0;
+            commands.push(PaintCommand::FillRect {
+                x,
+                y: *cursor_y,
+                width: avail_width,
+                height: 1.5,
+                color_argb: 0xFF232734,
+                corner_radius: 1.0,
+            });
+            *cursor_y += 10.0;
+            return;
+        }
 
         *cursor_y += style.margin_vertical;
 
@@ -172,7 +185,7 @@ fn layout_node_recursive(
                 width: avail_width,
                 height: style.font_size_sp + (style.padding * 2.0) + 8.0,
                 color_argb: style.background_color,
-                corner_radius: 10.0,
+                corner_radius: style.corner_radius,
             });
         }
     }
@@ -185,10 +198,30 @@ fn layout_node_recursive(
                 ComputedStyle::default()
             };
 
+            let prefix = if node.parent != NO_NODE {
+                if let NodeKind::Element { ref tag, .. } = dom.nodes()[node.parent as usize].kind {
+                    if tag == "li" {
+                        "• "
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            };
+
+            let full_text = if prefix.is_empty() {
+                text.clone()
+            } else {
+                format!("{}{}", prefix, text)
+            };
+
             commands.push(PaintCommand::DrawText {
                 x: x + parent_style.padding,
                 y: *cursor_y + parent_style.padding,
-                text: text.clone(),
+                text: full_text.clone(),
                 color_argb: parent_style.text_color,
                 font_size_sp: parent_style.font_size_sp,
                 bold: parent_style.font_weight_bold,
@@ -196,7 +229,7 @@ fn layout_node_recursive(
             });
 
             let chars_per_line = (avail_width / (parent_style.font_size_sp * 0.55)).max(12.0);
-            let lines = ((text.len() as f32) / chars_per_line).ceil().max(1.0);
+            let lines = ((full_text.len() as f32) / chars_per_line).ceil().max(1.0);
             *cursor_y += lines * (parent_style.font_size_sp * 1.45) + 4.0;
         }
     }

@@ -58,6 +58,11 @@ jobs:
       - name: Inspect Compiled Rust Engine Binary Size
         run: ls -lh app/src/main/jniLibs/arm64-v8a/libmanta_core.so
 
+      - name: Sync Root logo.png into Android Drawable Resources
+        run: |
+          mkdir -p app/src/main/res/drawable-nodpi
+          cp logo.png app/src/main/res/drawable-nodpi/logo.png
+
       - name: Set up Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:

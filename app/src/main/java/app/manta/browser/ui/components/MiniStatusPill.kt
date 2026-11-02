@@ -17,31 +17,32 @@ import app.manta.browser.core.MantaNative
 import app.manta.browser.ui.theme.MantaTheme
 
 /**
- * M3 Expressive Floating Omnibox & Engine Control Sheet (`MiniStatusPill.kt`):
- * - Appears as a borderless, glass-like M3 Expressive overlay when tapping the address bar or menu.
+ * M3 Expressive Floating Omnibox & Chrome Control Sheet (`MiniStatusPill.kt`):
+ * - Appears as a borderless M3 Expressive overlay when tapping the address bar or menu.
  * - Uses Google Search (`https://www.google.com/search?q=...`) as the default search engine.
- * - Provides 1-tap domain helpers, Reload, Reader Mode toggle, CORS Dev toggle, and Instant RAM Zeroize.
+ * - Provides 1-tap domain helpers, Reload, Reader Mode toggle, Desktop Site toggle,
+ *   and Clear Custom Storage.
  */
 class MiniStatusPill(
     context: Context,
     private val onNavigateToUrlOrSearch: (queryOrUrl: String, forceReader: Boolean) -> Unit,
     private val onReloadPage: () -> Unit,
     private val onToggleReaderMode: () -> Unit,
-    private val onToggleCorsMode: (Boolean) -> Unit,
+    private val onToggleDesktopMode: (Boolean) -> Unit,
     private val onZeroizeRam: () -> Unit
 ) : FrameLayout(context) {
 
     private val addressInput: EditText
     private val telemetrySubtitle: TextView
-    private val corsPillBtn: TextView
+    private val desktopPillBtn: TextView
     private val readerPillBtn: TextView
 
-    private var corsEnabled: Boolean = true
+    private var desktopEnabled: Boolean = false
     private var readerEnabled: Boolean = false
 
     init {
         visibility = View.GONE
-        setBackgroundColor(0xB805060A.toInt()) // Soft scrim backdrop
+        setBackgroundColor(0xB805060A.toInt())
         setOnClickListener { dismissOverlay() }
 
         val sheetCard = LinearLayout(context).apply {
@@ -136,7 +137,7 @@ class MiniStatusPill(
         val tokensRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
         }
-        val quickTokens = listOf("https://", ".com", ".dev", "localhost:3000", "google.com", "github.com")
+        val quickTokens = listOf("https://", ".com", ".org", ".dev", "google.com", "github.com")
         for (tok in quickTokens) {
             val chip = TextView(context).apply {
                 text = tok
@@ -163,7 +164,7 @@ class MiniStatusPill(
         tokensScroll.addView(tokensRow)
         sheetCard.addView(tokensScroll)
 
-        // 3. Expressive Action Grid (Reload, Copy, Reader Mode, CORS Bypass, Zeroize)
+        // 3. Expressive Action Grid (Reload, Copy URL, Reader Mode, Desktop Site, Clear Storage)
         val actionsRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -207,22 +208,23 @@ class MiniStatusPill(
             }
         }
 
-        corsPillBtn = makeExpressivePillButton(
+        desktopPillBtn = makeExpressivePillButton(
             context,
-            "CORS Bypass: ON",
-            MantaTheme.CONTAINER_SECONDARY,
-            MantaTheme.ON_CONTAINER_SECONDARY
+            "Desktop Site: OFF",
+            MantaTheme.BG_CARD,
+            MantaTheme.TEXT_SECONDARY
         ) {
-            corsEnabled = !corsEnabled
+            desktopEnabled = !desktopEnabled
             updateToggleLabels()
-            onToggleCorsMode(corsEnabled)
+            dismissOverlay()
+            onToggleDesktopMode(desktopEnabled)
         }
-        secondRow.addView(corsPillBtn)
+        secondRow.addView(desktopPillBtn)
 
         secondRow.addView(
             makeExpressivePillButton(
                 context,
-                "⚡ Zeroize RAM",
+                "⚡ Clear Storage",
                 MantaTheme.CONTAINER_TERTIARY,
                 MantaTheme.ON_CONTAINER_TERTIARY
             ) {
@@ -274,14 +276,14 @@ class MiniStatusPill(
     }
 
     private fun updateToggleLabels() {
-        corsPillBtn.text = if (corsEnabled) "CORS Bypass: ON" else "CORS: Standard"
-        corsPillBtn.background = MantaTheme.roundedBg(
-            if (corsEnabled) MantaTheme.CONTAINER_SECONDARY else MantaTheme.BG_CARD,
+        desktopPillBtn.text = if (desktopEnabled) "Desktop Site: ON" else "Desktop Site: OFF"
+        desktopPillBtn.background = MantaTheme.roundedBg(
+            if (desktopEnabled) MantaTheme.CONTAINER_SECONDARY else MantaTheme.BG_CARD,
             18f,
             context
         )
-        corsPillBtn.setTextColor(
-            if (corsEnabled) MantaTheme.ON_CONTAINER_SECONDARY else MantaTheme.TEXT_SECONDARY
+        desktopPillBtn.setTextColor(
+            if (desktopEnabled) MantaTheme.ON_CONTAINER_SECONDARY else MantaTheme.TEXT_SECONDARY
         )
 
         readerPillBtn.text = if (readerEnabled) "Reader: ON" else "Reader: OFF"
@@ -319,15 +321,17 @@ class MiniStatusPill(
         visibility = View.GONE
     }
 
-    fun updateStatus(title: String, ramBytes: Int, isCorsOn: Boolean, tabCount: Int) {
-        corsEnabled = isCorsOn
+    fun updateStatus(title: String, ramBytes: Int, isDesktopOn: Boolean, tabCount: Int) {
+        desktopEnabled = isDesktopOn
         updateToggleLabels()
         val cores = MantaNative.getWorkerCoreCount()
-        val kb = ramBytes / 1024f
+        val storageKb = MantaNative.getCustomStorageBytes() / 1024f
+        val ramKb = ramBytes / 1024f
         telemetrySubtitle.text = String.format(
-            "%s • %.1f KB RAM • %d Rust Cores • %d Tab%s",
-            title.take(24),
-            kb,
+            "%s • %.1f KB RAM • %.1f KB Vault • %d Cores • %d Tab%s",
+            title.take(20),
+            ramKb,
+            storageKb,
             cores,
             tabCount,
             if (tabCount == 1) "" else "s"

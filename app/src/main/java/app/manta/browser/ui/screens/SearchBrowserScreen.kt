@@ -16,20 +16,20 @@ import kotlin.concurrent.thread
 
 /**
  * Full-Screen Edge-to-Edge Browser Viewport (`SearchBrowserScreen.kt`):
- * - Zero top bars, zero borders, 100% screen space dedicated to the website!
+ * - Zero top bars, zero borders, 100% screen space dedicated to the website.
  * - Uses Google (`https://www.google.com/search?q=...`) as the default search engine.
- * - Detects vertical scroll direction to automatically hide/reveal the floating bottom dock.
+ * - Enforces per-origin Site Isolation and custom clearable Rust storage.
  */
 class SearchBrowserScreen(
     context: Context,
     private val openTabs: MutableList<EphemeralTabInfo>,
     private val getActiveTabId: () -> Int,
     private val setActiveTabId: (Int) -> Unit,
-    private val isCorsDevEnabled: () -> Boolean,
+    private val isDesktopModeEnabled: () -> Boolean,
     private val onStateUpdated: (title: String, url: String, progress: Int) -> Unit,
     private val onScrollDirectionChanged: (scrollingDown: Boolean) -> Unit,
     private val onOpenOmnibox: () -> Unit,
-    private val onShieldLog: (String) -> Unit
+    private val onSecurityLog: (String) -> Unit
 ) : FrameLayout(context) {
 
     private val startOverlay: HomeScreen
@@ -51,7 +51,7 @@ class SearchBrowserScreen(
             onLinkClicked = { href -> loadInputUrlOrQuery(href, false) },
             onTextCopied = { copied ->
                 MantaNative.copyToClipboard(copied)
-                Toast.makeText(context, "Copied paragraph to Rust Vault", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Copied paragraph to clipboard", Toast.LENGTH_SHORT).show()
             }
         ).apply {
             visibility = View.GONE
@@ -161,7 +161,7 @@ class SearchBrowserScreen(
 
     fun closeTabById(tabId: Int) {
         tabSandboxes.remove(tabId)?.let { sandbox ->
-            sandbox.wipeAllEphemeralData()
+            sandbox.releaseTabResources()
             removeView(sandbox)
             sandbox.destroy()
         }
@@ -186,6 +186,17 @@ class SearchBrowserScreen(
         }
     }
 
+    fun setDesktopSiteMode(enabled: Boolean) {
+        val activeId = getActiveTabId()
+        MantaNative.setDesktopMode(activeId, enabled)
+        tabSandboxes[activeId]?.let { sandbox ->
+            sandbox.applyDesktopModeSetting(enabled)
+            if (currentUrl != "manta://start") {
+                sandbox.reload()
+            }
+        }
+    }
+
     /**
      * Resolves any user input to a URL or a Google Search (`https://www.google.com/search?q=...`).
      */
@@ -201,7 +212,7 @@ class SearchBrowserScreen(
         val resolvedUrl = when {
             trimmed.startsWith("manta://") -> trimmed
             trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed
-            trimmed.startsWith("localhost") -> "http://$trimmed"
+            trimmed.startsWith("localhost") || trimmed.startsWith("127.0.0.1") -> "http://$trimmed"
             trimmed.contains(".") && !trimmed.contains(" ") -> "https://$trimmed"
             else -> "https://www.google.com/search?q=${URLEncoder.encode(trimmed, "UTF-8")}"
         }
@@ -264,7 +275,7 @@ class SearchBrowserScreen(
             val created = EphemeralWebSandbox(
                 context = context,
                 tabId = tabId,
-                isCorsDevEnabled = isCorsDevEnabled,
+                isDesktopModeEnabled = isDesktopModeEnabled,
                 onPageMetaUpdate = { updatedTabId, title, url ->
                     openTabs.find { it.id == updatedTabId }?.let {
                         it.title = title
@@ -282,22 +293,21 @@ class SearchBrowserScreen(
                         onStateUpdated(activeTab?.title ?: "Loading...", currentUrl, pct)
                     }
                 },
-                onShieldEvent = onShieldLog
+                onSecurityEvent = onSecurityLog
             )
 
-            // Attach scroll-direction listener so the bottom dock auto-hides for 100% page space
             created.setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
                 val dy = scrollY - oldScrollY
                 if (dy > 18 && scrollY > 120) {
-                    onScrollDirectionChanged(true) // Hide dock
+                    onScrollDirectionChanged(true)
                 } else if (dy < -18 || scrollY < 60) {
-                    onScrollDirectionChanged(false) // Show dock
+                    onScrollDirectionChanged(false)
                 }
             }
 
             addView(
                 created,
-                0, // Add below overlays so Omnibox/TabChooser always sit above
+                0,
                 LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
             )
             tabSandboxes[tabId] = created
@@ -313,15 +323,10 @@ class SearchBrowserScreen(
         onScrollDirectionChanged(false)
         openTabs.find { it.id == activeId }?.url = targetUrl
 
-        if (targetUrl == "manta://cors-lab") {
-            loadInteractiveCorsLabInFullEngine(activeId)
-            return
-        }
-
-        val verdict = MantaNative.sanitizeAndCheckUrl(targetUrl)
+        val verdict = MantaNative.validateUrl("", targetUrl, true)
         if (verdict == "BLOCKED") {
-            onShieldLog("Blocked navigation to tracker host: $targetUrl")
-            Toast.makeText(context, "Rust Shield blocked tracker domain", Toast.LENGTH_SHORT).show()
+            onSecurityLog("Blocked unsafe navigation: $targetUrl")
+            Toast.makeText(context, "Site Isolation blocked unsafe URL scheme", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -350,77 +355,6 @@ class SearchBrowserScreen(
         }
     }
 
-    private fun loadInteractiveCorsLabInFullEngine(tabId: Int) {
-        currentUrl = "manta://cors-lab"
-        val sandbox = getOrCreateSandboxForTab(tabId) ?: return
-        sandbox.visibility = View.VISIBLE
-        rustRenderView.visibility = View.GONE
-
-        val labHtml = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Manta CORS & Turnstile Lab</title>
-                <style>
-                    body { background:#090a0f; color:#f1f5f9; font-family:sans-serif; padding:20px; margin:0; }
-                    .card { background:#191c26; border-radius:24px; padding:18px; margin-bottom:16px; }
-                    h2 { margin:0 0 8px 0; font-size:17px; color:#a8c7fa; }
-                    p { margin:4px 0; font-size:13.5px; color:#94a3b8; }
-                    button { background:#a8c7fa; color:#090a0f; border:none; border-radius:18px; padding:11px 16px; font-weight:bold; font-size:13px; margin-top:10px; margin-right:8px; }
-                    pre { background:#12141c; color:#6dd58c; padding:12px; border-radius:16px; font-size:12px; overflow-x:auto; white-space:pre-wrap; }
-                </style>
-            </head>
-            <body>
-                <div class="card">
-                    <h2>Live Developer CORS Tester</h2>
-                    <p>Verify cross-origin GET & POST requests through Manta's Rust CORS Engine:</p>
-                    <button onclick="runCorsGet()">Test Cross-Origin GET</button>
-                    <button onclick="runCorsPost()">Test Cross-Origin POST</button>
-                    <pre id="cors-out">Ready to test cross-origin requests...</pre>
-                </div>
-                <div class="card">
-                    <h2>Cloudflare Turnstile & Stealth Status</h2>
-                    <pre id="bot-out"></pre>
-                </div>
-                <script>
-                    document.getElementById('bot-out').textContent =
-                        'navigator.webdriver: ' + navigator.webdriver + '\n' +
-                        'User-Agent: ' + navigator.userAgent + '\n' +
-                        'Session Cookies Ready: ' + navigator.cookieEnabled;
-
-                    async function runCorsGet() {
-                        const out = document.getElementById('cors-out');
-                        out.textContent = 'Fetching https://httpbin.org/get ...';
-                        try {
-                            const res = await fetch('https://httpbin.org/get?manta=1');
-                            const txt = await res.text();
-                            out.textContent = 'HTTP ' + res.status + ':\n' + txt.slice(0, 400);
-                        } catch (e) { out.textContent = 'Error: ' + e; }
-                    }
-
-                    async function runCorsPost() {
-                        const out = document.getElementById('cors-out');
-                        out.textContent = 'POSTing to https://httpbin.org/post ...';
-                        try {
-                            const res = await fetch('https://httpbin.org/post', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ browser: 'Manta', corsUnlocked: true })
-                            });
-                            const txt = await res.text();
-                            out.textContent = 'HTTP ' + res.status + ':\n' + txt.slice(0, 420);
-                        } catch (e) { out.textContent = 'Error: ' + e; }
-                    }
-                </script>
-            </body>
-            </html>
-        """.trimIndent()
-
-        sandbox.loadDataWithBaseURL("https://manta.local/", labHtml, "text/html", "UTF-8", null)
-        onStateUpdated("CORS & Turnstile Lab", "manta://cors-lab", 100)
-    }
-
     private fun streamRemoteUrlViaRust(cleanUrl: String) {
         val tabId = getActiveTabId()
         onStateUpdated("Reader Mode...", cleanUrl, 40)
@@ -432,7 +366,10 @@ class SearchBrowserScreen(
                     connectTimeout = 6000
                     readTimeout = 8000
                     useCaches = false
-                    setRequestProperty("User-Agent", EphemeralWebSandbox.buildCleanChromeUserAgent(context))
+                    setRequestProperty(
+                        "User-Agent",
+                        EphemeralWebSandbox.buildCleanChromeUserAgent(context, isDesktopModeEnabled())
+                    )
                 }
                 val stream = conn.inputStream
                 val buf = ByteArray(4096)

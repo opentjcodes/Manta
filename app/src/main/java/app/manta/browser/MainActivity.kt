@@ -20,15 +20,16 @@ import java.util.concurrent.CopyOnWriteArrayList
  * Manta Main Activity:
  * - Full-screen edge-to-edge browser viewport (`SearchBrowserScreen`).
  * - Single auto-hiding M3 Expressive Gesture Dock (`SlidingBottomDock`) at the bottom.
- * - Floating Google Omnibox & Quick Settings Sheet (`MiniStatusPill`).
+ * - Floating Google Omnibox & Chrome Controls Sheet (`MiniStatusPill`).
  * - Full-screen M3 Expressive 2-Column Tab Chooser Grid (`LibraryTabsScreen`).
+ * - Zero disk cache bloat + Clearable Custom Rust Storage (`manta_custom_storage.bin`).
  */
 class MainActivity : Activity() {
 
     private val openTabs = CopyOnWriteArrayList<EphemeralTabInfo>()
-    private val shieldLogs = CopyOnWriteArrayList<String>()
+    private val securityLogs = CopyOnWriteArrayList<String>()
     private var activeTabId: Int = 1
-    private var corsDevPermissive: Boolean = true
+    private var desktopModeEnabled: Boolean = false
     private var activeLoadProgress: Int = 100
 
     private var searchScreen: SearchBrowserScreen? = null
@@ -39,7 +40,8 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        activeTabId = MantaNative.initEngine(corsDevPermissive)
+        val customStoragePath = ZeroDiskJanitor.getCustomStorageFilePath(this)
+        activeTabId = MantaNative.initEngine(customStoragePath)
         openTabs.add(
             EphemeralTabInfo(
                 id = activeTabId,
@@ -79,7 +81,7 @@ class MainActivity : Activity() {
         )
         bottomDock = dock
 
-        // 2. Construct Floating Omnibox & Command Sheet
+        // 2. Construct Floating Omnibox & Chrome Controls Sheet
         val omni = MiniStatusPill(
             context = this,
             onNavigateToUrlOrSearch = { queryOrUrl, forceReader ->
@@ -92,14 +94,14 @@ class MainActivity : Activity() {
             onToggleReaderMode = {
                 searchScreen?.toggleReaderMode()
             },
-            onToggleCorsMode = { enabled ->
-                corsDevPermissive = enabled
-                MantaNative.setCorsDevMode(enabled)
-                shieldLogs.add("CORS Bypass: ${if (enabled) "ON" else "OFF"}")
+            onToggleDesktopMode = { enabled ->
+                desktopModeEnabled = enabled
+                searchScreen?.setDesktopSiteMode(enabled)
+                securityLogs.add("Desktop Site Mode: ${if (enabled) "ON" else "OFF"}")
                 syncDockAndTelemetry()
             },
             onZeroizeRam = {
-                performInstantZeroizePurge()
+                performClearCustomStorageAndRam()
             }
         )
         omniboxSheet = omni
@@ -110,7 +112,7 @@ class MainActivity : Activity() {
             openTabs = openTabs,
             getActiveTabId = { activeTabId },
             setActiveTabId = { newId -> activeTabId = newId },
-            isCorsDevEnabled = { corsDevPermissive },
+            isDesktopModeEnabled = { desktopModeEnabled },
             onStateUpdated = { title, url, progress ->
                 activeLoadProgress = progress
                 openTabs.find { it.id == activeTabId }?.let {
@@ -126,8 +128,8 @@ class MainActivity : Activity() {
                 val curUrl = searchScreen?.currentUrl ?: ""
                 omni.showOmnibox(curUrl, focusKeyboard = true)
             },
-            onShieldLog = { event ->
-                shieldLogs.add(event)
+            onSecurityLog = { event ->
+                securityLogs.add(event)
             }
         )
         searchScreen = browser
@@ -149,12 +151,12 @@ class MainActivity : Activity() {
             },
             onCloseTab = { tabId ->
                 browser.closeTabById(tabId)
-                tabChooserScreen?.refreshLibraryState(shieldLogs)
+                tabChooserScreen?.refreshLibraryState(securityLogs)
                 syncDockAndTelemetry()
             },
             onZeroizeAll = {
                 closeTabChooser()
-                performInstantZeroizePurge()
+                performClearCustomStorageAndRam()
             },
             onDismissSheet = {
                 closeTabChooser()
@@ -208,7 +210,7 @@ class MainActivity : Activity() {
 
     private fun openTabChooser() {
         omniboxSheet?.dismissOverlay()
-        tabChooserScreen?.refreshLibraryState(shieldLogs)
+        tabChooserScreen?.refreshLibraryState(securityLogs)
         tabChooserScreen?.apply {
             alpha = 0f
             translationY = MantaTheme.dpF(context, 40f)
@@ -230,31 +232,32 @@ class MainActivity : Activity() {
             urlOrTitle = urlOrTitle,
             tabsCount = openTabs.size,
             progress = activeLoadProgress,
-            isCorsEnabled = corsDevPermissive
+            isCorsEnabled = desktopModeEnabled
         )
 
         omniboxSheet?.updateStatus(
             title = activeTab?.title ?: "Manta",
             ramBytes = ramBytes,
-            isCorsOn = corsDevPermissive,
+            isDesktopOn = desktopModeEnabled,
             tabCount = openTabs.size
         )
     }
 
-    private fun performInstantZeroizePurge() {
+    private fun performClearCustomStorageAndRam() {
         searchScreen?.wipeAllTabsAndSandboxes()
         ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
         openTabs.clear()
-        shieldLogs.clear()
+        securityLogs.clear()
 
-        activeTabId = MantaNative.initEngine(corsDevPermissive)
+        val customStoragePath = ZeroDiskJanitor.getCustomStorageFilePath(this)
+        activeTabId = MantaNative.initEngine(customStoragePath)
         openTabs.add(EphemeralTabInfo(activeTabId, "New Tab", "manta://start"))
         searchScreen?.bootInitialPage()
-        tabChooserScreen?.refreshLibraryState(shieldLogs)
+        tabChooserScreen?.refreshLibraryState(securityLogs)
         syncDockAndTelemetry()
         Toast.makeText(
             this,
-            "Zeroized All Volatile RAM, Cookies & Tabs (0 B)",
+            "Cleared Custom Storage Vault, Cookies & Tabs (0 B)",
             Toast.LENGTH_SHORT
         ).show()
     }
@@ -273,19 +276,17 @@ class MainActivity : Activity() {
             syncDockAndTelemetry()
             return
         }
-        ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
+        ZeroDiskJanitor.enforceZeroCacheAndFlushCustomStorage(this)
         super.onBackPressed()
     }
 
     override fun onStop() {
         super.onStop()
-        if (isFinishing) {
-            ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
-        }
+        ZeroDiskJanitor.enforceZeroCacheAndFlushCustomStorage(this)
     }
 
     override fun onDestroy() {
-        ZeroDiskJanitor.purgeAllDiskAndRamTraces(this)
+        ZeroDiskJanitor.enforceZeroCacheAndFlushCustomStorage(this)
         super.onDestroy()
     }
 }

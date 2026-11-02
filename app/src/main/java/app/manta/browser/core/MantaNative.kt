@@ -1,7 +1,9 @@
 package app.manta.browser.core
 
 /**
- * Direct Zero-Overhead JNI Bridge to `libmanta_core.so` (Multi-Core Rust Engine).
+ * Direct Zero-Overhead JNI Bridge to `libmanta_core.so` (Multi-Core Rust Browser Engine).
+ * Connects Android UI to Manta's Site Isolation, Bytecode JS VM, Chrome Controls,
+ * and Clearable Custom Storage Engine.
  */
 object MantaNative {
     var isLoaded: Boolean = false
@@ -17,7 +19,7 @@ object MantaNative {
     }
 
     @JvmStatic
-    private external fun nativeInitEngine(devCorsPermissive: Boolean): Int
+    private external fun nativeInitEngine(storagePath: String): Int
 
     @JvmStatic
     private external fun nativeGetWorkerCoreCount(): Int
@@ -43,19 +45,60 @@ object MantaNative {
     private external fun nativeSwitchTab(tabId: Int): Boolean
 
     @JvmStatic
-    private external fun nativeSetCorsDevMode(enabled: Boolean)
+    private external fun nativeSetDesktopMode(tabId: Int, enabled: Boolean)
 
     @JvmStatic
-    private external fun nativeGetRuntimeScript(corsDevEnabled: Boolean): String
+    private external fun nativeIsDesktopMode(tabId: Int): Boolean
+
+    @JvmStatic
+    private external fun nativeSetTabZoom(tabId: Int, zoomPercent: Int)
+
+    @JvmStatic
+    private external fun nativeGetTabZoom(tabId: Int): Int
+
+    @JvmStatic
+    private external fun nativeGetRuntimeScript(originUrl: String): String
 
     @JvmStatic
     private external fun nativeIsChallengeUrl(url: String): Boolean
 
     @JvmStatic
-    private external fun nativeSetVolatileCookie(tabId: Int, host: String, cookie: String)
+    private external fun nativeValidateUrl(
+        initiatorUrl: String,
+        targetUrl: String,
+        isMainFrame: Boolean
+    ): String
 
     @JvmStatic
-    private external fun nativeGetVolatileCookie(tabId: Int, host: String): String
+    private external fun nativeStorageSetItem(
+        originUrl: String,
+        key: String,
+        value: String,
+        isSession: Boolean
+    ): Boolean
+
+    @JvmStatic
+    private external fun nativeStorageGetItem(
+        originUrl: String,
+        key: String,
+        isSession: Boolean
+    ): String
+
+    @JvmStatic
+    private external fun nativeStorageRemoveItem(
+        originUrl: String,
+        key: String,
+        isSession: Boolean
+    )
+
+    @JvmStatic
+    private external fun nativeStorageClearOrigin(originUrl: String)
+
+    @JvmStatic
+    private external fun nativeFlushCustomStorage(): Boolean
+
+    @JvmStatic
+    private external fun nativeToggleBookmark(url: String, title: String): Boolean
 
     @JvmStatic
     private external fun nativeStreamHtmlChunk(
@@ -66,25 +109,25 @@ object MantaNative {
     ): String
 
     @JvmStatic
-    private external fun nativeSanitizeAndCheckUrl(url: String): String
-
-    @JvmStatic
     private external fun nativeCopyToClipboard(text: String): Boolean
 
     @JvmStatic
     private external fun nativeGetClipboardText(): String
 
     @JvmStatic
-    private external fun nativeCloseTabAndZeroize(tabId: Int)
+    private external fun nativeCloseTab(tabId: Int)
 
     @JvmStatic
-    private external fun nativePurgeAllVolatileRam()
+    private external fun nativeClearAllCustomStorageAndRam()
 
     @JvmStatic
     private external fun nativeGetEngineRamBytes(): Int
 
-    fun initEngine(devCorsPermissive: Boolean): Int =
-        if (isLoaded) runCatching { nativeInitEngine(devCorsPermissive) }.getOrDefault(1) else 1
+    @JvmStatic
+    private external fun nativeGetCustomStorageBytes(): Int
+
+    fun initEngine(storagePath: String = ""): Int =
+        if (isLoaded) runCatching { nativeInitEngine(storagePath) }.getOrDefault(1) else 1
 
     fun getWorkerCoreCount(): Int =
         if (isLoaded) runCatching { nativeGetWorkerCoreCount() }.getOrDefault(4) else 4
@@ -105,22 +148,63 @@ object MantaNative {
     fun switchTab(tabId: Int): Boolean =
         if (isLoaded) runCatching { nativeSwitchTab(tabId) }.getOrDefault(false) else false
 
-    fun setCorsDevMode(enabled: Boolean) {
-        if (isLoaded) runCatching { nativeSetCorsDevMode(enabled) }
+    fun setDesktopMode(tabId: Int, enabled: Boolean) {
+        if (isLoaded) runCatching { nativeSetDesktopMode(tabId, enabled) }
     }
 
-    fun getRuntimeScript(corsDevEnabled: Boolean): String =
-        if (isLoaded) runCatching { nativeGetRuntimeScript(corsDevEnabled) }.getOrDefault("") else ""
+    fun isDesktopMode(tabId: Int): Boolean =
+        if (isLoaded) runCatching { nativeIsDesktopMode(tabId) }.getOrDefault(false) else false
+
+    fun setTabZoom(tabId: Int, zoomPercent: Int) {
+        if (isLoaded) runCatching { nativeSetTabZoom(tabId, zoomPercent) }
+    }
+
+    fun getTabZoom(tabId: Int): Int =
+        if (isLoaded) runCatching { nativeGetTabZoom(tabId) }.getOrDefault(100) else 100
+
+    fun getRuntimeScript(originUrl: String): String =
+        if (isLoaded) runCatching { nativeGetRuntimeScript(originUrl) }.getOrDefault("") else ""
 
     fun isChallengeUrl(url: String): Boolean =
         if (isLoaded) runCatching { nativeIsChallengeUrl(url) }.getOrDefault(false) else false
 
-    fun setVolatileCookie(tabId: Int, host: String, cookie: String) {
-        if (isLoaded) runCatching { nativeSetVolatileCookie(tabId, host, cookie) }
+    fun validateUrl(initiatorUrl: String, targetUrl: String, isMainFrame: Boolean): String =
+        if (isLoaded) {
+            runCatching { nativeValidateUrl(initiatorUrl, targetUrl, isMainFrame) }.getOrDefault(targetUrl)
+        } else {
+            targetUrl
+        }
+
+    fun sanitizeAndCheckUrl(url: String): String =
+        validateUrl("", url, true)
+
+    fun storageSetItem(originUrl: String, key: String, value: String, isSession: Boolean): Boolean =
+        if (isLoaded) {
+            runCatching { nativeStorageSetItem(originUrl, key, value, isSession) }.getOrDefault(false)
+        } else {
+            false
+        }
+
+    fun storageGetItem(originUrl: String, key: String, isSession: Boolean): String =
+        if (isLoaded) {
+            runCatching { nativeStorageGetItem(originUrl, key, isSession) }.getOrDefault("")
+        } else {
+            ""
+        }
+
+    fun storageRemoveItem(originUrl: String, key: String, isSession: Boolean) {
+        if (isLoaded) runCatching { nativeStorageRemoveItem(originUrl, key, isSession) }
     }
 
-    fun getVolatileCookie(tabId: Int, host: String): String =
-        if (isLoaded) runCatching { nativeGetVolatileCookie(tabId, host) }.getOrDefault("") else ""
+    fun storageClearOrigin(originUrl: String) {
+        if (isLoaded) runCatching { nativeStorageClearOrigin(originUrl) }
+    }
+
+    fun flushCustomStorage(): Boolean =
+        if (isLoaded) runCatching { nativeFlushCustomStorage() }.getOrDefault(false) else false
+
+    fun toggleBookmark(url: String, title: String): Boolean =
+        if (isLoaded) runCatching { nativeToggleBookmark(url, title) }.getOrDefault(false) else false
 
     fun streamHtmlChunk(tabId: Int, url: String, htmlChunk: String, isEof: Boolean): String =
         if (isLoaded) {
@@ -130,9 +214,6 @@ object MantaNative {
             "MANTA_FRAME|title=Manta|bg=#FF09090B|height=300.0|nodes=1|ramKB=0.0\nTEXT|16.0|24.0|16.0|1|#FFF8FAFC||Manta Core Active\n"
         }
 
-    fun sanitizeAndCheckUrl(url: String): String =
-        if (isLoaded) runCatching { nativeSanitizeAndCheckUrl(url) }.getOrDefault(url) else url
-
     fun copyToClipboard(text: String): Boolean =
         if (isLoaded) runCatching { nativeCopyToClipboard(text) }.getOrDefault(false) else false
 
@@ -140,13 +221,16 @@ object MantaNative {
         if (isLoaded) runCatching { nativeGetClipboardText() }.getOrDefault("") else ""
 
     fun closeTabAndZeroize(tabId: Int) {
-        if (isLoaded) runCatching { nativeCloseTabAndZeroize(tabId) }
+        if (isLoaded) runCatching { nativeCloseTab(tabId) }
     }
 
     fun purgeAllVolatileRam() {
-        if (isLoaded) runCatching { nativePurgeAllVolatileRam() }
+        if (isLoaded) runCatching { nativeClearAllCustomStorageAndRam() }
     }
 
     fun getEngineRamBytes(): Int =
         if (isLoaded) runCatching { nativeGetEngineRamBytes() }.getOrDefault(0) else 0
+
+    fun getCustomStorageBytes(): Int =
+        if (isLoaded) runCatching { nativeGetCustomStorageBytes() }.getOrDefault(0) else 0
 }

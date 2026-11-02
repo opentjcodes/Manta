@@ -6,16 +6,37 @@ import android.webkit.WebStorage
 import java.io.File
 
 /**
- * Guarantees Manta never grows on disk and leaves 0 cached files or databases behind.
- * Works alongside Rust's `MantaNative.purgeAllVolatileRam()` on tab close and app exit.
+ * Manta Zero-Cache & Custom Storage Manager (`ZeroDiskJanitor.kt`):
+ * 1. Never allows HTTP network caches, shader caches, or un-clearable OS WebView bloat to accumulate.
+ * 2. Stores user-saved data inside Manta's single custom Rust storage file (`manta_custom_storage.bin`),
+ *    which can be flushed cleanly on app pause/exit or cleared 100% on user command.
  */
 object ZeroDiskJanitor {
 
+    private const val CUSTOM_STORAGE_FILENAME = "manta_custom_storage.bin"
+
+    fun getCustomStorageFilePath(context: Context): String {
+        return File(context.filesDir, CUSTOM_STORAGE_FILENAME).absolutePath
+    }
+
+    /**
+     * Called on app background/exit:
+     * - Flushes user-saved data in Manta's custom Rust storage container (`manta_custom_storage.bin`).
+     * - Deletes all transient HTTP/shader/network cache directories so 0 bytes of cache ever remain.
+     */
+    fun enforceZeroCacheAndFlushCustomStorage(context: Context) {
+        MantaNative.flushCustomStorage()
+        wipeTransientCachesOnly(context)
+    }
+
+    /**
+     * Called when the user explicitly taps "Clear Data" / "Zeroize All":
+     * - Wipes Manta's custom storage container (`manta_custom_storage.bin`), RAM arenas,
+     *   session cookies, and all cache directories.
+     */
     fun purgeAllDiskAndRamTraces(context: Context) {
-        // 1. Cryptographically zeroize all Rust volatile arenas (`0x00` volatile overwrite)
         MantaNative.purgeAllVolatileRam()
 
-        // 2. Wipe any transient WebStorage / CookieManager state in memory
         try {
             CookieManager.getInstance().removeAllCookies(null)
             CookieManager.getInstance().flush()
@@ -23,15 +44,29 @@ object ZeroDiskJanitor {
         } catch (_: Throwable) {
         }
 
-        // 3. Recursively delete any transient cache / app_webview directories on flash storage
+        try {
+            File(context.filesDir, CUSTOM_STORAGE_FILENAME).let {
+                if (it.exists()) it.delete()
+            }
+        } catch (_: Throwable) {
+        }
+
+        wipeTransientCachesOnly(context)
+    }
+
+    private fun wipeTransientCachesOnly(context: Context) {
         try {
             deleteDirContents(context.cacheDir)
             context.codeCacheDir?.let { deleteDirContents(it) }
             val dataDir = context.dataDir
             if (dataDir != null) {
-                File(dataDir, "app_webview").let { if (it.exists()) deleteDirContents(it) }
+                val webviewDir = File(dataDir, "app_webview")
+                if (webviewDir.exists()) {
+                    File(webviewDir, "Cache").let { if (it.exists()) deleteDirContents(it) }
+                    File(webviewDir, "GPUCache").let { if (it.exists()) deleteDirContents(it) }
+                    File(webviewDir, "Code Cache").let { if (it.exists()) deleteDirContents(it) }
+                }
                 File(dataDir, "app_textures").let { if (it.exists()) deleteDirContents(it) }
-                File(dataDir, "databases").let { if (it.exists()) deleteDirContents(it) }
             }
         } catch (_: Throwable) {
         }

@@ -1,6 +1,3 @@
-use std::ptr;
-use std::sync::atomic::{compiler_fence, Ordering};
-
 use crate::html_tokenizer::HtmlToken;
 
 /// Compact 32-bit node index into the flat `ZeroCopyDomArena`.
@@ -32,8 +29,9 @@ pub struct DomNode {
     pub kind: NodeKind,
 }
 
-/// Contiguous Flat Index DOM Arena.
-/// Stores all DOM nodes inside a single `Vec<DomNode>` with strict byte accounting.
+/// Contiguous Flat Index DOM Arena (100% Safe Rust).
+/// Stores all DOM nodes inside a single `Vec<DomNode>` with strict byte accounting
+/// and instant O(1) arena recycling.
 pub struct ZeroCopyDomArena {
     nodes: Vec<DomNode>,
     open_stack: Vec<NodeId>,
@@ -233,49 +231,16 @@ impl ZeroCopyDomArena {
         }
     }
 
-    /// Zeroizes all text strings and attributes in the DOM arena before releasing memory.
-    pub fn zeroize_and_clear(&mut self) {
-        for node in &mut self.nodes {
-            match &mut node.kind {
-                NodeKind::Text(s) => zeroize_string(s),
-                NodeKind::Element {
-                    tag,
-                    id_attr,
-                    classes,
-                    attributes,
-                    inline_style,
-                } => {
-                    zeroize_string(tag);
-                    if let Some(id) = id_attr {
-                        zeroize_string(id);
-                    }
-                    for c in classes {
-                        zeroize_string(c);
-                    }
-                    for (k, v) in attributes {
-                        zeroize_string(k);
-                        zeroize_string(v);
-                    }
-                    if let Some(st) = inline_style {
-                        zeroize_string(st);
-                    }
-                }
-                NodeKind::Document => {}
-            }
-        }
-        for s in &mut self.collected_styles {
-            zeroize_string(s);
-        }
-        for s in &mut self.collected_scripts {
-            zeroize_string(s);
-        }
-        zeroize_string(&mut self.page_title);
-
+    /// Fast O(1) arena reset and memory release.
+    pub fn clear_and_shrink(&mut self) {
         self.nodes.clear();
         self.nodes.shrink_to_fit();
         self.open_stack.clear();
         self.collected_styles.clear();
+        self.collected_styles.shrink_to_fit();
         self.collected_scripts.clear();
+        self.collected_scripts.shrink_to_fit();
+        self.page_title.clear();
         self.approx_bytes = 0;
     }
 
@@ -311,14 +276,4 @@ impl ZeroCopyDomArena {
         }
         id
     }
-}
-
-fn zeroize_string(s: &mut String) {
-    unsafe {
-        for b in s.as_bytes_mut() {
-            ptr::write_volatile(b, 0u8);
-        }
-    }
-    compiler_fence(Ordering::SeqCst);
-    s.clear();
 }

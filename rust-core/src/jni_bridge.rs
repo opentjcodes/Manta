@@ -2,6 +2,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
 use crate::page_compiler::PageRuntimeCompiler;
+use crate::site_isolation::IsolationVerdict;
 use crate::tab_compressor::TabCompressor;
 use crate::MantaEngine;
 
@@ -63,21 +64,18 @@ impl JNIEnv {
     }
 }
 
-/// Initializes Manta Multi-Core Rust Engine and returns the initial tab ID.
+/// Initializes Manta Multi-Core Rust Engine with its custom clearable storage file path.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInitEngine(
-    _env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
-    dev_cors_permissive: JBoolean,
+    j_storage_path: JString,
 ) -> JInt {
+    let storage_path = unsafe { env.get_rust_string(j_storage_path) };
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return 1;
     };
-    engine.config.dev_cors_permissive = dev_cors_permissive != 0;
-    engine
-        .modules
-        .set_module_enabled("cors_dev", dev_cors_permissive != 0);
-    engine.tabs.create_tab() as JInt
+    engine.init_with_storage_path(&storage_path) as JInt
 }
 
 /// Returns the number of active Rust worker cores in `MantaWorkerPool`.
@@ -114,7 +112,9 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCrea
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return 1;
     };
-    engine.tabs.create_tab() as JInt
+    let id = engine.tabs.create_tab();
+    engine.controls.ensure_tab_state(id);
+    id as JInt
 }
 
 /// Compresses and stores a tab's state in Rust's VolatileRamVault when switching tabs.
@@ -132,6 +132,10 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeComp
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return 0;
     };
+    engine
+        .controls
+        .ensure_tab_state(tab_id as u32)
+        .record_navigation(&url, &title);
     TabCompressor::store_tab_snapshot(&mut engine.vault, tab_id as u32, &url, &title, scroll_y)
         as JInt
 }
@@ -176,28 +180,75 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSwit
     }
 }
 
-/// Toggles Developer CORS Permissive mode at runtime.
+/// Toggles Desktop Site Mode (`request_desktop_site`) for a tab in Rust.
 #[no_mangle]
-pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetCorsDevMode(
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetDesktopMode(
     _env: JNIEnv,
     _class: JClass,
+    tab_id: JInt,
     enabled: JBoolean,
 ) {
     if let Ok(mut engine) = MantaEngine::global().lock() {
-        let active = enabled != 0;
-        engine.config.dev_cors_permissive = active;
-        engine.modules.set_module_enabled("cors_dev", active);
+        engine
+            .controls
+            .set_desktop_mode(tab_id as u32, enabled != 0);
     }
 }
 
-/// Returns the Rust-compiled Anti-Detection, Cookie-Banner Eliminator, and CORS runtime script.
+/// Returns whether Desktop Site Mode is active for a tab.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeIsDesktopMode(
+    _env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+) -> JBoolean {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    u8::from(engine.controls.is_desktop_mode(tab_id as u32))
+}
+
+/// Sets page zoom percentage (`50` ..= `300`) for a tab.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetTabZoom(
+    _env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+    zoom_percent: JInt,
+) {
+    if let Ok(mut engine) = MantaEngine::global().lock() {
+        engine
+            .controls
+            .set_zoom_percent(tab_id as u32, zoom_percent.max(50) as u16);
+    }
+}
+
+/// Gets page zoom percentage for a tab.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetTabZoom(
+    _env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+) -> JInt {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return 100;
+    };
+    engine.controls.get_zoom_percent(tab_id as u32) as JInt
+}
+
+/// Returns the Rust-compiled Chrome Web API & Origin-Isolated Custom Storage runtime script.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetRuntimeScript(
     env: JNIEnv,
     _class: JClass,
-    cors_dev_enabled: JBoolean,
+    j_origin_url: JString,
 ) -> JString {
-    let script = PageRuntimeCompiler::compile_runtime_script(cors_dev_enabled != 0);
+    let origin_url = unsafe { env.get_rust_string(j_origin_url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    let script =
+        PageRuntimeCompiler::compile_runtime_script_for_origin(&origin_url, &engine.storage);
     unsafe { env.new_java_string(&script) }
 }
 
@@ -209,48 +260,154 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeIsCh
     j_url: JString,
 ) -> JBoolean {
     let url = unsafe { env.get_rust_string(j_url) };
-    if PageRuntimeCompiler::is_verification_challenge_url(&url) {
-        1
-    } else {
-        0
-    }
+    u8::from(PageRuntimeCompiler::is_verification_challenge_url(&url))
 }
 
-/// Stores an ephemeral cookie inside Rust's `VolatileRamVault` (never touches disk).
+/// Validates a URL against Manta's `SiteIsolationEngine` (SSRF / Private Network guard & scheme security).
+/// Returns `"BLOCKED"` if denied, or the validated/upgraded URL string.
 #[no_mangle]
-pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetVolatileCookie(
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeValidateUrl(
     env: JNIEnv,
     _class: JClass,
-    tab_id: JInt,
-    j_host: JString,
-    j_cookie: JString,
-) {
-    let host = unsafe { env.get_rust_string(j_host) };
-    let cookie = unsafe { env.get_rust_string(j_cookie) };
-    if let Ok(mut engine) = MantaEngine::global().lock() {
-        PageRuntimeCompiler::store_volatile_cookie(
-            &mut engine.vault,
-            tab_id as u32,
-            &host,
-            &cookie,
-        );
-    }
-}
-
-/// Reads ephemeral cookies for a host from Rust's `VolatileRamVault`.
-#[no_mangle]
-pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetVolatileCookie(
-    env: JNIEnv,
-    _class: JClass,
-    tab_id: JInt,
-    j_host: JString,
+    j_initiator_url: JString,
+    j_target_url: JString,
+    is_main_frame: JBoolean,
 ) -> JString {
-    let host = unsafe { env.get_rust_string(j_host) };
+    let initiator = unsafe { env.get_rust_string(j_initiator_url) };
+    let target = unsafe { env.get_rust_string(j_target_url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string(&target) };
+    };
+    let init_opt = if initiator.is_empty() {
+        None
+    } else {
+        Some(initiator.as_str())
+    };
+    match engine
+        .isolation
+        .validate_request(init_opt, &target, is_main_frame != 0)
+    {
+        IsolationVerdict::Allow { sanitized_url } => unsafe { env.new_java_string(&sanitized_url) },
+        IsolationVerdict::UpgradeToHttps { upgraded_url } => unsafe {
+            env.new_java_string(&upgraded_url)
+        },
+        IsolationVerdict::Deny { .. } => unsafe { env.new_java_string("BLOCKED") },
+    }
+}
+
+/// Writes an entry into Manta's origin-isolated custom storage engine (`localStorage` or `sessionStorage`).
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageSetItem(
+    env: JNIEnv,
+    _class: JClass,
+    j_origin_url: JString,
+    j_key: JString,
+    j_val: JString,
+    is_session: JBoolean,
+) -> JBoolean {
+    let origin = unsafe { env.get_rust_string(j_origin_url) };
+    let key = unsafe { env.get_rust_string(j_key) };
+    let val = unsafe { env.get_rust_string(j_val) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    let ok = if is_session != 0 {
+        engine.storage.set_session_storage(&origin, &key, &val)
+    } else {
+        let saved = engine.storage.set_local_storage(&origin, &key, &val);
+        if saved {
+            let _ = engine.storage.save_to_backing_file();
+        }
+        saved
+    };
+    u8::from(ok)
+}
+
+/// Reads an entry from Manta's origin-isolated custom storage engine.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageGetItem(
+    env: JNIEnv,
+    _class: JClass,
+    j_origin_url: JString,
+    j_key: JString,
+    is_session: JBoolean,
+) -> JString {
+    let origin = unsafe { env.get_rust_string(j_origin_url) };
+    let key = unsafe { env.get_rust_string(j_key) };
     let Ok(engine) = MantaEngine::global().lock() else {
         return unsafe { env.new_java_string("") };
     };
-    let val = PageRuntimeCompiler::read_volatile_cookie(&engine.vault, tab_id as u32, &host);
-    unsafe { env.new_java_string(&val) }
+    let val = if is_session != 0 {
+        engine.storage.get_session_storage(&origin, &key)
+    } else {
+        engine.storage.get_local_storage(&origin, &key)
+    };
+    unsafe { env.new_java_string(val.as_deref().unwrap_or("")) }
+}
+
+/// Removes an entry from Manta's origin-isolated custom storage engine.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageRemoveItem(
+    env: JNIEnv,
+    _class: JClass,
+    j_origin_url: JString,
+    j_key: JString,
+    is_session: JBoolean,
+) {
+    let origin = unsafe { env.get_rust_string(j_origin_url) };
+    let key = unsafe { env.get_rust_string(j_key) };
+    if let Ok(mut engine) = MantaEngine::global().lock() {
+        if is_session != 0 {
+            engine.storage.remove_session_storage(&origin, &key);
+        } else if engine.storage.remove_local_storage(&origin, &key) {
+            let _ = engine.storage.save_to_backing_file();
+        }
+    }
+}
+
+/// Clears all custom storage data (`localStorage`, `sessionStorage`, `cookies`) for a single origin.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageClearOrigin(
+    env: JNIEnv,
+    _class: JClass,
+    j_origin_url: JString,
+) {
+    let origin = unsafe { env.get_rust_string(j_origin_url) };
+    if let Ok(mut engine) = MantaEngine::global().lock() {
+        if engine.storage.clear_origin(&origin) {
+            let _ = engine.storage.save_to_backing_file();
+        }
+    }
+}
+
+/// Flushes Manta's custom binary storage container to disk without writing any browser caches.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeFlushCustomStorage(
+    _env: JNIEnv,
+    _class: JClass,
+) -> JBoolean {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    u8::from(engine.storage.save_to_backing_file().is_ok())
+}
+
+/// Toggles a bookmark inside Manta's custom storage engine.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeToggleBookmark(
+    env: JNIEnv,
+    _class: JClass,
+    j_url: JString,
+    j_title: JString,
+) -> JBoolean {
+    let url = unsafe { env.get_rust_string(j_url) };
+    let title = unsafe { env.get_rust_string(j_title) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    let added = engine.storage.toggle_bookmark(&url, &title);
+    let _ = engine.storage.save_to_backing_file();
+    u8::from(added)
 }
 
 /// Streams a chunk of HTML/data into a tab and returns the serialized `MANTA_FRAME` DisplayList.
@@ -266,11 +423,17 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStre
     let url = unsafe { env.get_rust_string(j_url) };
     let chunk_str = unsafe { env.get_rust_string(j_html_chunk) };
 
+    // Pre-warm any `<link rel="preconnect">` hosts discovered in this chunk on background cores
+    let preconnect_hosts = PageRuntimeCompiler::extract_preconnect_hosts(&chunk_str);
+
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return unsafe { env.new_java_string("MANTA_ERR|Engine Lock Poisoned") };
     };
-    let engine_ref = &mut *engine;
+    for host_url in preconnect_hosts {
+        engine.workers.prewarm_url_dns(&host_url);
+    }
 
+    let engine_ref = &mut *engine;
     match engine_ref.tabs.load_stream_chunk(
         tab_id as u32,
         &url,
@@ -278,31 +441,14 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStre
         is_eof != 0,
         &mut engine_ref.modules,
         &mut engine_ref.vault,
+        &mut engine_ref.storage,
     ) {
         Ok(frame) => unsafe { env.new_java_string(&frame.to_compact_wire_string()) },
         Err(e) => unsafe { env.new_java_string(&format!("MANTA_ERR|{}", e)) },
     }
 }
 
-/// Sanitizes a URL (strips `utm_*`, `fbclid`, `gclid`, etc.) and checks tracker blocklist in Rust.
-#[no_mangle]
-pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSanitizeAndCheckUrl(
-    env: JNIEnv,
-    _class: JClass,
-    j_url: JString,
-) -> JString {
-    let raw = unsafe { env.get_rust_string(j_url) };
-    if PageRuntimeCompiler::is_verification_challenge_url(&raw) {
-        return unsafe { env.new_java_string(&raw) };
-    }
-    if crate::shield::PrivacyShieldModule::is_blocked_domain(&raw) {
-        return unsafe { env.new_java_string("BLOCKED") };
-    }
-    let clean = crate::shield::PrivacyShieldModule::sanitize_url(&raw);
-    unsafe { env.new_java_string(&clean) }
-}
-
-/// Copies text into Manta's size-capped, zeroizable Rust ClipboardSandbox.
+/// Copies text into Manta's size-capped Rust ClipboardSandbox.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCopyToClipboard(
     env: JNIEnv,
@@ -313,11 +459,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCopy
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return 0;
     };
-    if engine.clipboard.copy_text(&text) {
-        1
-    } else {
-        0
-    }
+    u8::from(engine.clipboard.copy_text(&text))
 }
 
 /// Reads the current text stored in Manta's Rust ClipboardSandbox.
@@ -332,9 +474,9 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetC
     unsafe { env.new_java_string(engine.clipboard.paste_text()) }
 }
 
-/// Closes a tab and immediately zeroizes its RAM buffers.
+/// Closes a tab and releases its DOM/JS memory buffers while preserving saved user storage.
 #[no_mangle]
-pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCloseTabAndZeroize(
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCloseTab(
     _env: JNIEnv,
     _class: JClass,
     tab_id: JInt,
@@ -344,21 +486,23 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeClos
         engine_ref
             .tabs
             .close_tab(tab_id as u32, &mut engine_ref.vault);
+        engine_ref.controls.remove_tab(tab_id as u32);
+        engine_ref.modules.dispatch_tab_closed(tab_id as u32);
     }
 }
 
-/// Called when the user closes Manta or taps Panic Purge: cryptographically zeroes all RAM.
+/// Explicitly clears all custom storage, tabs, and volatile RAM when requested by the user.
 #[no_mangle]
-pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativePurgeAllVolatileRam(
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeClearAllCustomStorageAndRam(
     _env: JNIEnv,
     _class: JClass,
 ) {
     if let Ok(mut engine) = MantaEngine::global().lock() {
-        engine.purge_all_volatile_state();
+        engine.clear_all_custom_storage_and_ram();
     }
 }
 
-/// Returns current total memory used by all active tabs and the volatile vault in bytes.
+/// Returns current total memory used by active tabs and transient RAM pool in bytes.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetEngineRamBytes(
     _env: JNIEnv,
@@ -368,6 +512,18 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetE
         return 0;
     };
     (engine.tabs.total_allocated_bytes() + engine.vault.used_bytes()) as JInt
+}
+
+/// Returns current bytes stored inside Manta's custom user storage container.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetCustomStorageBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> JInt {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    engine.storage.used_bytes() as JInt
 }
 
 #[cfg(test)]
@@ -409,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jni_bridge_roundtrip_and_zeroize() {
+    fn test_jni_bridge_isolation_and_custom_storage() {
         let table = JNINativeInterface {
             reserved: [ptr::null(); 167],
             new_string_utf: mock_new_string_utf,
@@ -421,29 +577,49 @@ mod tests {
         let env = JNIEnv(&table_ptr);
 
         unsafe {
-            let tab_id =
-                Java_app_manta_browser_core_MantaNative_nativeInitEngine(env, ptr::null_mut(), 1);
+            let empty_path = CString::new("").unwrap();
+            let tab_id = Java_app_manta_browser_core_MantaNative_nativeInitEngine(
+                env,
+                ptr::null_mut(),
+                empty_path.as_ptr() as JString,
+            );
             assert!(tab_id >= 1);
 
-            let cores =
-                Java_app_manta_browser_core_MantaNative_nativeGetWorkerCoreCount(env, ptr::null_mut());
-            assert!(cores >= 1);
-
-            let url_c = CString::new("https://example.com/?utm_source=ads&ok=1").unwrap();
-            let clean_jstr = Java_app_manta_browser_core_MantaNative_nativeSanitizeAndCheckUrl(
+            let init_c = CString::new("https://public-site.com").unwrap();
+            let ssrf_c = CString::new("http://127.0.0.1:9000/secret").unwrap();
+            let verdict_jstr = Java_app_manta_browser_core_MantaNative_nativeValidateUrl(
                 env,
                 ptr::null_mut(),
-                url_c.as_ptr() as JString,
+                init_c.as_ptr() as JString,
+                ssrf_c.as_ptr() as JString,
+                0,
             );
-            let clean_owned = CString::from_raw(clean_jstr as *mut c_char);
-            assert_eq!(clean_owned.to_str().unwrap(), "https://example.com/?ok=1");
+            let verdict_owned = CString::from_raw(verdict_jstr as *mut c_char);
+            assert_eq!(verdict_owned.to_str().unwrap(), "BLOCKED");
 
-            Java_app_manta_browser_core_MantaNative_nativePurgeAllVolatileRam(env, ptr::null_mut());
-            let ram = Java_app_manta_browser_core_MantaNative_nativeGetEngineRamBytes(
+            let key_c = CString::new("token").unwrap();
+            let val_c = CString::new("abc123").unwrap();
+            let saved = Java_app_manta_browser_core_MantaNative_nativeStorageSetItem(
+                env,
+                ptr::null_mut(),
+                init_c.as_ptr() as JString,
+                key_c.as_ptr() as JString,
+                val_c.as_ptr() as JString,
+                0,
+            );
+            assert_eq!(saved, 1);
+
+            Java_app_manta_browser_core_MantaNative_nativeClearAllCustomStorageAndRam(
                 env,
                 ptr::null_mut(),
             );
-            assert_eq!(ram, 0);
+            assert_eq!(
+                Java_app_manta_browser_core_MantaNative_nativeGetCustomStorageBytes(
+                    env,
+                    ptr::null_mut()
+                ),
+                0
+            );
         }
     }
 }

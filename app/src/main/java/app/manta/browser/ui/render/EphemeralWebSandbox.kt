@@ -15,35 +15,33 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import app.manta.browser.core.MantaNative
 import app.manta.browser.ui.theme.MantaTheme
-import org.json.JSONObject
 import java.io.ByteArrayInputStream
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
- * Manta Full-Fidelity Rust-Accelerated Engine Viewport:
- * 1. Cloudflare Turnstile & CAPTCHA Ready:
- *    - Dynamically aligns `User-Agent` to the device's exact native Chromium engine version
- *      (eliminating TLS JA3 / `Sec-CH-UA` version mismatches that trigger Cloudflare blocks).
- *    - Enables session-only first & third-party cookies in memory so Turnstile (`__cf_bm` / `cf_clearance`)
- *      and reCAPTCHA/hCaptcha iframes complete verification on the first click, then wipes all cookies on close.
- *    - Leaves all `challenges.cloudflare.com`, `hcaptcha.com`, and `recaptcha.net` requests untouched.
- * 2. True Developer CORS Unlocker:
- *    - Intercepts cross-origin `OPTIONS` preflights and `GET` API requests in `shouldInterceptRequest`,
- *      echoing the exact `Origin` and `Access-Control-Request-Headers`.
- *    - Provides `MantaBridge.corsRequest(method, url, headersJson, body)` for cross-origin `POST`/`PUT`/`PATCH`/`DELETE`.
- * 3. Cookie-Banner Eliminator & Rust Ad/Tracker Shield:
- *    - Automatically dismisses GDPR/Cookie consent walls and unlocks page scrolling.
+ * Manta Full-Fidelity Chrome-Compatible Engine Viewport:
+ * 1. Stock Chrome Compatibility & Zero Ad-Block Tampering:
+ *    - Dynamically aligns `User-Agent` to the device's native Chromium engine version
+ *      (supporting both Mobile and Desktop Site modes).
+ *    - Enforces standard W3C Same-Origin Policy (SOP) and CORS without unsafe bypass proxies.
+ * 2. Strict Per-Origin Site Isolation & SSRF Guard:
+ *    - Validates subresource requests in Rust (`MantaNative.validateUrl`) to block cross-origin
+ *      Private Network Access (SSRF) and unsafe schemes while allowing all legitimate site traffic.
+ * 3. Custom Clearable Rust Storage Bridge (`MantaBridge`):
+ *    - Routes `localStorage` and `sessionStorage` into Manta's origin-partitioned Rust storage engine
+ *      while keeping WebView network cache strictly disabled (`LOAD_NO_CACHE`).
  */
 @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
 class EphemeralWebSandbox(
     context: Context,
     val tabId: Int,
-    private val isCorsDevEnabled: () -> Boolean,
+    private val isDesktopModeEnabled: () -> Boolean,
     private val onPageMetaUpdate: (tabId: Int, title: String, url: String) -> Unit,
     private val onProgressUpdate: (tabId: Int, progress: Int) -> Unit,
-    private val onShieldEvent: (String) -> Unit
+    private val onSecurityEvent: (String) -> Unit
 ) : WebView(context) {
+
+    @Volatile
+    private var currentMainFrameOriginUrl: String = ""
 
     inner class MantaJsBridge {
         @JavascriptInterface
@@ -51,71 +49,32 @@ class EphemeralWebSandbox(
             MantaNative.copyToClipboard(text)
         }
 
-        /**
-         * Full-featured Developer CORS Bridge for `fetch()` and `XMLHttpRequest`
-         * supporting `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, custom request headers, and bodies.
-         */
         @JavascriptInterface
-        fun corsRequest(
-            method: String,
-            targetUrl: String,
-            headersJson: String,
-            body: String
-        ): String {
-            if (!isCorsDevEnabled()) {
-                return JSONObject().put("error", "CORS Dev Mode Disabled").toString()
-            }
-            val clean = MantaNative.sanitizeAndCheckUrl(targetUrl)
-            if (clean == "BLOCKED") {
-                return JSONObject().put("error", "Blocked by Shield").toString()
-            }
-            return try {
-                val upperMethod = method.uppercase().trim()
-                val conn = (URL(clean).openConnection() as HttpURLConnection).apply {
-                    requestMethod = upperMethod
-                    connectTimeout = 8000
-                    readTimeout = 10000
-                    useCaches = false
-                    instanceFollowRedirects = true
-                    setRequestProperty("Accept", "*/*")
-                    setRequestProperty("User-Agent", buildCleanChromeUserAgent(context))
+        fun storageSet(key: String, value: String, isSession: Boolean): Boolean {
+            val origin = currentMainFrameOriginUrl
+            if (origin.isBlank()) return false
+            return MantaNative.storageSetItem(origin, key, value, isSession)
+        }
 
-                    if (headersJson.isNotBlank() && headersJson.startsWith("{")) {
-                        val hdrObj = JSONObject(headersJson)
-                        val keys = hdrObj.keys()
-                        while (keys.hasNext()) {
-                            val k = keys.next()
-                            val v = hdrObj.optString(k, "")
-                            if (k.isNotBlank() && v.isNotBlank()) {
-                                setRequestProperty(k, v)
-                            }
-                        }
-                    }
+        @JavascriptInterface
+        fun storageGet(key: String, isSession: Boolean): String {
+            val origin = currentMainFrameOriginUrl
+            if (origin.isBlank()) return ""
+            return MantaNative.storageGetItem(origin, key, isSession)
+        }
 
-                    if (body.isNotEmpty() && (upperMethod == "POST" || upperMethod == "PUT" || upperMethod == "PATCH")) {
-                        doOutput = true
-                        if (getRequestProperty("Content-Type") == null) {
-                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                        }
-                        outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                    }
-                }
+        @JavascriptInterface
+        fun storageRemove(key: String, isSession: Boolean) {
+            val origin = currentMainFrameOriginUrl
+            if (origin.isBlank()) return
+            MantaNative.storageRemoveItem(origin, key, isSession)
+        }
 
-                val status = conn.responseCode
-                val contentType = (conn.contentType ?: "application/json; charset=utf-8")
-                val stream = if (status in 200..399) conn.inputStream else conn.errorStream
-                val respBody = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-
-                post { onShieldEvent("CORS Bridge [$upperMethod $status]: ${URL(clean).host}") }
-
-                JSONObject().apply {
-                    put("status", status)
-                    put("contentType", contentType)
-                    put("body", respBody)
-                }.toString()
-            } catch (t: Throwable) {
-                JSONObject().put("error", t.message ?: "Request failed").toString()
-            }
+        @JavascriptInterface
+        fun storageClearOrigin() {
+            val origin = currentMainFrameOriginUrl
+            if (origin.isBlank()) return
+            MantaNative.storageClearOrigin(origin)
         }
     }
 
@@ -125,9 +84,6 @@ class EphemeralWebSandbox(
         isFocusable = true
         isFocusableInTouchMode = true
 
-        // Enable in-memory session cookies (including third-party iframe cookies) so Cloudflare Turnstile
-        // (`challenges.cloudflare.com`), hCaptcha, and reCAPTCHA pass on the first click.
-        // ZeroDiskJanitor wipes all cookies when the tab or app closes.
         try {
             CookieManager.getInstance().apply {
                 setAcceptCookie(true)
@@ -136,12 +92,10 @@ class EphemeralWebSandbox(
         } catch (_: Throwable) {
         }
 
-        val alignedUserAgent = buildCleanChromeUserAgent(context)
-
         settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            databaseEnabled = true
+            databaseEnabled = false
             cacheMode = WebSettings.LOAD_NO_CACHE
 
             useWideViewPort = true
@@ -152,13 +106,13 @@ class EphemeralWebSandbox(
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
-            javaScriptCanOpenWindowsAutomatically = true
+            javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(false)
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = false
             allowContentAccess = false
-            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            userAgentString = alignedUserAgent
+            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            userAgentString = buildCleanChromeUserAgent(context, isDesktopModeEnabled())
         }
 
         addJavascriptInterface(MantaJsBridge(), "MantaBridge")
@@ -188,54 +142,23 @@ class EphemeralWebSandbox(
                     return super.shouldInterceptRequest(view, request)
                 }
 
-                // 1. NEVER intercept or alter Cloudflare Turnstile, hCaptcha, or reCAPTCHA challenge traffic!
                 if (MantaNative.isChallengeUrl(rawUrl)) {
                     return super.shouldInterceptRequest(view, request)
                 }
 
-                // 2. Sub-millisecond Rust Shield check
-                val verdict = MantaNative.sanitizeAndCheckUrl(rawUrl)
+                val initiator = if (request.isForMainFrame) "" else currentMainFrameOriginUrl
+                val verdict = MantaNative.validateUrl(initiator, rawUrl, request.isForMainFrame)
                 if (verdict == "BLOCKED") {
                     val host = request.url?.host ?: rawUrl
-                    post { onShieldEvent("Rust Shield Blocked: $host") }
+                    post { onSecurityEvent("Site Isolation Blocked SSRF/Unsafe: $host") }
                     return WebResourceResponse(
                         "text/plain",
                         "UTF-8",
-                        204,
-                        "No Content",
-                        corsPermissiveHeaders(request),
+                        403,
+                        "Forbidden",
+                        emptyMap(),
                         ByteArrayInputStream(ByteArray(0))
                     )
-                }
-
-                // 3. Developer CORS Mode: Intercept OPTIONS preflights & Cross-Origin GET API calls
-                if (isCorsDevEnabled()) {
-                    val reqMethod = request.method?.uppercase() ?: "GET"
-                    if (reqMethod == "OPTIONS") {
-                        val host = request.url?.host ?: rawUrl
-                        post { onShieldEvent("CORS Preflight 204: $host") }
-                        return WebResourceResponse(
-                            "text/plain",
-                            "UTF-8",
-                            204,
-                            "No Content",
-                            corsPermissiveHeaders(request),
-                            ByteArrayInputStream(ByteArray(0))
-                        )
-                    }
-
-                    val originHeader = request.requestHeaders["Origin"] ?: request.requestHeaders["origin"]
-                    val targetHost = request.url?.host ?: ""
-                    val isCrossOriginSubresource = !request.isForMainFrame &&
-                        !originHeader.isNullOrBlank() &&
-                        originHeader != "null" &&
-                        !originHeader.contains(targetHost, ignoreCase = true)
-
-                    val secFetchMode = request.requestHeaders["Sec-Fetch-Mode"] ?: ""
-                    if (reqMethod == "GET" && isCrossOriginSubresource && secFetchMode.equals("cors", ignoreCase = true)) {
-                        val proxied = proxyCrossOriginGet(verdict, request)
-                        if (proxied != null) return proxied
-                    }
                 }
 
                 return super.shouldInterceptRequest(view, request)
@@ -243,25 +166,30 @@ class EphemeralWebSandbox(
 
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                if (url != null && !MantaNative.isChallengeUrl(url)) {
-                    MantaNative.prewarmDns(url)
-                    val runtimeJs = MantaNative.getRuntimeScript(isCorsDevEnabled())
-                    if (runtimeJs.isNotEmpty()) {
-                        view.evaluateJavascript(runtimeJs, null)
-                    }
-                }
                 if (url != null) {
+                    currentMainFrameOriginUrl = url
+                    if (!MantaNative.isChallengeUrl(url)) {
+                        MantaNative.prewarmDns(url)
+                        val runtimeJs = MantaNative.getRuntimeScript(url)
+                        if (runtimeJs.isNotEmpty()) {
+                            view.evaluateJavascript(runtimeJs, null)
+                        }
+                    }
                     post { onPageMetaUpdate(tabId, view.title ?: url, url) }
                 }
             }
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                if (url != null && !MantaNative.isChallengeUrl(url)) {
-                    val runtimeJs = MantaNative.getRuntimeScript(isCorsDevEnabled())
-                    if (runtimeJs.isNotEmpty()) {
-                        view.evaluateJavascript(runtimeJs, null)
+                if (url != null) {
+                    currentMainFrameOriginUrl = url
+                    if (!MantaNative.isChallengeUrl(url)) {
+                        val runtimeJs = MantaNative.getRuntimeScript(url)
+                        if (runtimeJs.isNotEmpty()) {
+                            view.evaluateJavascript(runtimeJs, null)
+                        }
                     }
+                    MantaNative.flushCustomStorage()
                 }
                 post {
                     onProgressUpdate(tabId, 100)
@@ -271,60 +199,11 @@ class EphemeralWebSandbox(
         }
     }
 
-    private fun proxyCrossOriginGet(
-        cleanUrl: String,
-        request: WebResourceRequest
-    ): WebResourceResponse? {
-        return try {
-            val conn = (URL(cleanUrl).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 7000
-                readTimeout = 8000
-                useCaches = false
-                instanceFollowRedirects = true
-                for ((k, v) in request.requestHeaders) {
-                    if (!k.equals("Origin", ignoreCase = true) && !k.equals("Host", ignoreCase = true)) {
-                        setRequestProperty(k, v)
-                    }
-                }
-            }
-            val status = conn.responseCode
-            val rawCt = conn.contentType ?: "application/json; charset=utf-8"
-            val mimeType = rawCt.split(';')[0].trim().ifEmpty { "application/json" }
-            val stream = if (status in 200..399) conn.inputStream else conn.errorStream
-            val bytes = stream?.readBytes() ?: ByteArray(0)
-            val host = URL(cleanUrl).host
-            post { onShieldEvent("CORS GET Unlocked: $host ($status)") }
-
-            WebResourceResponse(
-                mimeType,
-                "UTF-8",
-                status.coerceIn(200, 599),
-                "OK",
-                corsPermissiveHeaders(request),
-                ByteArrayInputStream(bytes)
-            )
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    private fun corsPermissiveHeaders(request: WebResourceRequest): Map<String, String> {
-        val origin = request.requestHeaders["Origin"]
-            ?: request.requestHeaders["origin"]
-            ?: "*"
-        val reqHeaders = request.requestHeaders["Access-Control-Request-Headers"]
-            ?: request.requestHeaders["access-control-request-headers"]
-            ?: "Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control"
-
-        return mapOf(
-            "Access-Control-Allow-Origin" to origin,
-            "Access-Control-Allow-Credentials" to "true",
-            "Access-Control-Allow-Methods" to "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD",
-            "Access-Control-Allow-Headers" to reqHeaders,
-            "Access-Control-Expose-Headers" to "*",
-            "Access-Control-Max-Age" to "86400"
-        )
+    fun applyDesktopModeSetting(desktopEnabled: Boolean) {
+        MantaNative.setDesktopMode(tabId, desktopEnabled)
+        settings.userAgentString = buildCleanChromeUserAgent(context, desktopEnabled)
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
     }
 
     /**
@@ -348,6 +227,17 @@ class EphemeralWebSandbox(
         }
     }
 
+    fun releaseTabResources() {
+        try {
+            stopLoading()
+            loadUrl("about:blank")
+            clearHistory()
+            clearFormData()
+            clearCache(false)
+        } catch (_: Throwable) {
+        }
+    }
+
     fun wipeAllEphemeralData() {
         try {
             stopLoading()
@@ -363,18 +253,20 @@ class EphemeralWebSandbox(
 
     companion object {
         /**
-         * Reads the device's real System WebView User-Agent so the `Chrome/XXX.0.0.0` version
-         * matches the TLS/HTTP2 & `Sec-CH-UA` fingerprint (mandatory for Cloudflare Turnstile),
-         * while stripping the `; wv` WebView flag and specific phone hardware model.
+         * Builds a stock Chrome User-Agent matching the device's real Chromium engine version
+         * (supporting both Mobile and Desktop Site modes).
          */
-        fun buildCleanChromeUserAgent(context: Context): String {
-            return try {
+        fun buildCleanChromeUserAgent(context: Context, desktopMode: Boolean = false): String {
+            val chromeVer = try {
                 val raw = WebSettings.getDefaultUserAgent(context)
-                val chromeMatch = Regex("Chrome/([0-9.]+)").find(raw)?.groupValues?.getOrNull(1)
-                    ?: "131.0.0.0"
-                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeMatch Mobile Safari/537.36"
+                Regex("Chrome/([0-9.]+)").find(raw)?.groupValues?.getOrNull(1) ?: "131.0.0.0"
             } catch (_: Throwable) {
-                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+                "131.0.0.0"
+            }
+            return if (desktopMode) {
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeVer Safari/537.36"
+            } else {
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeVer Mobile Safari/537.36"
             }
         }
     }

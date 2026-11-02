@@ -1,37 +1,40 @@
 /// Central configuration for Manta Core.
-/// Tuned for minimal battery usage, strict KB-level memory budgets,
-/// developer CORS freedom, and complete anti-tracking isolation.
+/// Tuned for stock-Chrome web compatibility, strict KB-level memory budgets,
+/// strict per-origin site isolation, zero disk cache bloat, and custom clearable user storage.
 #[derive(Debug, Clone)]
 pub struct MantaConfig {
-    /// Maximum total bytes across the volatile RAM vault (Default: 4 MB).
+    /// Maximum total bytes across the transient in-memory RAM pool (Default: 4 MB).
     pub global_ram_ceiling_bytes: usize,
-    /// Maximum bytes allowed per active tab arena (Default: 512 KB).
+    /// Maximum bytes allowed per active tab DOM/render arena (Default: 512 KB).
     pub per_tab_ram_ceiling_bytes: usize,
-    /// Maximum JS VM instruction fuel per script execution (prevents CPU/battery drain).
+    /// Maximum bytes allowed per origin inside Manta's custom storage engine (Default: 256 KB).
+    pub per_origin_storage_quota_bytes: usize,
+    /// Maximum total bytes across Manta's custom clearable storage container (Default: 8 MB).
+    pub total_custom_storage_ceiling_bytes: usize,
+    /// Maximum bytecode VM instruction fuel per script execution (prevents CPU/battery drain).
     pub js_max_fuel_instructions: u32,
-    /// Developer mode: automatically bypass CORS restrictions & synthesize OPTIONS preflights.
-    pub dev_cors_permissive: bool,
-    /// Spoof JS automation/bot probes (`navigator.webdriver = false`, canvas noise, etc.).
-    pub block_fingerprinting: bool,
-    /// Strip `utm_*`, `fbclid`, `gclid`, and tracking query parameters from all URLs.
-    pub strip_tracking_params: bool,
-    /// Never store or send HTTP `Cookie` or `Set-Cookie` headers.
-    pub strict_zero_cookies: bool,
-    /// Bottom dock active tab index (0 = Home, 1 = Search, 2 = Library).
-    pub active_dock_section: u8,
+    /// Maximum JS call-stack depth.
+    pub js_max_call_depth: usize,
+    /// Enforce strict RFC 6454 Same-Origin Policy & Private Network Access (SSRF) protection.
+    pub strict_site_isolation: bool,
+    /// Never write HTTP/network/media disk caches (100% zero-cache guarantee).
+    pub zero_disk_cache: bool,
+    /// Path to Manta's single clearable custom binary storage container.
+    pub custom_storage_file_path: String,
 }
 
 impl Default for MantaConfig {
     fn default() -> Self {
         Self {
-            global_ram_ceiling_bytes: 4 * 1024 * 1024, // 4 MB total ceiling
-            per_tab_ram_ceiling_bytes: 512 * 1024,     // 512 KB per tab
-            js_max_fuel_instructions: 25_000,          // Fast, battery-safe execution cap
-            dev_cors_permissive: true,                 // Enabled by default for site testing
-            block_fingerprinting: true,
-            strip_tracking_params: true,
-            strict_zero_cookies: true,
-            active_dock_section: 0,
+            global_ram_ceiling_bytes: 4 * 1024 * 1024,       // 4 MB transient pool ceiling
+            per_tab_ram_ceiling_bytes: 512 * 1024,           // 512 KB per active tab arena
+            per_origin_storage_quota_bytes: 256 * 1024,      // 256 KB per origin storage quota
+            total_custom_storage_ceiling_bytes: 8 * 1024 * 1024, // 8 MB custom storage ceiling
+            js_max_fuel_instructions: 50_000,                // Fast, battery-safe bytecode execution cap
+            js_max_call_depth: 64,
+            strict_site_isolation: true,
+            zero_disk_cache: true,
+            custom_storage_file_path: String::new(),
         }
     }
 }

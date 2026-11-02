@@ -1,18 +1,18 @@
-use crate::cookie_banner::CookieBannerEliminator;
-use crate::ram_vault::VolatileRamVault;
+use crate::site_isolation::OriginKey;
+use crate::storage_engine::MantaStorageEngine;
 
-/// Rust Page Runtime Compiler & Accelerator (`page_compiler.rs`):
-/// Generates the high-speed JavaScript + CSS injection payload executed on pages:
-/// 1. Cloudflare Turnstile & CAPTCHA Stealth Integrity (never tampers with challenge iframes,
-///    preserves native `Function.prototype.toString` and `Navigator.prototype` descriptors).
-/// 2. Cookie-Banner & GDPR Consent Wall Auto-Eliminator (`cookie_banner.rs`).
-/// 3. Universal Developer CORS Unlocker (`window.fetch` + `XMLHttpRequest` -> `MantaBridge.corsRequest`).
-/// 4. Cosmetic Ad Slot Zapper.
+/// Rust Page Runtime Compiler & Pre-Scanner (`page_compiler.rs`):
+/// 1. Stock Chrome Stealth & Web API Compatibility (preserves native prototype descriptors,
+///    zero ad-blocking CSS/JS tampering, zero unsafe CORS overrides).
+/// 2. Origin-Isolated Custom Storage Synchronization: Hydrates `window.localStorage` and
+///    `window.sessionStorage` from Manta's custom Rust storage engine (`MantaStorageEngine`)
+///    strictly for the current page's canonical `OriginKey` (`scheme://host:port`).
+/// 3. Pre-scans HTML streams for `<link rel="preconnect">` and `<link rel="dns-prefetch">` hints.
 pub struct PageRuntimeCompiler;
 
 impl PageRuntimeCompiler {
-    /// Returns true if the URL belongs to Cloudflare Turnstile, hCaptcha, or Google reCAPTCHA.
-    /// Manta leaves challenge URLs 100% untouched so cryptographic verification always succeeds.
+    /// Returns true if the URL belongs to a cryptographic challenge endpoint
+    /// (Cloudflare Turnstile, hCaptcha, Google reCAPTCHA).
     pub fn is_verification_challenge_url(url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
         lower.contains("challenges.cloudflare.com")
@@ -25,25 +25,26 @@ impl PageRuntimeCompiler {
             || lower.contains("gstatic.com/recaptcha")
     }
 
-    pub fn compile_runtime_script(cors_dev_enabled: bool) -> String {
-        let cors_flag = if cors_dev_enabled { "true" } else { "false" };
-        let cookie_css = CookieBannerEliminator::COSMETIC_COOKIE_CSS;
-        let cookie_js = CookieBannerEliminator::AUTO_DISMISS_COOKIE_JS;
+    /// Generates the standards-compliant Chrome runtime script for a specific origin,
+    /// syncing `localStorage` and `sessionStorage` writes directly into Manta's clearable Rust storage.
+    pub fn compile_runtime_script_for_origin(
+        origin_url: &str,
+        storage: &MantaStorageEngine,
+    ) -> String {
+        let origin = OriginKey::from_url(origin_url);
+        if origin.is_opaque || Self::is_verification_challenge_url(origin_url) {
+            return String::new();
+        }
+
+        let local_json = storage.export_origin_storage_json(origin_url, false);
+        let session_json = storage.export_origin_storage_json(origin_url, true);
 
         format!(
             r#"(function() {{
-    if (window.__mantaRuntimeV2) return;
-    window.__mantaRuntimeV2 = true;
+    if (window.__mantaChromeRuntimeV3) return;
+    window.__mantaChromeRuntimeV3 = true;
 
-    const host = (location && location.hostname) ? location.hostname.toLowerCase() : '';
-    const isChallengeFrame = (
-        host.includes('cloudflare.com') ||
-        host.includes('hcaptcha.com') ||
-        host.includes('recaptcha.net') ||
-        (location && location.pathname && location.pathname.includes('/cdn-cgi/'))
-    );
-
-    // 1. Stealth Anti-Webdriver Patch (Preserves native prototype & toString for Cloudflare Turnstile)
+    // 1. Standard Chrome Automation Flag Alignment
     try {{
         if (navigator.webdriver === true) {{
             const navProto = Object.getPrototypeOf(navigator);
@@ -59,180 +60,83 @@ impl PageRuntimeCompiler {
         }}
     }} catch (_) {{}}
 
-    // If inside a Cloudflare Turnstile / CAPTCHA iframe, stop here so zero globals or prototypes are altered!
-    if (isChallengeFrame) return;
+    // 2. Hydrate & Hook Origin-Isolated Custom Rust Storage (MantaStorageEngine)
+    if (window.MantaBridge && typeof window.MantaBridge.storageSet === 'function') {{
+        try {{
+            const initialLocal = {local_json};
+            for (const k in initialLocal) {{
+                if (Object.prototype.hasOwnProperty.call(initialLocal, k)) {{
+                    window.localStorage.setItem(k, initialLocal[k]);
+                }}
+            }}
+            const initialSession = {session_json};
+            for (const k in initialSession) {{
+                if (Object.prototype.hasOwnProperty.call(initialSession, k)) {{
+                    window.sessionStorage.setItem(k, initialSession[k]);
+                }}
+            }}
 
-    // 2. Universal Developer CORS Unlocker (Supports BOTH window.fetch and XMLHttpRequest)
-    const corsDevActive = {cors_flag};
-    if (corsDevActive && window.MantaBridge && window.MantaBridge.corsRequest) {{
-        // 2a. Wrap window.fetch
-        if (window.fetch) {{
-            const nativeFetch = window.fetch.bind(window);
-            window.fetch = async function(input, init) {{
-                let targetUrl = '';
-                let method = 'GET';
-                let bodyStr = '';
-                let headersObj = {{}};
+            const origLocalSet = Storage.prototype.setItem;
+            const origLocalRemove = Storage.prototype.removeItem;
+            const origLocalClear = Storage.prototype.clear;
 
+            Storage.prototype.setItem = function(key, val) {{
+                origLocalSet.call(this, key, val);
                 try {{
-                    targetUrl = (typeof input === 'string') ? input : (input && input.url ? input.url : String(input));
-                    if (targetUrl.startsWith('//')) targetUrl = location.protocol + targetUrl;
-                    else if (targetUrl.startsWith('/')) targetUrl = location.origin + targetUrl;
+                    const isSess = (this === window.sessionStorage);
+                    window.MantaBridge.storageSet(String(key), String(val), isSess);
+                }} catch (_) {{}}
+            }};
 
-                    method = (init && init.method) ? String(init.method).toUpperCase() : (input && input.method ? String(input.method).toUpperCase() : 'GET');
-                    if (init && init.headers) {{
-                        if (init.headers instanceof Headers) {{
-                            init.headers.forEach((v, k) => {{ headersObj[k] = v; }});
-                        }} else if (typeof init.headers === 'object') {{
-                            Object.assign(headersObj, init.headers);
-                        }}
-                    }}
-                    if (init && init.body) {{
-                        bodyStr = (typeof init.body === 'string') ? init.body : JSON.stringify(init.body);
+            Storage.prototype.removeItem = function(key) {{
+                origLocalRemove.call(this, key);
+                try {{
+                    const isSess = (this === window.sessionStorage);
+                    window.MantaBridge.storageRemove(String(key), isSess);
+                }} catch (_) {{}}
+            }};
+
+            Storage.prototype.clear = function() {{
+                origLocalClear.call(this);
+                try {{
+                    if (this === window.localStorage) {{
+                        window.MantaBridge.storageClearOrigin();
                     }}
                 }} catch (_) {{}}
-
-                const isCrossOrigin = targetUrl.startsWith('http') && !targetUrl.startsWith(location.origin);
-                const needsBodyBridge = isCrossOrigin && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE');
-
-                if (needsBodyBridge) {{
-                    const rawJson = window.MantaBridge.corsRequest(method, targetUrl, JSON.stringify(headersObj), bodyStr);
-                    const parsed = JSON.parse(rawJson);
-                    if (!parsed.error) {{
-                        return new Response(parsed.body, {{
-                            status: parsed.status || 200,
-                            headers: {{
-                                'Content-Type': parsed.contentType || 'application/json',
-                                'Access-Control-Allow-Origin': '*'
-                            }}
-                        }});
-                    }}
-                }}
-
-                try {{
-                    return await nativeFetch(input, init);
-                }} catch (fetchErr) {{
-                    if (targetUrl.startsWith('http')) {{
-                        const rawJson = window.MantaBridge.corsRequest(method, targetUrl, JSON.stringify(headersObj), bodyStr);
-                        const parsed = JSON.parse(rawJson);
-                        if (!parsed.error) {{
-                            return new Response(parsed.body, {{
-                                status: parsed.status || 200,
-                                headers: {{
-                                    'Content-Type': parsed.contentType || 'application/json',
-                                    'Access-Control-Allow-Origin': '*'
-                                }}
-                            }});
-                        }}
-                    }}
-                    throw fetchErr;
-                }}
             }};
-        }}
-
-        // 2b. Wrap XMLHttpRequest for Axios / XHR apps
-        if (window.XMLHttpRequest) {{
-            const OrigXHR = window.XMLHttpRequest;
-            const origOpen = OrigXHR.prototype.open;
-            const origSend = OrigXHR.prototype.send;
-            const origSetHeader = OrigXHR.prototype.setRequestHeader;
-
-            OrigXHR.prototype.open = function(method, url) {{
-                this.__mantaMethod = method ? String(method).toUpperCase() : 'GET';
-                let resolved = String(url || '');
-                if (resolved.startsWith('//')) resolved = location.protocol + resolved;
-                else if (resolved.startsWith('/')) resolved = location.origin + resolved;
-                this.__mantaUrl = resolved;
-                this.__mantaHeaders = {{}};
-                return origOpen.apply(this, arguments);
-            }};
-
-            OrigXHR.prototype.setRequestHeader = function(k, v) {{
-                if (this.__mantaHeaders) this.__mantaHeaders[k] = v;
-                return origSetHeader.apply(this, arguments);
-            }};
-
-            OrigXHR.prototype.send = function(body) {{
-                const xhr = this;
-                const url = xhr.__mantaUrl || '';
-                const method = xhr.__mantaMethod || 'GET';
-                const isCrossOrigin = url.startsWith('http') && !url.startsWith(location.origin);
-
-                if (isCrossOrigin && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')) {{
-                    try {{
-                        const bodyStr = (typeof body === 'string') ? body : (body ? JSON.stringify(body) : '');
-                        const rawJson = window.MantaBridge.corsRequest(method, url, JSON.stringify(xhr.__mantaHeaders || {{}}), bodyStr);
-                        const parsed = JSON.parse(rawJson);
-                        if (!parsed.error) {{
-                            Object.defineProperty(xhr, 'readyState', {{ value: 4, configurable: true }});
-                            Object.defineProperty(xhr, 'status', {{ value: parsed.status || 200, configurable: true }});
-                            Object.defineProperty(xhr, 'responseText', {{ value: parsed.body || '', configurable: true }});
-                            Object.defineProperty(xhr, 'response', {{ value: parsed.body || '', configurable: true }});
-                            if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange();
-                            if (typeof xhr.onload === 'function') xhr.onload();
-                            return;
-                        }}
-                    }} catch (_) {{}}
-                }}
-                return origSend.apply(this, arguments);
-            }};
-        }}
+        }} catch (_) {{}}
     }}
-
-    // 3. Cosmetic Ad & Cookie-Banner Zapper
-    try {{
-        const injectStyles = function() {{
-            if (document.getElementById('__manta_shield_css')) return;
-            const style = document.createElement('style');
-            style.id = '__manta_shield_css';
-            style.textContent = `
-                .adsbygoogle, [id^="google_ads_iframe"], [id^="div-gpt-ad"],
-                iframe[src*="doubleclick.net"], iframe[src*="googlesyndication.com"],
-                .ad-banner, .ad-slot, [data-ad-slot] {{
-                    display: none !important;
-                    height: 0 !important;
-                    visibility: hidden !important;
-                }}
-                {cookie_css}
-            `;
-            (document.head || document.documentElement).appendChild(style);
-        }};
-        if (document.head || document.documentElement) injectStyles();
-        else document.addEventListener('DOMContentLoaded', injectStyles, {{ once: true }});
-    }} catch (_) {{}}
-
-    // 4. Auto-Dismiss Cookie Walls & Unlock Page Scroll
-    {cookie_js}
 }})();"#,
-            cors_flag = cors_flag,
-            cookie_css = cookie_css,
-            cookie_js = cookie_js
+            local_json = local_json,
+            session_json = session_json
         )
     }
 
-    pub fn store_volatile_cookie(
-        vault: &mut VolatileRamVault,
-        tab_id: u32,
-        host: &str,
-        raw_cookie: &str,
-    ) {
-        if host.is_empty() || raw_cookie.is_empty() {
-            return;
+    /// Extracts `<link rel="preconnect" href="...">` and `<link rel="dns-prefetch" href="...">`
+    /// URLs from an HTML chunk so `MantaWorkerPool` can pre-warm DNS in parallel.
+    pub fn extract_preconnect_hosts(html_chunk: &str) -> Vec<String> {
+        let mut hosts = Vec::new();
+        let lower = html_chunk.to_ascii_lowercase();
+        if !lower.contains("preconnect") && !lower.contains("dns-prefetch") {
+            return hosts;
         }
-        let cookie_pair = raw_cookie.split(';').next().unwrap_or("").trim();
-        if cookie_pair.is_empty() || cookie_pair.len() > 2048 {
-            return;
+        for segment in html_chunk.split("<link") {
+            let seg_lower = segment.to_ascii_lowercase();
+            if seg_lower.contains("preconnect") || seg_lower.contains("dns-prefetch") {
+                if let Some(href_pos) = seg_lower.find("href=") {
+                    let after = &segment[href_pos + 5..].trim_start();
+                    let quote = after.chars().next().unwrap_or(' ');
+                    if quote == '"' || quote == '\'' {
+                        if let Some(end_q) = after[1..].find(quote) {
+                            let url = &after[1..1 + end_q];
+                            if !url.is_empty() && hosts.len() < 8 {
+                                hosts.push(url.to_string());
+                            }
+                        }
+                    }
+                }
+            }
         }
-        let vault_key = format!("cookie:{}", host.to_ascii_lowercase());
-        vault.put_ephemeral(tab_id, &vault_key, cookie_pair.as_bytes());
-    }
-
-    pub fn read_volatile_cookie(vault: &VolatileRamVault, tab_id: u32, host: &str) -> String {
-        let vault_key = format!("cookie:{}", host.to_ascii_lowercase());
-        vault
-            .get_ephemeral(tab_id, &vault_key)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("")
-            .to_string()
+        hosts
     }
 }
