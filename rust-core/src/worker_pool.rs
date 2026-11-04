@@ -7,14 +7,13 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// Multi-Core Rust Worker Pool (`worker_pool.rs`):
 /// Distributes DNS pre-warming, background tab compression, and stream tasks across
-/// multiple CPU hardware threads while keeping idle CPU/battery usage at 0% via Condvar/Channel park.
+/// multiple CPU hardware threads while keeping idle CPU/battery usage at 0% via channel park.
 pub struct MantaWorkerPool {
     sender: Sender<Job>,
     core_count: usize,
 }
 
 impl MantaWorkerPool {
-    /// Creates a worker pool. If `requested_cores == 0`, automatically scales to hardware cores (2..=8).
     pub fn new(requested_cores: usize) -> Self {
         let detected = thread::available_parallelism()
             .map(|n| n.get())
@@ -55,7 +54,6 @@ impl MantaWorkerPool {
         self.core_count
     }
 
-    /// Submits an asynchronous task to one of Manta's background Rust cores.
     pub fn spawn_task<F>(&self, task: F)
     where
         F: FnOnce() + Send + 'static,
@@ -63,8 +61,6 @@ impl MantaWorkerPool {
         let _ = self.sender.send(Box::new(task));
     }
 
-    /// Pre-warms OS DNS cache for a target URL's host on a background Rust core
-    /// so subsequent navigation has 0ms DNS resolution latency.
     pub fn prewarm_url_dns(&self, url: &str) {
         let host = extract_host_for_dns(url).to_string();
         if host.is_empty() || host.contains("localhost") {

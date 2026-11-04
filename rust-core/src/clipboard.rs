@@ -1,5 +1,5 @@
 /// Sandboxed, size-capped Clipboard Manager in 100% Safe Rust.
-/// Allows user-initiated copy/paste & selection extraction with instant O(1) clear.
+/// Supports user-initiated copy/paste & selection extraction with instant O(1) clear.
 pub struct ClipboardSandbox {
     buffer: String,
     max_bytes: usize,

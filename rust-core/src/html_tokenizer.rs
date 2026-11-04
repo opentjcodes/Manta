@@ -32,9 +32,10 @@ enum LexState {
 
 /// Streaming HTML5 Tokenizer designed for chunk-by-chunk ingestion:
 /// - Preserves multi-byte UTF-8 sequences cleanly across 4 KB network chunk boundaries.
-/// - Switches to `RawText` mode inside `<script>` and `<style>` tags so `<` operators
-///   in JavaScript or CSS never corrupt the DOM tree.
-/// - Decodes HTML5 named, decimal, and hexadecimal character entities (`&amp;`, `&lt;`, `&#x2022;`, etc.).
+/// - Switches to `RawText` mode inside `<script>`, `<style>`, and `<textarea>` tags so `<`
+///   operators in JavaScript or CSS never corrupt the DOM tree.
+/// - Properly handles `<!-- ... -->` comments even when `>` appears inside the comment body.
+/// - Decodes HTML5 named, decimal, and hexadecimal character entities in text and attributes.
 pub struct StreamingHtmlTokenizer {
     state: LexState,
     current_tag_name: String,
@@ -259,9 +260,12 @@ impl StreamingHtmlTokenizer {
                     }
                 }
                 LexState::Comment => {
-                    if b == b'>'
-                        && ((self.comment_tail[0] == b'-' && self.comment_tail[1] == b'-')
-                            || self.comment_tail[1] == 0)
+                    // Close comment on `-->` or DOCTYPE `<!DOCTYPE ...>`
+                    if b == b'>' && self.comment_tail == [b'-', b'-'] {
+                        self.state = LexState::Data;
+                    } else if b == b'>'
+                        && self.comment_tail[0] != b'-'
+                        && self.comment_tail[1] != b'-'
                     {
                         self.state = LexState::Data;
                     } else {

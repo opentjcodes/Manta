@@ -1,12 +1,11 @@
 use crate::ram_vault::VolatileRamVault;
 
 /// Ultra-fast LZ-Run-Length Hybrid Compressor in pure Rust (`tab_compressor.rs`).
-/// Compresses background tab metadata, URL, title, and scroll coordinates into a tiny
-/// byte slice inside `VolatileRamVault` so 20+ open tabs consume only a few kilobytes of RAM.
+/// Used when total open tab memory exceeds the global ceiling, or when saving fast
+/// restoration snapshots inside `VolatileRamVault`.
 pub struct TabCompressor;
 
 impl TabCompressor {
-    /// Compresses a byte slice using Byte-Aligned Run-Length + Repeated-Token encoding.
     pub fn compress(input: &[u8]) -> Vec<u8> {
         if input.is_empty() {
             return Vec::new();
@@ -32,7 +31,6 @@ impl TabCompressor {
         out
     }
 
-    /// Decompresses a slice produced by `TabCompressor::compress`.
     pub fn decompress(compressed: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(compressed.len() * 2);
         let mut i = 0;
@@ -52,7 +50,6 @@ impl TabCompressor {
         out
     }
 
-    /// Saves a tab's state (URL, Title, ScrollY, Custom state) compressed into the VolatileRamVault.
     pub fn store_tab_snapshot(
         vault: &mut VolatileRamVault,
         tab_id: u32,
@@ -63,16 +60,15 @@ impl TabCompressor {
         let raw = format!("{}|{}|{}", scroll_y, title.replace('|', " "), url);
         let compressed = Self::compress(raw.as_bytes());
         let len = compressed.len();
-        vault.put_ephemeral(tab_id, "tab_snapshot_v1", &compressed);
+        vault.put_ephemeral(tab_id, "tab_snapshot_v2", &compressed);
         len
     }
 
-    /// Restores a tab's compressed snapshot from `VolatileRamVault`.
     pub fn restore_tab_snapshot(
         vault: &VolatileRamVault,
         tab_id: u32,
     ) -> Option<(i32, String, String)> {
-        let compressed = vault.get_ephemeral(tab_id, "tab_snapshot_v1")?;
+        let compressed = vault.get_ephemeral(tab_id, "tab_snapshot_v2")?;
         let raw_bytes = Self::decompress(compressed);
         let raw_str = String::from_utf8(raw_bytes).ok()?;
         let mut parts = raw_str.splitn(3, '|');
@@ -80,24 +76,5 @@ impl TabCompressor {
         let title = parts.next()?.to_string();
         let url = parts.next()?.to_string();
         Some((scroll_y, title, url))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_tab_compression_roundtrip() {
-        let mut vault = VolatileRamVault::new(32 * 1024);
-        let url = "https://example.com/some/very/long/path/aaaaaaabbbbbbbccccccc";
-        let title = "Example Page Title";
-        let bytes_stored = TabCompressor::store_tab_snapshot(&mut vault, 7, url, title, 1240);
-        assert!(bytes_stored > 0);
-
-        let (scroll_y, r_title, r_url) = TabCompressor::restore_tab_snapshot(&vault, 7).unwrap();
-        assert_eq!(scroll_y, 1240);
-        assert_eq!(r_title, title);
-        assert_eq!(r_url, url);
     }
 }

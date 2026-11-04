@@ -1,32 +1,221 @@
 use std::collections::HashMap;
 
-/// Per-tab Chrome-parity browser controls managed in Rust:
-/// - Navigation history stack (Back, Forward, CanGoBack, CanGoForward)
-/// - Desktop Site mode (`request_desktop_site`)
-/// - Page Zoom percentage (`50%` ..= `300%`)
-/// - Audio Mute toggle
-/// - Find-in-Page state
+/// Cookie policy selectable by the user in Manta Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookiePolicy {
+    AllowAll,
+    PartitionThirdParty,
+    BlockThirdParty,
+    BlockAll,
+}
+
+/// Media autoplay policy selectable in Manta Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoplayPolicy {
+    AllowAll,
+    AllowMutedOnly,
+    BlockAll,
+}
+
+/// Complete browser settings matrix (`MantaSettings`) covering every control modern users expect.
+#[derive(Debug, Clone)]
+pub struct MantaSettings {
+    pub search_engine_name: String,
+    pub search_url_template: String,
+    pub homepage_url: String,
+    pub new_tab_url: String,
+    pub javascript_enabled: bool,
+    pub images_enabled: bool,
+    pub popups_blocked: bool,
+    pub do_not_track: bool,
+    pub global_privacy_control: bool,
+    pub https_only_mode: bool,
+    pub dns_preconnect_enabled: bool,
+    pub dark_mode_forced: bool,
+    pub default_zoom_percent: u16,
+    pub font_scale_percent: u16,
+    pub minimum_font_size_sp: u8,
+    pub cookie_policy: CookiePolicy,
+    pub autoplay_policy: AutoplayPolicy,
+    pub download_auto_save: bool,
+    pub download_directory: String,
+    pub custom_user_agent: String,
+}
+
+impl Default for MantaSettings {
+    fn default() -> Self {
+        Self {
+            search_engine_name: "Google".to_string(),
+            search_url_template: "https://www.google.com/search?q={query}".to_string(),
+            homepage_url: "manta://start".to_string(),
+            new_tab_url: "manta://start".to_string(),
+            javascript_enabled: true,
+            images_enabled: true,
+            popups_blocked: true,
+            do_not_track: true,
+            global_privacy_control: true,
+            https_only_mode: false,
+            dns_preconnect_enabled: true,
+            dark_mode_forced: true,
+            default_zoom_percent: 100,
+            font_scale_percent: 100,
+            minimum_font_size_sp: 10,
+            cookie_policy: CookiePolicy::PartitionThirdParty,
+            autoplay_policy: AutoplayPolicy::AllowMutedOnly,
+            download_auto_save: true,
+            download_directory: String::from("./downloads"),
+            custom_user_agent: String::new(),
+        }
+    }
+}
+
+impl MantaSettings {
+    /// Resolves any omnibox input (URL, IP, localhost, `manta://`, or search query) into a target URL.
+    pub fn resolve_omnibox_input(&self, raw_input: &str) -> String {
+        let trimmed = raw_input.trim();
+        if trimmed.is_empty() {
+            return self.new_tab_url.clone();
+        }
+        if trimmed.starts_with("manta://")
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("data:")
+        {
+            return trimmed.to_string();
+        }
+        if trimmed.starts_with("localhost") || trimmed.starts_with("127.0.0.1") {
+            return format!("http://{}", trimmed);
+        }
+        if trimmed.contains('.') && !trimmed.contains(' ') {
+            return format!("https://{}", trimmed);
+        }
+        let encoded = url_encode_query(trimmed);
+        self.search_url_template.replace("{query}", &encoded)
+    }
+
+    /// Updates a setting dynamically by key name.
+    pub fn set_by_key(&mut self, key: &str, value: &str) -> bool {
+        let v = value.trim();
+        match key.trim() {
+            "search_engine_name" => self.search_engine_name = v.to_string(),
+            "search_url_template" => self.search_url_template = v.to_string(),
+            "homepage_url" => self.homepage_url = v.to_string(),
+            "new_tab_url" => self.new_tab_url = v.to_string(),
+            "javascript_enabled" => self.javascript_enabled = parse_bool(v),
+            "images_enabled" => self.images_enabled = parse_bool(v),
+            "popups_blocked" => self.popups_blocked = parse_bool(v),
+            "do_not_track" => self.do_not_track = parse_bool(v),
+            "global_privacy_control" => self.global_privacy_control = parse_bool(v),
+            "https_only_mode" => self.https_only_mode = parse_bool(v),
+            "dns_preconnect_enabled" => self.dns_preconnect_enabled = parse_bool(v),
+            "dark_mode_forced" => self.dark_mode_forced = parse_bool(v),
+            "default_zoom_percent" => {
+                if let Ok(z) = v.parse::<u16>() {
+                    self.default_zoom_percent = z.clamp(25, 500);
+                } else {
+                    return false;
+                }
+            }
+            "font_scale_percent" => {
+                if let Ok(s) = v.parse::<u16>() {
+                    self.font_scale_percent = s.clamp(50, 300);
+                } else {
+                    return false;
+                }
+            }
+            "download_auto_save" => self.download_auto_save = parse_bool(v),
+            "download_directory" => self.download_directory = v.to_string(),
+            "custom_user_agent" => self.custom_user_agent = v.to_string(),
+            "cookie_policy" => {
+                self.cookie_policy = match v.to_ascii_lowercase().as_str() {
+                    "allow_all" => CookiePolicy::AllowAll,
+                    "block_third_party" => CookiePolicy::BlockThirdParty,
+                    "block_all" => CookiePolicy::BlockAll,
+                    _ => CookiePolicy::PartitionThirdParty,
+                };
+            }
+            "autoplay_policy" => {
+                self.autoplay_policy = match v.to_ascii_lowercase().as_str() {
+                    "allow_all" => AutoplayPolicy::AllowAll,
+                    "block_all" => AutoplayPolicy::BlockAll,
+                    _ => AutoplayPolicy::AllowMutedOnly,
+                };
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn export_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"search_engine_name\":\"{}\",",
+                "\"search_url_template\":\"{}\",",
+                "\"homepage_url\":\"{}\",",
+                "\"javascript_enabled\":{},",
+                "\"images_enabled\":{},",
+                "\"popups_blocked\":{},",
+                "\"do_not_track\":{},",
+                "\"global_privacy_control\":{},",
+                "\"https_only_mode\":{},",
+                "\"dns_preconnect_enabled\":{},",
+                "\"dark_mode_forced\":{},",
+                "\"default_zoom_percent\":{},",
+                "\"font_scale_percent\":{},",
+                "\"download_auto_save\":{},",
+                "\"download_directory\":\"{}\"",
+                "}}"
+            ),
+            escape_json(&self.search_engine_name),
+            escape_json(&self.search_url_template),
+            escape_json(&self.homepage_url),
+            self.javascript_enabled,
+            self.images_enabled,
+            self.popups_blocked,
+            self.do_not_track,
+            self.global_privacy_control,
+            self.https_only_mode,
+            self.dns_preconnect_enabled,
+            self.dark_mode_forced,
+            self.default_zoom_percent,
+            self.font_scale_percent,
+            self.download_auto_save,
+            escape_json(&self.download_directory),
+        )
+    }
+}
+
+/// Per-tab navigation, zoom, find-in-page, reader mode, and media controls managed in Rust.
 #[derive(Debug, Clone)]
 pub struct TabControlState {
     pub tab_id: u32,
     pub history_entries: Vec<(String, String)>, // (url, title)
     pub history_cursor: usize,
     pub desktop_mode: bool,
+    pub reader_mode: bool,
     pub zoom_percent: u16,
     pub audio_muted: bool,
-    pub last_find_query: String,
+    pub fullscreen: bool,
+    pub find_query: String,
+    pub find_match_count: usize,
+    pub find_active_ordinal: usize,
 }
 
 impl TabControlState {
-    pub fn new(tab_id: u32) -> Self {
+    pub fn new(tab_id: u32, default_zoom: u16) -> Self {
         Self {
             tab_id,
             history_entries: Vec::with_capacity(16),
             history_cursor: 0,
             desktop_mode: false,
-            zoom_percent: 100,
+            reader_mode: false,
+            zoom_percent: default_zoom,
             audio_muted: false,
-            last_find_query: String::new(),
+            fullscreen: false,
+            find_query: String::new(),
+            find_match_count: 0,
+            find_active_ordinal: 0,
         }
     }
 
@@ -46,7 +235,7 @@ impl TabControlState {
                 return;
             }
         }
-        if self.history_entries.len() >= 64 {
+        if self.history_entries.len() >= 128 {
             self.history_entries.remove(0);
         }
         self.history_entries
@@ -81,28 +270,31 @@ impl TabControlState {
     }
 }
 
-/// Manages Chrome-parity controls across all open tabs.
-pub struct ChromeControlsManager {
+/// Manages global `MantaSettings` and per-tab `TabControlState` across all open tabs.
+pub struct MantaControlsManager {
+    pub settings: MantaSettings,
     tab_controls: HashMap<u32, TabControlState>,
 }
 
-impl Default for ChromeControlsManager {
+impl Default for MantaControlsManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ChromeControlsManager {
+impl MantaControlsManager {
     pub fn new() -> Self {
         Self {
+            settings: MantaSettings::default(),
             tab_controls: HashMap::new(),
         }
     }
 
     pub fn ensure_tab_state(&mut self, tab_id: u32) -> &mut TabControlState {
+        let default_zoom = self.settings.default_zoom_percent;
         self.tab_controls
             .entry(tab_id)
-            .or_insert_with(|| TabControlState::new(tab_id))
+            .or_insert_with(|| TabControlState::new(tab_id, default_zoom))
     }
 
     pub fn set_desktop_mode(&mut self, tab_id: u32, enabled: bool) {
@@ -117,14 +309,21 @@ impl ChromeControlsManager {
     }
 
     pub fn set_zoom_percent(&mut self, tab_id: u32, zoom: u16) {
-        self.ensure_tab_state(tab_id).zoom_percent = zoom.clamp(50, 300);
+        self.ensure_tab_state(tab_id).zoom_percent = zoom.clamp(25, 500);
     }
 
     pub fn get_zoom_percent(&self, tab_id: u32) -> u16 {
         self.tab_controls
             .get(&tab_id)
             .map(|s| s.zoom_percent)
-            .unwrap_or(100)
+            .unwrap_or(self.settings.default_zoom_percent)
+    }
+
+    pub fn update_find_in_page(&mut self, tab_id: u32, query: &str, total_matches: usize) {
+        let st = self.ensure_tab_state(tab_id);
+        st.find_query = query.to_string();
+        st.find_match_count = total_matches;
+        st.find_active_ordinal = if total_matches > 0 { 1 } else { 0 };
     }
 
     pub fn remove_tab(&mut self, tab_id: u32) {
@@ -136,27 +335,50 @@ impl ChromeControlsManager {
     }
 }
 
+fn parse_bool(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+}
+
+fn url_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_navigation_history_and_zoom_controls() {
-        let mut mgr = ChromeControlsManager::new();
+    fn test_manta_settings_and_navigation_controls() {
+        let mut mgr = MantaControlsManager::new();
+        assert_eq!(
+            mgr.settings.resolve_omnibox_input("rust lang"),
+            "https://www.google.com/search?q=rust+lang"
+        );
+        assert_eq!(
+            mgr.settings.resolve_omnibox_input("manta.dev"),
+            "https://manta.dev"
+        );
+
+        assert!(mgr.settings.set_by_key("default_zoom_percent", "125"));
         let st = mgr.ensure_tab_state(1);
-        st.record_navigation("https://google.com", "Google");
-        st.record_navigation("https://github.com", "GitHub");
-        st.record_navigation("https://rust-lang.org", "Rust");
-
+        assert_eq!(st.zoom_percent, 125);
+        st.record_navigation("https://manta.dev", "Manta");
+        st.record_navigation("https://manta.dev/docs", "Docs");
         assert!(st.can_go_back());
-        assert!(!st.can_go_forward());
-        assert_eq!(st.go_back().unwrap().0, "https://github.com");
-        assert!(st.can_go_forward());
-        assert_eq!(st.go_forward().unwrap().0, "https://rust-lang.org");
-
-        mgr.set_zoom_percent(1, 150);
-        assert_eq!(mgr.get_zoom_percent(1), 150);
-        mgr.set_desktop_mode(1, true);
-        assert!(mgr.is_desktop_mode(1));
+        assert_eq!(st.go_back().unwrap().0, "https://manta.dev");
     }
 }

@@ -6,25 +6,31 @@ use crate::dom_arena::{DomNode, NodeKind};
 pub struct ComputedStyle {
     pub text_color: u32,       // ARGB 0xAARRGGBB
     pub background_color: u32, // ARGB 0xAARRGGBB
+    pub border_color: u32,     // ARGB 0xAARRGGBB
     pub font_size_sp: f32,
     pub font_weight_bold: bool,
     pub margin_vertical: f32,
     pub padding: f32,
     pub corner_radius: f32,
+    pub explicit_height: Option<f32>,
     pub display_none: bool,
+    pub is_flex_row: bool,
 }
 
 impl Default for ComputedStyle {
     fn default() -> Self {
         Self {
-            text_color: 0xFFF1F5F9,       // Clean crisp off-white for Manta dark mode
-            background_color: 0x00000000, // Transparent by default
+            text_color: 0xFFF1F5F9,
+            background_color: 0x00000000,
+            border_color: 0x00000000,
             font_size_sp: 15.0,
             font_weight_bold: false,
             margin_vertical: 6.0,
             padding: 0.0,
             corner_radius: 8.0,
+            explicit_height: None,
             display_none: false,
+            is_flex_row: false,
         }
     }
 }
@@ -32,14 +38,16 @@ impl Default for ComputedStyle {
 #[derive(Debug, Clone)]
 pub struct CssRule {
     pub selector: String,
+    pub specificity: (u16, u16, u16), // (id_count, class_count, tag_count)
+    pub source_order: usize,
     pub declarations: Vec<(String, String)>,
 }
 
-/// Lightweight streaming CSS parser and cascade matcher supporting CSS variables (`--var`),
-/// compound selectors (`tag.class`, `tag#id`), `rgb()`/`rgba()`, hex, and named colors.
+/// High-speed streaming CSS parser and W3C Specificity Cascade Matcher.
 pub struct MicroCssEngine {
     rules: Vec<CssRule>,
     variables: HashMap<String, String>,
+    next_order: usize,
 }
 
 impl Default for MicroCssEngine {
@@ -53,6 +61,7 @@ impl MicroCssEngine {
         Self {
             rules: Vec::new(),
             variables: HashMap::new(),
+            next_order: 0,
         }
     }
 
@@ -88,14 +97,22 @@ impl MicroCssEngine {
                 for sel in selector_group.split(',') {
                     let trimmed = sel.trim().to_string();
                     if !trimmed.is_empty() {
+                        let spec = compute_specificity(&trimmed);
+                        let order = self.next_order;
+                        self.next_order += 1;
                         self.rules.push(CssRule {
                             selector: trimmed,
+                            specificity: spec,
+                            source_order: order,
                             declarations: declarations.clone(),
                         });
                     }
                 }
             }
         }
+        // Keep rules sorted by W3C specificity `(id, class, tag)` then `source_order`
+        self.rules
+            .sort_by_key(|r| (r.specificity, r.source_order));
     }
 
     pub fn compute_style(&self, node: &DomNode) -> ComputedStyle {
@@ -112,7 +129,7 @@ impl MicroCssEngine {
             return style;
         };
 
-        // 1. User-Agent semantic defaults
+        // 1. User-Agent semantic defaults (including interactive form controls)
         match tag.as_str() {
             "head" | "script" | "style" | "meta" | "link" | "title" | "noscript" | "template" => {
                 style.display_none = true;
@@ -133,7 +150,7 @@ impl MicroCssEngine {
                 style.font_weight_bold = true;
                 style.margin_vertical = 10.0;
             }
-            "h4" | "strong" | "b" => {
+            "h4" | "strong" | "b" | "label" => {
                 style.font_weight_bold = true;
             }
             "a" => {
@@ -150,6 +167,14 @@ impl MicroCssEngine {
                 style.text_color = 0xFF94A3B8;
                 style.padding = 10.0;
             }
+            "input" | "textarea" | "select" => {
+                style.background_color = 0xFF161922;
+                style.border_color = 0xFF334155;
+                style.text_color = 0xFFF8FAFC;
+                style.padding = 10.0;
+                style.corner_radius = 12.0;
+                style.margin_vertical = 8.0;
+            }
             "button" => {
                 style.background_color = 0xFF1E3252;
                 style.text_color = 0xFFD3E3FD;
@@ -160,14 +185,14 @@ impl MicroCssEngine {
             _ => {}
         }
 
-        // 2. Match stylesheet rules in cascade order
+        // 2. Match stylesheet rules sorted by W3C specificity
         for rule in &self.rules {
             if selector_matches(&rule.selector, tag, id_attr.as_deref(), classes) {
                 self.apply_declarations(&mut style, &rule.declarations);
             }
         }
 
-        // 3. Apply inline `style="..."` attribute
+        // 3. Apply inline `style="..."` attribute (highest cascade priority)
         if let Some(inline) = inline_style {
             let mut inline_decls = Vec::new();
             for pair in inline.split(';') {
@@ -192,8 +217,17 @@ impl MicroCssEngine {
         for (prop, raw_val) in decls {
             let val = self.resolve_var(raw_val);
             match prop.as_str() {
-                "display" if val.eq_ignore_ascii_case("none") => {
-                    style.display_none = true;
+                "display" => {
+                    if val.eq_ignore_ascii_case("none") {
+                        style.display_none = true;
+                    } else if val.eq_ignore_ascii_case("flex")
+                        || val.eq_ignore_ascii_case("inline-flex")
+                    {
+                        style.display_none = false;
+                        style.is_flex_row = true;
+                    } else {
+                        style.display_none = false;
+                    }
                 }
                 "color" => {
                     if let Some(c) = parse_css_color(&val) {
@@ -205,14 +239,23 @@ impl MicroCssEngine {
                         style.background_color = c;
                     }
                 }
+                "border-color" => {
+                    if let Some(c) = parse_css_color(&val) {
+                        style.border_color = c;
+                    }
+                }
                 "font-size" => {
                     if let Some(px) = parse_numeric_px(&val) {
-                        style.font_size_sp = px.clamp(10.0, 48.0);
+                        style.font_size_sp = px.clamp(10.0, 64.0);
                     }
                 }
                 "font-weight" => {
-                    if val.contains("bold") || val == "600" || val == "700" || val == "800" || val == "900" {
+                    if val.contains("bold")
+                        || matches!(val.as_str(), "600" | "700" | "800" | "900")
+                    {
                         style.font_weight_bold = true;
+                    } else if val == "normal" || val == "400" {
+                        style.font_weight_bold = false;
                     }
                 }
                 "padding" => {
@@ -220,9 +263,19 @@ impl MicroCssEngine {
                         style.padding = px.clamp(0.0, 64.0);
                     }
                 }
+                "margin" | "margin-top" | "margin-bottom" => {
+                    if let Some(px) = parse_numeric_px(&val) {
+                        style.margin_vertical = px.clamp(0.0, 64.0);
+                    }
+                }
+                "height" => {
+                    if let Some(px) = parse_numeric_px(&val) {
+                        style.explicit_height = Some(px.clamp(16.0, 800.0));
+                    }
+                }
                 "border-radius" => {
                     if let Some(px) = parse_numeric_px(&val) {
-                        style.corner_radius = px.clamp(0.0, 48.0);
+                        style.corner_radius = px.clamp(0.0, 64.0);
                     }
                 }
                 _ => {}
@@ -244,6 +297,35 @@ impl MicroCssEngine {
         self.rules.clear();
         self.rules.shrink_to_fit();
         self.variables.clear();
+        self.next_order = 0;
+    }
+}
+
+fn compute_specificity(selector: &str) -> (u16, u16, u16) {
+    let mut ids = 0u16;
+    let mut classes = 0u16;
+    let mut tags = 0u16;
+    for part in selector.split_whitespace() {
+        let p = part.trim_Matches_combinator();
+        if p.is_empty() {
+            continue;
+        }
+        ids += p.matches('#').count() as u16;
+        classes += p.matches('.').count() as u16;
+        if !p.starts_with('#') && !p.starts_with('.') && !p.starts_with('*') {
+            tags += 1;
+        }
+    }
+    (ids, classes, tags)
+}
+
+trait TrimCombinator {
+    fn trim_Matches_combinator(&self) -> &str;
+}
+
+impl TrimCombinator for str {
+    fn trim_Matches_combinator(&self) -> &str {
+        self.trim_matches(|c| c == '>' || c == '+' || c == '~')
     }
 }
 
@@ -254,6 +336,9 @@ fn selector_matches(
     classes: &[String],
 ) -> bool {
     let target_sel = selector.split_whitespace().last().unwrap_or(selector);
+    if target_sel == "*" {
+        return true;
+    }
     if let Some(id) = target_sel.strip_prefix('#') {
         return id_attr == Some(id);
     }
@@ -283,7 +368,7 @@ pub fn parse_css_color(raw: &str) -> Option<u32> {
             let r = u32::from_str_radix(&hex[0..1], 16).ok()?;
             let g = u32::from_str_radix(&hex[1..2], 16).ok()?;
             let b = u32::from_str_radix(&hex[2..3], 16).ok()?;
-            return Some(0xFF00_0000 | (r * 17) << 16 | (g * 17) << 8 | (b * 17));
+            return Some(0xFF00_0000 | ((r * 17) << 16) | ((g * 17) << 8) | (b * 17));
         }
     }
     if let Some(rgb_inner) = v
@@ -316,9 +401,36 @@ pub fn parse_css_color(raw: &str) -> Option<u32> {
 
 fn parse_numeric_px(raw: &str) -> Option<f32> {
     let trimmed = raw.trim();
-    if let Some(rem) = trimmed.strip_suffix("rem").or_else(|| trimmed.strip_suffix("em")) {
+    if let Some(rem) = trimmed
+        .strip_suffix("rem")
+        .or_else(|| trimmed.strip_suffix("em"))
+    {
         return rem.trim().parse::<f32>().ok().map(|v| v * 16.0);
     }
     let clean = trimmed.trim_end_matches("px").trim();
     clean.parse::<f32>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dom_arena::ZeroCopyDomArena;
+    use crate::html_tokenizer::StreamingHtmlTokenizer;
+
+    #[test]
+    fn test_css_specificity_id_beats_later_tag_rule() {
+        let mut dom = ZeroCopyDomArena::new(32 * 1024);
+        let mut tok = StreamingHtmlTokenizer::new();
+        tok.feed_chunk(b"<div id=\"hero\" class=\"card\">Hello</div>", true, |t| {
+            dom.ingest_token(t);
+        });
+
+        let mut css = MicroCssEngine::new();
+        // Even though `div` comes AFTER `#hero`, `#hero` has higher W3C specificity `(1,0,0)` > `(0,0,1)`
+        css.parse_stylesheet("#hero { color: #00FF00; } div { color: #FF0000; }");
+
+        let hero_id = dom.find_by_id("hero").unwrap();
+        let style = css.compute_style(&dom.nodes()[hero_id as usize]);
+        assert_eq!(style.text_color, 0xFF00FF00);
+    }
 }

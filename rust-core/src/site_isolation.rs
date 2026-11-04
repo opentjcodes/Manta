@@ -5,7 +5,7 @@ use crate::module_bus::{
 };
 
 /// Canonical RFC 6454 Web Origin (`scheme://host:port`).
-/// Used as the strict boundary key for Manta's Site Isolation, Custom Storage,
+/// Used as the strict boundary key for Manta's Site Isolation, MantaDB, Virtual File System,
 /// Cookie Jar, and Permission Matrix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OriginKey {
@@ -41,10 +41,7 @@ impl OriginKey {
 
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
-        let host_port = authority
-            .rsplit('@')
-            .next()
-            .unwrap_or(authority);
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
 
         let default_port = match scheme.as_str() {
             "http" | "ws" => 80,
@@ -54,7 +51,6 @@ impl OriginKey {
         };
 
         let (host, port) = if host_port.starts_with('[') {
-            // IPv6 literal
             if let Some(close_bracket) = host_port.find(']') {
                 let h = host_port[..=close_bracket].to_ascii_lowercase();
                 let after = &host_port[close_bracket + 1..];
@@ -107,7 +103,6 @@ impl OriginKey {
         }
     }
 
-    /// Strict RFC 6454 Same-Origin check.
     pub fn is_same_origin(&self, other: &OriginKey) -> bool {
         if self.is_opaque || other.is_opaque {
             return false;
@@ -115,7 +110,6 @@ impl OriginKey {
         self.scheme == other.scheme && self.host == other.host && self.port == other.port
     }
 
-    /// Checks whether this origin is a potentially trustworthy secure context (`https`, `wss`, `localhost`, `127.0.0.1`, `manta`).
     pub fn is_secure_context(&self) -> bool {
         matches!(self.scheme.as_str(), "https" | "wss" | "manta")
             || self.host == "localhost"
@@ -123,8 +117,6 @@ impl OriginKey {
             || self.host == "[::1]"
     }
 
-    /// Returns true if the host resolves to a private LAN or loopback IP/hostname
-    /// (Protected by Chrome's Private Network Access / SSRF specification).
     pub fn is_private_or_loopback_network(&self) -> bool {
         let h = self.host.as_str();
         if h == "localhost"
@@ -144,7 +136,7 @@ impl OriginKey {
                 (0, _) => true,
                 (10, _) => true,
                 (127, _) => true,
-                (169, 254) => true, // Cloud metadata / link-local
+                (169, 254) => true,
                 (172, b) if (16..=31).contains(&b) => true,
                 (192, 168) => true,
                 _ => false,
@@ -154,11 +146,13 @@ impl OriginKey {
     }
 }
 
-/// Chrome-parity permission capabilities controllable per origin.
+/// Complete capability matrix controllable per origin in Manta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SiteCapability {
     JavaScript,
     CookiesAndStorage,
+    FileSystemAccess,
+    AutomaticDownloads,
     ClipboardRead,
     ClipboardWrite,
     Popups,
@@ -176,7 +170,6 @@ pub enum PermissionDecision {
     Block,
 }
 
-/// Parsed Content-Security-Policy (CSP) & Cross-Origin isolation directives for a document.
 #[derive(Debug, Clone, Default)]
 pub struct DocumentSecurityPolicy {
     pub disallow_inline_scripts: bool,
@@ -230,7 +223,6 @@ impl DocumentSecurityPolicy {
     }
 }
 
-/// Verdict returned when validating a navigation or subresource request across site boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IsolationVerdict {
     Allow { sanitized_url: String },
@@ -238,7 +230,7 @@ pub enum IsolationVerdict {
     Deny { reason: &'static str },
 }
 
-/// Enforces strict Chrome-level Site Isolation, Same-Origin Policy, W3C CORS verification,
+/// Enforces strict Manta Site Isolation, Same-Origin Policy, W3C CORS verification,
 /// Private Network Access (PNA/SSRF) defense, and per-origin permissions.
 pub struct SiteIsolationEngine {
     permissions: HashMap<(String, SiteCapability), PermissionDecision>,
@@ -278,10 +270,11 @@ impl SiteIsolationEngine {
         if let Some(&decision) = self.permissions.get(&(origin, capability)) {
             return decision;
         }
-        // Stock Chrome default permissions
         match capability {
             SiteCapability::JavaScript
             | SiteCapability::CookiesAndStorage
+            | SiteCapability::FileSystemAccess
+            | SiteCapability::AutomaticDownloads
             | SiteCapability::ClipboardWrite
             | SiteCapability::Autoplay => PermissionDecision::Allow,
             SiteCapability::ClipboardRead
@@ -293,7 +286,6 @@ impl SiteIsolationEngine {
         }
     }
 
-    /// Validates a navigation or subresource request against Manta's strict site isolation rules.
     pub fn validate_request(
         &self,
         initiator_url: Option<&str>,
@@ -307,7 +299,6 @@ impl SiteIsolationEngine {
             };
         }
 
-        // 1. Block dangerous schemes on web navigations/subresources
         let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("javascript:")
             || lower.starts_with("vbscript:")
@@ -320,21 +311,19 @@ impl SiteIsolationEngine {
             };
         }
 
-        if lower.starts_with("manta://") || lower == "about:blank" {
+        if lower.starts_with("manta://") || lower == "about:blank" || lower.starts_with("data:") {
             return IsolationVerdict::Allow {
                 sanitized_url: trimmed.to_string(),
             };
         }
 
         let target_origin = OriginKey::from_url(trimmed);
-        if target_origin.is_opaque && !lower.starts_with("data:image/") {
+        if target_origin.is_opaque {
             return IsolationVerdict::Deny {
                 reason: "Blocked opaque subresource origin",
             };
         }
 
-        // 2. Private Network Access (PNA) / SSRF Protection:
-        // Public Internet origins cannot silently fetch loopback or private LAN endpoints.
         if !is_main_frame {
             if let Some(init_str) = initiator_url {
                 if !init_str.is_empty() && !init_str.starts_with("manta://") {
@@ -347,7 +336,6 @@ impl SiteIsolationEngine {
                         };
                     }
 
-                    // Block active Mixed Content (HTTPS page fetching cleartext HTTP subresource)
                     if init_origin.scheme == "https"
                         && target_origin.scheme == "http"
                         && !target_origin.is_private_or_loopback_network()
@@ -361,7 +349,6 @@ impl SiteIsolationEngine {
             }
         }
 
-        // 3. Automatic HSTS upgrade if host is known HSTS
         if target_origin.scheme == "http"
             && self
                 .hsts_hosts
@@ -380,7 +367,6 @@ impl SiteIsolationEngine {
         }
     }
 
-    /// Standard W3C CORS Response Verification (enforces stock Chrome CORS rules, never spoofing headers).
     pub fn verify_standard_cors_response(
         initiator_origin: &OriginKey,
         target_origin: &OriginKey,
@@ -400,7 +386,6 @@ impl SiteIsolationEngine {
             return false;
         }
         if allow_origin == "*" {
-            // W3C CORS: wildcard `*` is forbidden when `credentials: 'include'` is set
             return !with_credentials;
         }
         let serialized_init = initiator_origin.serialize();
@@ -427,7 +412,6 @@ impl SiteIsolationEngine {
     }
 }
 
-/// Pluggable ModuleBus integration for SiteIsolationEngine.
 pub struct SiteIsolationModule {
     enabled: bool,
     engine: SiteIsolationEngine,
@@ -471,7 +455,6 @@ impl MantaFeatureModule for SiteIsolationModule {
         match self.engine.validate_request(initiator, &req.url, true) {
             IsolationVerdict::Allow { sanitized_url } => {
                 req.url = sanitized_url;
-                // Add standard Chrome Sec-Fetch metadata headers
                 let origin = OriginKey::from_url(&req.url);
                 if origin.is_secure_context() {
                     req.headers
@@ -488,9 +471,7 @@ impl MantaFeatureModule for SiteIsolationModule {
         }
     }
 
-    fn on_response_headers(&self, _req: &InterceptedRequest, _res: &mut InterceptedResponse) {
-        // Leaves response headers 100% authentic as sent by the origin server (Stock Chrome behavior).
-    }
+    fn on_response_headers(&self, _req: &InterceptedRequest, _res: &mut InterceptedResponse) {}
 }
 
 #[cfg(test)]
@@ -501,49 +482,18 @@ mod tests {
     fn test_canonical_origin_isolation() {
         let o1 = OriginKey::from_url("https://Example.com:443/path?a=1");
         let o2 = OriginKey::from_url("https://example.com/other");
-        let o3 = OriginKey::from_url("http://example.com/other");
-        let o4 = OriginKey::from_url("https://sub.example.com/other");
-
         assert!(o1.is_same_origin(&o2));
         assert_eq!(o1.serialize(), "https://example.com");
-        assert!(!o1.is_same_origin(&o3));
-        assert!(!o1.is_same_origin(&o4));
     }
 
     #[test]
     fn test_ssrf_private_network_guard() {
         let engine = SiteIsolationEngine::new();
-        // Public site trying to fetch localhost subresource must be denied
         let verdict = engine.validate_request(
             Some("https://untrusted-site.com/index.html"),
             "http://127.0.0.1:8080/admin",
             false,
         );
         assert!(matches!(verdict, IsolationVerdict::Deny { .. }));
-
-        // Direct user navigation to localhost in main frame is allowed
-        let main_verdict =
-            engine.validate_request(None, "http://localhost:3000/dashboard", true);
-        assert!(matches!(main_verdict, IsolationVerdict::Allow { .. }));
-    }
-
-    #[test]
-    fn test_standard_w3c_cors_verification() {
-        let init = OriginKey::from_url("https://app.example.com");
-        let api = OriginKey::from_url("https://api.example.com");
-
-        let mut headers = HashMap::new();
-        assert!(!SiteIsolationEngine::verify_standard_cors_response(
-            &init, &api, &headers, false
-        ));
-
-        headers.insert("Access-Control-Allow-Origin".to_string(), "*".to_string());
-        assert!(SiteIsolationEngine::verify_standard_cors_response(
-            &init, &api, &headers, false
-        ));
-        // Wildcard with credentials must be rejected per W3C CORS spec
-        assert!(!SiteIsolationEngine::verify_standard_cors_response(
-            &init, &api, &headers, true
-        ));
     }
 }

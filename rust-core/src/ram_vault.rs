@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 /// Fast, 100% safe Rust in-memory buffer for transient tab snapshots.
-/// Uses O(1) memory reclamation without slow volatile byte-by-byte wipe loops.
 pub struct EphemeralBuffer {
     data: Vec<u8>,
 }
@@ -37,7 +36,7 @@ impl EphemeralBuffer {
 /// High-speed in-memory RAM pool for compressed background tab states and transient buffers.
 /// Strictly capped at `max_bytes` with automatic FIFO/LRU eviction.
 pub struct VolatileRamVault {
-    entries: HashMap<u64, (u32, EphemeralBuffer)>, // key_hash -> (tab_id, buffer)
+    entries: HashMap<u64, (u32, EphemeralBuffer)>,
     insertion_order: Vec<u64>,
     max_bytes: usize,
     current_bytes: usize,
@@ -63,7 +62,6 @@ impl VolatileRamVault {
         self.max_bytes
     }
 
-    /// Fast FNV-1a 64-bit hash key.
     pub fn hash_key(tab_id: u32, key: &str) -> u64 {
         let mut hash: u64 = 0xcbf29ce484222325 ^ (tab_id as u64);
         for b in key.as_bytes() {

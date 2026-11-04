@@ -1,84 +1,84 @@
-name: Build Manta Rust Core & Android APK
+name: Build, Test & Release Manta Rust Core Engine
 
 on:
   push:
     branches: [ "main", "master" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build-manta:
+  build-manta-core:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Manta Repository
-        uses: actions/checkout@v5
+      - name: Checkout Manta Core Repository
+        uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Install Rust Stable & Android Targets
+      - name: Install Rust Stable & Cross-Compilation Targets
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          targets: x86_64-unknown-linux-gnu,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
 
-      - name: Run Manta Rust Core Unit Tests
+      - name: Run Full Manta Core Unit & Integration Test Suite
         run: cargo test --manifest-path Cargo.toml --verbose
 
-      - name: Locate or Install Android NDK
+      - name: Build Host Linux x86_64 Release Engine (.so & .a)
+        run: cargo build --release --manifest-path Cargo.toml --target x86_64-unknown-linux-gnu
+
+      - name: Locate or Install Android NDK for Mobile Targets
         run: |
           if [ -d "$ANDROID_HOME/ndk" ]; then
             NDK_VER=$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -n 1)
           fi
           if [ -z "$NDK_VER" ]; then
-            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" "platforms;android-34" "build-tools;34.0.0"
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018"
             NDK_VER="27.2.12479018"
           fi
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VER" >> $GITHUB_ENV
-          echo "Using ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VER"
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
 
-      - name: Compile Rust Core (libmanta_core.so) for Android ABIs
+      - name: Build Android Multi-ABI Release Libraries
         run: |
           cargo ndk \
             -t arm64-v8a \
             -t armeabi-v7a \
             -t x86_64 \
-            -o app/src/main/jniLibs \
+            -o dist/android-jniLibs \
             build --release --manifest-path Cargo.toml
 
-      - name: Inspect Compiled Rust Engine Binary Size
-        run: ls -lh app/src/main/jniLibs/arm64-v8a/libmanta_core.so
-
-      - name: Sync Root logo.png into Android Drawable Resources
+      - name: Package Manta Core SDK Bundle (Libraries + C Header)
         run: |
-          mkdir -p app/src/main/res/drawable-nodpi
-          cp logo.png app/src/main/res/drawable-nodpi/logo.png
+          mkdir -p dist/linux-x86_64 dist/include
+          cp target/x86_64-unknown-linux-gnu/release/libmanta_core.so dist/linux-x86_64/
+          cp target/x86_64-unknown-linux-gnu/release/libmanta_core.a dist/linux-x86_64/
+          cp include/manta_core.h dist/include/
+          ls -lh dist/linux-x86_64/ dist/android-jniLibs/arm64-v8a/
+          tar -czvf Manta-Core-Engine-SDK.tar.gz -C dist .
 
-      - name: Set up Gradle 8.10.2
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.10.2'
-
-      - name: Build R8-Minified Release & Debug APKs
-        run: gradle assembleRelease assembleDebug --no-daemon
-
-      - name: Upload Manta Release APK Artifact
+      - name: Upload Manta Core Engine SDK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Manta-Release-APK
-          path: app/build/outputs/apk/release/*.apk
+          name: Manta-Core-Engine-SDK
+          path: |
+            Manta-Core-Engine-SDK.tar.gz
+            dist/**
 
-      - name: Upload Manta Debug APK Artifact
-        uses: actions/upload-artifact@v4
+      - name: Publish GitHub Release (on Tag or Manual Dispatch)
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
         with:
-          name: Manta-Debug-APK
-          path: app/build/outputs/apk/debug/*.apk
+          tag_name: ${{ github.ref_name == 'main' && format('v2.0.{0}', github.run_number) || github.ref_name }}
+          name: "Manta Core Engine ${{ github.ref_name == 'main' && format('v2.0.{0}', github.run_number) || github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            Manta-Core-Engine-SDK.tar.gz
+            include/manta_core.h

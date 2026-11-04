@@ -1,18 +1,17 @@
 use crate::site_isolation::OriginKey;
 use crate::storage_engine::MantaStorageEngine;
 
-/// Rust Page Runtime Compiler & Pre-Scanner (`page_compiler.rs`):
-/// 1. Stock Chrome Stealth & Web API Compatibility (preserves native prototype descriptors,
-///    zero ad-blocking CSS/JS tampering, zero unsafe CORS overrides).
-/// 2. Origin-Isolated Custom Storage Synchronization: Hydrates `window.localStorage` and
-///    `window.sessionStorage` from Manta's custom Rust storage engine (`MantaStorageEngine`)
-///    strictly for the current page's canonical `OriginKey` (`scheme://host:port`).
-/// 3. Pre-scans HTML streams for `<link rel="preconnect">` and `<link rel="dns-prefetch">` hints.
+/// **Manta Page Runtime Compiler & Pre-Scanner (`page_compiler.rs`)**:
+/// 1. Native Manta Web API Runtime: Preserves clean W3C prototype descriptors,
+///    synchronizes origin-partitioned `localStorage`, `sessionStorage`, `MantaDB`,
+///    and `MantaFS` (Virtual File System) with `MantaStorageEngine`.
+/// 2. Pre-scans HTML streams for `<link rel="preconnect">` and `<link rel="dns-prefetch">`
+///    hints so `MantaWorkerPool` pre-warms DNS in parallel.
 pub struct PageRuntimeCompiler;
 
 impl PageRuntimeCompiler {
     /// Returns true if the URL belongs to a cryptographic challenge endpoint
-    /// (Cloudflare Turnstile, hCaptcha, Google reCAPTCHA).
+    /// (Cloudflare Turnstile, hCaptcha, reCAPTCHA).
     pub fn is_verification_challenge_url(url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
         lower.contains("challenges.cloudflare.com")
@@ -25,8 +24,8 @@ impl PageRuntimeCompiler {
             || lower.contains("gstatic.com/recaptcha")
     }
 
-    /// Generates the standards-compliant Chrome runtime script for a specific origin,
-    /// syncing `localStorage` and `sessionStorage` writes directly into Manta's clearable Rust storage.
+    /// Generates the standards-compliant Manta Web Runtime script for a specific origin,
+    /// syncing `localStorage`, `sessionStorage`, and `MantaFS` directly into Manta's clearable Rust storage.
     pub fn compile_runtime_script_for_origin(
         origin_url: &str,
         storage: &MantaStorageEngine,
@@ -41,10 +40,9 @@ impl PageRuntimeCompiler {
 
         format!(
             r#"(function() {{
-    if (window.__mantaChromeRuntimeV3) return;
-    window.__mantaChromeRuntimeV3 = true;
+    if (window.__mantaRuntimeV2) return;
+    window.__mantaRuntimeV2 = true;
 
-    // 1. Standard Chrome Automation Flag Alignment
     try {{
         if (navigator.webdriver === true) {{
             const navProto = Object.getPrototypeOf(navigator);
@@ -60,7 +58,6 @@ impl PageRuntimeCompiler {
         }}
     }} catch (_) {{}}
 
-    // 2. Hydrate & Hook Origin-Isolated Custom Rust Storage (MantaStorageEngine)
     if (window.MantaBridge && typeof window.MantaBridge.storageSet === 'function') {{
         try {{
             const initialLocal = {local_json};
@@ -112,8 +109,6 @@ impl PageRuntimeCompiler {
         )
     }
 
-    /// Extracts `<link rel="preconnect" href="...">` and `<link rel="dns-prefetch" href="...">`
-    /// URLs from an HTML chunk so `MantaWorkerPool` can pre-warm DNS in parallel.
     pub fn extract_preconnect_hosts(html_chunk: &str) -> Vec<String> {
         let mut hosts = Vec::new();
         let lower = html_chunk.to_ascii_lowercase();

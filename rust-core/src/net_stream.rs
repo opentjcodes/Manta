@@ -146,7 +146,7 @@ impl StreamingNetworkPipe {
             let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
             let mut raw_request = format!(
-                "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept-Encoding: identity\r\n",
+                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Manta/2.0\r\nConnection: close\r\nAccept-Encoding: identity\r\n",
                 req.method, parsed.path_and_query, parsed.host
             );
             for (k, v) in &req.headers {
@@ -208,13 +208,10 @@ impl StreamingNetworkPipe {
                             }
                         }
 
-                        is_chunked = response_meta
-                            .headers
-                            .iter()
-                            .any(|(k, v)| {
-                                k.eq_ignore_ascii_case("Transfer-Encoding")
-                                    && v.to_ascii_lowercase().contains("chunked")
-                            });
+                        is_chunked = response_meta.headers.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case("Transfer-Encoding")
+                                && v.to_ascii_lowercase().contains("chunked")
+                        });
 
                         if !body_remainder.is_empty() {
                             if is_chunked {
@@ -353,11 +350,10 @@ mod tests {
     fn test_chunked_transfer_encoding_decoder() {
         let mut decoder = ChunkedTransferDecoder::new();
         let mut out = Vec::new();
-        let raw_chunked = b"5\r\nManta\r\n7\r\n Chrome\r\n0\r\n\r\n";
-        // Feed in small slices to verify cross-boundary state continuity
+        let raw_chunked = b"5\r\nManta\r\n7\r\n Engine\r\n0\r\n\r\n";
         for slice in raw_chunked.chunks(3) {
             decoder.decode_bytes(slice, &mut out);
         }
-        assert_eq!(&out, b"Manta Chrome");
+        assert_eq!(&out, b"Manta Engine");
     }
 }

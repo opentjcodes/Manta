@@ -1,7 +1,9 @@
 use crate::css_engine::{ComputedStyle, MicroCssEngine};
 use crate::dom_arena::{NodeId, NodeKind, ZeroCopyDomArena, NO_NODE};
+use crate::input_forms::FormControlKind;
 
-/// Hardware-friendly draw command emitted by Manta's layout pass.
+/// Hardware-friendly draw command emitted by Manta's layout pass, including interactive
+/// `<input>`, `<textarea>`, `<select>`, and `<button>` hit-target metadata (`INPUT_BOX`).
 #[derive(Debug, Clone)]
 pub enum PaintCommand {
     FillRect {
@@ -21,9 +23,19 @@ pub enum PaintCommand {
         bold: bool,
         link_href: Option<String>,
     },
+    DrawInputBox {
+        node_id: NodeId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        display_text: String,
+        is_focused: bool,
+        is_checked: bool,
+    },
 }
 
-/// Complete frame output for a tab, ready for instant JNI binary transfer to Kotlin UI.
+/// Complete frame output for a tab, ready for instant C-ABI / JNI transfer to any platform UI.
 #[derive(Debug, Clone)]
 pub struct DisplayListFrame {
     pub page_title: String,
@@ -35,7 +47,6 @@ pub struct DisplayListFrame {
 }
 
 impl DisplayListFrame {
-    /// Builds a DisplayListFrame in a single depth-first pass over the flat DOM arena.
     pub fn build(
         dom: &ZeroCopyDomArena,
         css: &MicroCssEngine,
@@ -70,7 +81,7 @@ impl DisplayListFrame {
         }
     }
 
-    /// Serializes the frame into a compact wire format for instant JNI transfer.
+    /// Serializes the frame into Manta's compact wire format (`MANTA_FRAME`).
     pub fn to_compact_wire_string(&self) -> String {
         let mut out = String::with_capacity(256 + self.commands.len() * 48);
         out.push_str(&format!(
@@ -115,6 +126,28 @@ impl DisplayListFrame {
                         color_argb,
                         link_href.as_deref().unwrap_or(""),
                         text.replace('\n', " ").replace('|', " ")
+                    ));
+                }
+                PaintCommand::DrawInputBox {
+                    node_id,
+                    x,
+                    y,
+                    width,
+                    height,
+                    display_text,
+                    is_focused,
+                    is_checked,
+                } => {
+                    out.push_str(&format!(
+                        "INPUT|{}|{:.1}|{:.1}|{:.1}|{:.1}|{}|{}|{}\n",
+                        node_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                        u8::from(*is_focused),
+                        u8::from(*is_checked),
+                        display_text.replace('\n', " ").replace('|', " ")
                     ));
                 }
             }
@@ -174,6 +207,54 @@ fn layout_node_recursive(
             });
             *cursor_y += 10.0;
             return;
+        }
+
+        // Render interactive `<input>`, `<textarea>`, and `<select>` controls
+        if let Some(ctrl) = dom.control_for_node(node_id) {
+            if ctrl.kind != FormControlKind::Hidden {
+                *cursor_y += style.margin_vertical;
+                let box_h = style.explicit_height.unwrap_or(42.0);
+                let is_focused = dom.forms.focused_node() == Some(node_id);
+                let display_text = match &ctrl.kind {
+                    FormControlKind::TextInput { input_type } if input_type == "password" => {
+                        "•".repeat(ctrl.value.chars().count())
+                    }
+                    FormControlKind::Checkbox => {
+                        format!(
+                            "[{}] {}",
+                            if ctrl.checked { "✓" } else { " " },
+                            ctrl.name
+                        )
+                    }
+                    FormControlKind::Radio => {
+                        format!(
+                            "({}) {}",
+                            if ctrl.checked { "•" } else { " " },
+                            ctrl.name
+                        )
+                    }
+                    _ => {
+                        if ctrl.value.is_empty() {
+                            ctrl.placeholder.clone()
+                        } else {
+                            ctrl.value.clone()
+                        }
+                    }
+                };
+
+                commands.push(PaintCommand::DrawInputBox {
+                    node_id,
+                    x,
+                    y: *cursor_y,
+                    width: avail_width,
+                    height: box_h,
+                    display_text,
+                    is_focused,
+                    is_checked: ctrl.checked,
+                });
+                *cursor_y += box_h + 6.0;
+                return;
+            }
         }
 
         *cursor_y += style.margin_vertical;

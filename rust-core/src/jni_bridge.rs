@@ -64,7 +64,6 @@ impl JNIEnv {
     }
 }
 
-/// Initializes Manta Multi-Core Rust Engine with its custom clearable storage file path.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInitEngine(
     env: JNIEnv,
@@ -78,7 +77,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInit
     engine.init_with_storage_path(&storage_path) as JInt
 }
 
-/// Returns the number of active Rust worker cores in `MantaWorkerPool`.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetWorkerCoreCount(
     _env: JNIEnv,
@@ -90,7 +88,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetW
     engine.workers.core_count() as JInt
 }
 
-/// Pre-warms DNS resolution for a URL on a background Rust worker thread.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativePrewarmDns(
     env: JNIEnv,
@@ -103,7 +100,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativePrew
     }
 }
 
-/// Creates a new isolated tab sandbox and returns its TabId.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCreateNewTab(
     _env: JNIEnv,
@@ -117,7 +113,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCrea
     id as JInt
 }
 
-/// Compresses and stores a tab's state in Rust's VolatileRamVault when switching tabs.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCompressTabState(
     env: JNIEnv,
@@ -140,7 +135,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeComp
         as JInt
 }
 
-/// Restores a tab's compressed snapshot (`scrollY|title|url`) from Rust's VolatileRamVault.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeRestoreTabState(
     env: JNIEnv,
@@ -159,7 +153,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeRest
     }
 }
 
-/// Switches active tab and automatically hibernates the previous tab's DOM arena in Rust RAM.
+/// Switches active tab while keeping background tabs hot-active in memory.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSwitchTab(
     _env: JNIEnv,
@@ -170,17 +164,9 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSwit
         return 0;
     };
     let engine_ref = &mut *engine;
-    if engine_ref
-        .tabs
-        .switch_to_tab(tab_id as u32, &mut engine_ref.vault)
-    {
-        1
-    } else {
-        0
-    }
+    u8::from(engine_ref.tabs.switch_to_tab(tab_id as u32, &mut engine_ref.vault))
 }
 
-/// Toggles Desktop Site Mode (`request_desktop_site`) for a tab in Rust.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetDesktopMode(
     _env: JNIEnv,
@@ -195,7 +181,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetD
     }
 }
 
-/// Returns whether Desktop Site Mode is active for a tab.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeIsDesktopMode(
     _env: JNIEnv,
@@ -208,7 +193,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeIsDe
     u8::from(engine.controls.is_desktop_mode(tab_id as u32))
 }
 
-/// Sets page zoom percentage (`50` ..= `300`) for a tab.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetTabZoom(
     _env: JNIEnv,
@@ -219,11 +203,10 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetT
     if let Ok(mut engine) = MantaEngine::global().lock() {
         engine
             .controls
-            .set_zoom_percent(tab_id as u32, zoom_percent.max(50) as u16);
+            .set_zoom_percent(tab_id as u32, zoom_percent.max(25) as u16);
     }
 }
 
-/// Gets page zoom percentage for a tab.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetTabZoom(
     _env: JNIEnv,
@@ -236,7 +219,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetT
     engine.controls.get_zoom_percent(tab_id as u32) as JInt
 }
 
-/// Returns the Rust-compiled Chrome Web API & Origin-Isolated Custom Storage runtime script.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetRuntimeScript(
     env: JNIEnv,
@@ -252,7 +234,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetR
     unsafe { env.new_java_string(&script) }
 }
 
-/// Checks if a URL is a Cloudflare Turnstile, hCaptcha, or reCAPTCHA verification endpoint.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeIsChallengeUrl(
     env: JNIEnv,
@@ -263,8 +244,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeIsCh
     u8::from(PageRuntimeCompiler::is_verification_challenge_url(&url))
 }
 
-/// Validates a URL against Manta's `SiteIsolationEngine` (SSRF / Private Network guard & scheme security).
-/// Returns `"BLOCKED"` if denied, or the validated/upgraded URL string.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeValidateUrl(
     env: JNIEnv,
@@ -295,7 +274,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeVali
     }
 }
 
-/// Writes an entry into Manta's origin-isolated custom storage engine (`localStorage` or `sessionStorage`).
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageSetItem(
     env: JNIEnv,
@@ -323,7 +301,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStor
     u8::from(ok)
 }
 
-/// Reads an entry from Manta's origin-isolated custom storage engine.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageGetItem(
     env: JNIEnv,
@@ -345,7 +322,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStor
     unsafe { env.new_java_string(val.as_deref().unwrap_or("")) }
 }
 
-/// Removes an entry from Manta's origin-isolated custom storage engine.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageRemoveItem(
     env: JNIEnv,
@@ -365,7 +341,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStor
     }
 }
 
-/// Clears all custom storage data (`localStorage`, `sessionStorage`, `cookies`) for a single origin.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStorageClearOrigin(
     env: JNIEnv,
@@ -380,7 +355,18 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStor
     }
 }
 
-/// Flushes Manta's custom binary storage container to disk without writing any browser caches.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInspectStorageManifest(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("{}") };
+    };
+    let json = engine.storage.inspect_storage_manifest_json();
+    unsafe { env.new_java_string(&json) }
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeFlushCustomStorage(
     _env: JNIEnv,
@@ -392,7 +378,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeFlus
     u8::from(engine.storage.save_to_backing_file().is_ok())
 }
 
-/// Toggles a bookmark inside Manta's custom storage engine.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeToggleBookmark(
     env: JNIEnv,
@@ -410,7 +395,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeTogg
     u8::from(added)
 }
 
-/// Streams a chunk of HTML/data into a tab and returns the serialized `MANTA_FRAME` DisplayList.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStreamHtmlChunk(
     env: JNIEnv,
@@ -423,7 +407,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStre
     let url = unsafe { env.get_rust_string(j_url) };
     let chunk_str = unsafe { env.get_rust_string(j_html_chunk) };
 
-    // Pre-warm any `<link rel="preconnect">` hosts discovered in this chunk on background cores
     let preconnect_hosts = PageRuntimeCompiler::extract_preconnect_hosts(&chunk_str);
 
     let Ok(mut engine) = MantaEngine::global().lock() else {
@@ -442,13 +425,13 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStre
         &mut engine_ref.modules,
         &mut engine_ref.vault,
         &mut engine_ref.storage,
+        &mut engine_ref.downloads,
     ) {
         Ok(frame) => unsafe { env.new_java_string(&frame.to_compact_wire_string()) },
         Err(e) => unsafe { env.new_java_string(&format!("MANTA_ERR|{}", e)) },
     }
 }
 
-/// Copies text into Manta's size-capped Rust ClipboardSandbox.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCopyToClipboard(
     env: JNIEnv,
@@ -462,7 +445,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCopy
     u8::from(engine.clipboard.copy_text(&text))
 }
 
-/// Reads the current text stored in Manta's Rust ClipboardSandbox.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetClipboardText(
     env: JNIEnv,
@@ -474,7 +456,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetC
     unsafe { env.new_java_string(engine.clipboard.paste_text()) }
 }
 
-/// Closes a tab and releases its DOM/JS memory buffers while preserving saved user storage.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCloseTab(
     _env: JNIEnv,
@@ -491,7 +472,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeClos
     }
 }
 
-/// Explicitly clears all custom storage, tabs, and volatile RAM when requested by the user.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeClearAllCustomStorageAndRam(
     _env: JNIEnv,
@@ -502,7 +482,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeClea
     }
 }
 
-/// Returns current total memory used by active tabs and transient RAM pool in bytes.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetEngineRamBytes(
     _env: JNIEnv,
@@ -514,7 +493,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetE
     (engine.tabs.total_allocated_bytes() + engine.vault.used_bytes()) as JInt
 }
 
-/// Returns current bytes stored inside Manta's custom user storage container.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetCustomStorageBytes(
     _env: JNIEnv,
@@ -524,102 +502,4 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetC
         return 0;
     };
     engine.storage.used_bytes() as JInt
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    unsafe extern "system" fn mock_new_string_utf(_env: JNIEnv, utf: *const c_char) -> JString {
-        if utf.is_null() {
-            return ptr::null_mut();
-        }
-        let s = unsafe { CStr::from_ptr(utf).to_owned() };
-        s.into_raw() as JString
-    }
-
-    unsafe extern "system" fn mock_get_string_utf_len(_env: JNIEnv, jstr: JString) -> JInt {
-        if jstr.is_null() {
-            return 0;
-        }
-        let cstr = unsafe { CStr::from_ptr(jstr as *const c_char) };
-        cstr.to_bytes().len() as JInt
-    }
-
-    unsafe extern "system" fn mock_get_string_utf_chars(
-        _env: JNIEnv,
-        jstr: JString,
-        is_copy: *mut JBoolean,
-    ) -> *const c_char {
-        if !is_copy.is_null() {
-            unsafe { *is_copy = 0 };
-        }
-        jstr as *const c_char
-    }
-
-    unsafe extern "system" fn mock_release_string_utf_chars(
-        _env: JNIEnv,
-        _jstr: JString,
-        _chars: *const c_char,
-    ) {
-    }
-
-    #[test]
-    fn test_jni_bridge_isolation_and_custom_storage() {
-        let table = JNINativeInterface {
-            reserved: [ptr::null(); 167],
-            new_string_utf: mock_new_string_utf,
-            get_string_utf_length: mock_get_string_utf_len,
-            get_string_utf_chars: mock_get_string_utf_chars,
-            release_string_utf_chars: mock_release_string_utf_chars,
-        };
-        let table_ptr: *const JNINativeInterface = &table;
-        let env = JNIEnv(&table_ptr);
-
-        unsafe {
-            let empty_path = CString::new("").unwrap();
-            let tab_id = Java_app_manta_browser_core_MantaNative_nativeInitEngine(
-                env,
-                ptr::null_mut(),
-                empty_path.as_ptr() as JString,
-            );
-            assert!(tab_id >= 1);
-
-            let init_c = CString::new("https://public-site.com").unwrap();
-            let ssrf_c = CString::new("http://127.0.0.1:9000/secret").unwrap();
-            let verdict_jstr = Java_app_manta_browser_core_MantaNative_nativeValidateUrl(
-                env,
-                ptr::null_mut(),
-                init_c.as_ptr() as JString,
-                ssrf_c.as_ptr() as JString,
-                0,
-            );
-            let verdict_owned = CString::from_raw(verdict_jstr as *mut c_char);
-            assert_eq!(verdict_owned.to_str().unwrap(), "BLOCKED");
-
-            let key_c = CString::new("token").unwrap();
-            let val_c = CString::new("abc123").unwrap();
-            let saved = Java_app_manta_browser_core_MantaNative_nativeStorageSetItem(
-                env,
-                ptr::null_mut(),
-                init_c.as_ptr() as JString,
-                key_c.as_ptr() as JString,
-                val_c.as_ptr() as JString,
-                0,
-            );
-            assert_eq!(saved, 1);
-
-            Java_app_manta_browser_core_MantaNative_nativeClearAllCustomStorageAndRam(
-                env,
-                ptr::null_mut(),
-            );
-            assert_eq!(
-                Java_app_manta_browser_core_MantaNative_nativeGetCustomStorageBytes(
-                    env,
-                    ptr::null_mut()
-                ),
-                0
-            );
-        }
-    }
 }

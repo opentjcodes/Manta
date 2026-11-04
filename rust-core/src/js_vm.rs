@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::clipboard::ClipboardSandbox;
 use crate::dom_arena::ZeroCopyDomArena;
+use crate::downloads_engine::MantaDownloadManager;
 use crate::storage_engine::MantaStorageEngine;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +59,14 @@ impl JsValue {
     }
 }
 
+/// User-defined JavaScript function compiled into bytecode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsUserFunction {
+    pub name: String,
+    pub params: Vec<u16>,
+    pub entry_pc: usize,
+}
+
 /// Compact Stack-VM Bytecode Instruction Set (`OpCode`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpCode {
@@ -81,7 +90,8 @@ pub enum OpCode {
     Or,
     Jump(usize),
     JumpIfFalse(usize),
-    CallHost { host_fn_id: u16, argc: u8 },
+    CallFn { fn_name_id: u16, argc: u8 },
+    Return,
     Pop,
     Halt,
 }
@@ -91,6 +101,7 @@ pub enum OpCode {
 pub struct CompiledJsProgram {
     pub constants: Vec<JsValue>,
     pub identifiers: Vec<String>,
+    pub functions: HashMap<u16, JsUserFunction>,
     pub instructions: Vec<OpCode>,
 }
 
@@ -119,6 +130,7 @@ enum Token {
     Ident(String),
     Number(f64),
     Str(String),
+    KeywordFunction,
     KeywordLet,
     KeywordIf,
     KeywordElse,
@@ -154,7 +166,6 @@ enum Token {
     Eof,
 }
 
-/// Lexical analyzer converting JS source into a flat token stream.
 struct JsLexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
 }
@@ -243,6 +254,7 @@ impl<'a> JsLexer<'a> {
                     }
                 }
                 let tok = match ident.as_str() {
+                    "function" => Token::KeywordFunction,
                     "let" | "const" | "var" => Token::KeywordLet,
                     "if" => Token::KeywordIf,
                     "else" => Token::KeywordElse,
@@ -342,7 +354,8 @@ impl<'a> JsLexer<'a> {
     }
 }
 
-/// Recursive-descent Bytecode Compiler (`JsBytecodeCompiler`).
+/// Recursive-descent Bytecode Compiler (`JsBytecodeCompiler`) supporting user functions,
+/// control flow, DOM manipulation, Form/Input value bindings, MantaDB, and Virtual Files.
 pub struct JsBytecodeCompiler {
     tokens: Vec<Token>,
     pos: usize,
@@ -388,6 +401,52 @@ impl JsBytecodeCompiler {
         self.consume_optional_semicolons();
         match self.peek().clone() {
             Token::Eof | Token::RBrace => Ok(()),
+            Token::KeywordFunction => {
+                self.advance();
+                let Token::Ident(fn_name) = self.advance() else {
+                    return Err("Expected function name");
+                };
+                let fn_id = self.program.add_ident(&fn_name);
+                if self.peek() == &Token::LParen {
+                    self.advance();
+                }
+                let mut params = Vec::new();
+                while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
+                    if let Token::Ident(param_name) = self.advance() {
+                        params.push(self.program.add_ident(&param_name));
+                    }
+                    if self.peek() == &Token::Comma {
+                        self.advance();
+                    }
+                }
+                if self.peek() == &Token::RParen {
+                    self.advance();
+                }
+
+                // Jump over function body during top-level execution
+                let skip_jump_idx = self.program.instructions.len();
+                self.program.instructions.push(OpCode::Jump(0));
+
+                let entry_pc = self.program.instructions.len();
+                self.program.functions.insert(
+                    fn_id,
+                    JsUserFunction {
+                        name: fn_name,
+                        params,
+                        entry_pc,
+                    },
+                );
+
+                self.compile_statement()?;
+                // Ensure implicit `return undefined` at end of function body
+                let undef_c = self.program.add_const(JsValue::Undefined);
+                self.program.instructions.push(OpCode::LoadConst(undef_c));
+                self.program.instructions.push(OpCode::Return);
+
+                let after_fn = self.program.instructions.len();
+                self.program.instructions[skip_jump_idx] = OpCode::Jump(after_fn);
+                Ok(())
+            }
             Token::LBrace => {
                 self.advance();
                 while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
@@ -473,7 +532,7 @@ impl JsBytecodeCompiler {
                     let c = self.program.add_const(JsValue::Undefined);
                     self.program.instructions.push(OpCode::LoadConst(c));
                 }
-                self.program.instructions.push(OpCode::Halt);
+                self.program.instructions.push(OpCode::Return);
                 self.consume_optional_semicolons();
                 Ok(())
             }
@@ -491,7 +550,7 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_assignment(&mut self) -> Result<(), &'static str> {
-        // Handle `document.getElementById("id").textContent = expr` or `document.querySelector("sel").textContent = expr`
+        // Support `document.getElementById("id").textContent = expr` AND `.value = expr`
         if let Token::Ident(ref name) = self.peek().clone() {
             if name == "document.getElementById" || name == "document.querySelector" {
                 let saved_pos = self.pos;
@@ -505,34 +564,38 @@ impl JsBytecodeCompiler {
                     }
                     if let Token::Ident(prop) = self.peek().clone() {
                         let clean_prop = prop.trim_start_matches('.');
-                        if clean_prop == "textContent"
+                        let is_value_prop = clean_prop == "value";
+                        let is_text_prop = clean_prop == "textContent"
                             || clean_prop == "innerText"
-                            || clean_prop == "innerHTML"
-                        {
+                            || clean_prop == "innerHTML";
+
+                        if is_value_prop || is_text_prop {
                             self.advance();
                             if self.peek() == &Token::Assign {
                                 self.advance();
                                 self.compile_expr()?;
-                                let host_name = if fn_name == "document.getElementById" {
-                                    "__dom_set_text_by_id"
-                                } else {
-                                    "__dom_set_text_by_sel"
+                                let host_name = match (fn_name.as_str(), is_value_prop) {
+                                    ("document.getElementById", true) => "__dom_set_value_by_id",
+                                    ("document.getElementById", false) => "__dom_set_text_by_id",
+                                    (_, true) => "__dom_set_value_by_sel",
+                                    (_, false) => "__dom_set_text_by_sel",
                                 };
                                 let fn_id = self.program.add_ident(host_name);
-                                self.program.instructions.push(OpCode::CallHost {
-                                    host_fn_id: fn_id,
+                                self.program.instructions.push(OpCode::CallFn {
+                                    fn_name_id: fn_id,
                                     argc: 2,
                                 });
                                 return Ok(());
                             } else {
-                                let host_name = if fn_name == "document.getElementById" {
-                                    "__dom_get_text_by_id"
-                                } else {
-                                    "__dom_get_text_by_sel"
+                                let host_name = match (fn_name.as_str(), is_value_prop) {
+                                    ("document.getElementById", true) => "__dom_get_value_by_id",
+                                    ("document.getElementById", false) => "__dom_get_text_by_id",
+                                    (_, true) => "__dom_get_value_by_sel",
+                                    (_, false) => "__dom_get_text_by_sel",
                                 };
                                 let fn_id = self.program.add_ident(host_name);
-                                self.program.instructions.push(OpCode::CallHost {
-                                    host_fn_id: fn_id,
+                                self.program.instructions.push(OpCode::CallFn {
+                                    fn_name_id: fn_id,
                                     argc: 1,
                                 });
                                 return Ok(());
@@ -721,8 +784,8 @@ impl JsBytecodeCompiler {
                         self.advance();
                     }
                     let fn_id = self.program.add_ident(&name);
-                    self.program.instructions.push(OpCode::CallHost {
-                        host_fn_id: fn_id,
+                    self.program.instructions.push(OpCode::CallFn {
+                        fn_name_id: fn_id,
                         argc,
                     });
                     Ok(())
@@ -741,11 +804,17 @@ impl JsBytecodeCompiler {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CallFrame {
+    return_pc: usize,
+    locals: HashMap<u16, JsValue>,
+}
+
 /// High-Efficiency Bytecode JS Sandbox (`MantaJsSandbox`).
-/// - Compiles JS into compact stack bytecode (`CompiledJsProgram`).
+/// - Compiles JS into compact stack bytecode (`CompiledJsProgram`) with user functions & call frames.
 /// - Fuel-metered execution (prevents infinite loops and CPU/battery drain).
-/// - Standard Chrome globals (`navigator.webdriver = false`, `navigator.cookieEnabled = true`).
-/// - Origin-isolated bindings to `ZeroCopyDomArena`, `MantaStorageEngine`, and `ClipboardSandbox`.
+/// - Bindings to `ZeroCopyDomArena` (including `<input>.value`), `MantaStorageEngine` (`localStorage`,
+///   `sessionStorage`, `MantaDB`, `MantaFS`), `MantaDownloadManager`, and `ClipboardSandbox`.
 pub struct MantaJsSandbox {
     globals: HashMap<String, JsValue>,
     fuel_remaining: u32,
@@ -760,9 +829,7 @@ impl MantaJsSandbox {
         globals.insert("navigator.cookieEnabled".to_string(), JsValue::Bool(true));
         globals.insert(
             "navigator.userAgent".to_string(),
-            JsValue::Str(
-                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36".to_string(),
-            ),
+            JsValue::Str("Manta/2.0 (Native Rust Core; W3C Standard)".to_string()),
         );
         globals.insert("window.isSecureContext".to_string(), JsValue::Bool(true));
 
@@ -774,7 +841,6 @@ impl MantaJsSandbox {
         }
     }
 
-    /// Compiles and executes a script inside the fuel-limited bytecode VM.
     pub fn execute_script(
         &mut self,
         script: &str,
@@ -782,16 +848,17 @@ impl MantaJsSandbox {
         clipboard: &mut ClipboardSandbox,
     ) -> Result<JsValue, &'static str> {
         let mut dummy_storage = MantaStorageEngine::new(64 * 1024, 256 * 1024);
-        self.execute_script_with_storage(
+        let mut dummy_downloads = MantaDownloadManager::new("", 1024 * 1024);
+        self.execute_script_full(
             script,
             "https://manta.local",
             dom,
             clipboard,
             &mut dummy_storage,
+            &mut dummy_downloads,
         )
     }
 
-    /// Compiles and executes a script with full origin-isolated access to Manta's custom storage engine.
     pub fn execute_script_with_storage(
         &mut self,
         script: &str,
@@ -800,8 +867,28 @@ impl MantaJsSandbox {
         clipboard: &mut ClipboardSandbox,
         storage: &mut MantaStorageEngine,
     ) -> Result<JsValue, &'static str> {
+        let mut dummy_downloads = MantaDownloadManager::new("", 10 * 1024 * 1024);
+        self.execute_script_full(
+            script,
+            origin_url,
+            dom,
+            clipboard,
+            storage,
+            &mut dummy_downloads,
+        )
+    }
+
+    pub fn execute_script_full(
+        &mut self,
+        script: &str,
+        origin_url: &str,
+        dom: &mut ZeroCopyDomArena,
+        clipboard: &mut ClipboardSandbox,
+        storage: &mut MantaStorageEngine,
+        downloads: &mut MantaDownloadManager,
+    ) -> Result<JsValue, &'static str> {
         let program = JsBytecodeCompiler::compile(script)?;
-        self.run_bytecode(&program, origin_url, dom, clipboard, storage)
+        self.run_bytecode(&program, origin_url, dom, clipboard, storage, downloads)
     }
 
     pub fn run_bytecode(
@@ -811,9 +898,11 @@ impl MantaJsSandbox {
         dom: &mut ZeroCopyDomArena,
         clipboard: &mut ClipboardSandbox,
         storage: &mut MantaStorageEngine,
+        downloads: &mut MantaDownloadManager,
     ) -> Result<JsValue, &'static str> {
         self.fuel_remaining = self.max_fuel;
-        let mut stack: Vec<JsValue> = Vec::with_capacity(32);
+        let mut stack: Vec<JsValue> = Vec::with_capacity(64);
+        let mut call_frames: Vec<CallFrame> = Vec::with_capacity(16);
         let mut last_popped = JsValue::Undefined;
         let mut pc = 0usize;
 
@@ -834,6 +923,13 @@ impl MantaJsSandbox {
                     pc += 1;
                 }
                 OpCode::LoadVar(idx) => {
+                    if let Some(frame) = call_frames.last() {
+                        if let Some(local_val) = frame.locals.get(idx) {
+                            stack.push(local_val.clone());
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     let name = program
                         .identifiers
                         .get(*idx as usize)
@@ -852,6 +948,13 @@ impl MantaJsSandbox {
                 }
                 OpCode::StoreVar(idx) => {
                     let val = stack.last().cloned().unwrap_or(JsValue::Undefined);
+                    if let Some(frame) = call_frames.last_mut() {
+                        if frame.locals.contains_key(idx) {
+                            frame.locals.insert(*idx, val);
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     if let Some(name) = program.identifiers.get(*idx as usize) {
                         if name == "document.title" {
                             dom.page_title = val.as_str();
@@ -964,21 +1067,59 @@ impl MantaJsSandbox {
                         pc += 1;
                     }
                 }
-                OpCode::CallHost { host_fn_id, argc } => {
+                OpCode::CallFn { fn_name_id, argc } => {
                     let count = *argc as usize;
                     let mut args = Vec::with_capacity(count);
                     for _ in 0..count {
                         args.push(stack.pop().unwrap_or(JsValue::Undefined));
                     }
                     args.reverse();
+
+                    // 1. Check if this is a user-defined JS function in the current program
+                    if let Some(user_fn) = program.functions.get(fn_name_id) {
+                        if call_frames.len() >= 128 {
+                            return Err("JS call stack overflow");
+                        }
+                        let mut locals = HashMap::with_capacity(user_fn.params.len());
+                        for (i, &param_id) in user_fn.params.iter().enumerate() {
+                            let val = args.get(i).cloned().unwrap_or(JsValue::Undefined);
+                            locals.insert(param_id, val);
+                        }
+                        call_frames.push(CallFrame {
+                            return_pc: pc + 1,
+                            locals,
+                        });
+                        pc = user_fn.entry_pc;
+                        continue;
+                    }
+
+                    // 2. Otherwise invoke built-in Manta Host API
                     let fn_name = program
                         .identifiers
-                        .get(*host_fn_id as usize)
+                        .get(*fn_name_id as usize)
                         .map(|s| s.as_str())
                         .unwrap_or("");
-                    let ret = self.invoke_host_fn(fn_name, &args, origin_url, dom, clipboard, storage);
+                    let ret = self.invoke_host_fn(
+                        fn_name,
+                        &args,
+                        origin_url,
+                        dom,
+                        clipboard,
+                        storage,
+                        downloads,
+                    );
                     stack.push(ret);
                     pc += 1;
+                }
+                OpCode::Return => {
+                    let ret_val = stack.pop().unwrap_or(JsValue::Undefined);
+                    if let Some(frame) = call_frames.pop() {
+                        stack.push(ret_val);
+                        pc = frame.return_pc;
+                    } else {
+                        stack.push(ret_val);
+                        break;
+                    }
                 }
                 OpCode::Pop => {
                     if let Some(v) = stack.pop() {
@@ -995,6 +1136,7 @@ impl MantaJsSandbox {
         Ok(stack.pop().unwrap_or(last_popped))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn invoke_host_fn(
         &mut self,
         fn_name: &str,
@@ -1003,14 +1145,22 @@ impl MantaJsSandbox {
         dom: &mut ZeroCopyDomArena,
         clipboard: &mut ClipboardSandbox,
         storage: &mut MantaStorageEngine,
+        downloads: &mut MantaDownloadManager,
     ) -> JsValue {
         match fn_name {
             "__dom_set_text_by_id" => {
                 if args.len() >= 2 {
-                    let id = args[0].as_str();
-                    let val = args[1].as_str();
-                    if let Some(nid) = dom.find_by_id(&id) {
-                        dom.set_text_content(nid, val);
+                    if let Some(nid) = dom.find_by_id(&args[0].as_str()) {
+                        dom.set_text_content(nid, args[1].as_str());
+                    }
+                    return args[1].clone();
+                }
+                JsValue::Undefined
+            }
+            "__dom_set_value_by_id" => {
+                if args.len() >= 2 {
+                    if let Some(nid) = dom.find_by_id(&args[0].as_str()) {
+                        let _ = dom.forms.set_value(nid, &args[1].as_str());
                     }
                     return args[1].clone();
                 }
@@ -1018,10 +1168,17 @@ impl MantaJsSandbox {
             }
             "__dom_set_text_by_sel" => {
                 if args.len() >= 2 {
-                    let sel = args[0].as_str();
-                    let val = args[1].as_str();
-                    if let Some(nid) = dom.query_selector(&sel) {
-                        dom.set_text_content(nid, val);
+                    if let Some(nid) = dom.query_selector(&args[0].as_str()) {
+                        dom.set_text_content(nid, args[1].as_str());
+                    }
+                    return args[1].clone();
+                }
+                JsValue::Undefined
+            }
+            "__dom_set_value_by_sel" => {
+                if args.len() >= 2 {
+                    if let Some(nid) = dom.query_selector(&args[0].as_str()) {
+                        let _ = dom.forms.set_value(nid, &args[1].as_str());
                     }
                     return args[1].clone();
                 }
@@ -1035,10 +1192,30 @@ impl MantaJsSandbox {
                 }
                 JsValue::Null
             }
+            "__dom_get_value_by_id" => {
+                if let Some(id_arg) = args.first() {
+                    if let Some(nid) = dom.find_by_id(&id_arg.as_str()) {
+                        if let Some(ctrl) = dom.forms.get_control(nid) {
+                            return JsValue::Str(ctrl.value.clone());
+                        }
+                    }
+                }
+                JsValue::Null
+            }
             "__dom_get_text_by_sel" => {
                 if let Some(sel_arg) = args.first() {
                     if let Some(nid) = dom.query_selector(&sel_arg.as_str()) {
                         return JsValue::Str(dom.text_content(nid));
+                    }
+                }
+                JsValue::Null
+            }
+            "__dom_get_value_by_sel" => {
+                if let Some(sel_arg) = args.first() {
+                    if let Some(nid) = dom.query_selector(&sel_arg.as_str()) {
+                        if let Some(ctrl) = dom.forms.get_control(nid) {
+                            return JsValue::Str(ctrl.value.clone());
+                        }
                     }
                 }
                 JsValue::Null
@@ -1079,6 +1256,80 @@ impl MantaJsSandbox {
                 }
                 JsValue::Null
             }
+            "MantaDB.putObject" | "indexedDB.put" => {
+                if args.len() >= 3 {
+                    let ok = storage.db.put_object(
+                        origin_url,
+                        &args[0].as_str(),
+                        &args[1].as_str(),
+                        &args[2].as_str(),
+                    );
+                    return JsValue::Bool(ok);
+                }
+                JsValue::Bool(false)
+            }
+            "MantaDB.getObject" | "indexedDB.get" => {
+                if args.len() >= 2 {
+                    return match storage.db.get_object(
+                        origin_url,
+                        &args[0].as_str(),
+                        &args[1].as_str(),
+                    ) {
+                        Some(v) => JsValue::Str(v),
+                        None => JsValue::Null,
+                    };
+                }
+                JsValue::Null
+            }
+            "MantaFS.writeFile" => {
+                if args.len() >= 2 {
+                    let vpath = args[0].as_str();
+                    let content = args[1].as_str();
+                    let mime = args
+                        .get(2)
+                        .map(|a| a.as_str())
+                        .unwrap_or_else(|| "text/plain".to_string());
+                    let ok =
+                        storage
+                            .db
+                            .save_virtual_file(origin_url, &vpath, &mime, content.as_bytes());
+                    return JsValue::Bool(ok);
+                }
+                JsValue::Bool(false)
+            }
+            "MantaFS.readFile" => {
+                if let Some(p) = args.first() {
+                    if let Some(entry) = storage.db.read_virtual_file(origin_url, &p.as_str()) {
+                        return JsValue::Str(String::from_utf8_lossy(&entry.data).into_owned());
+                    }
+                }
+                JsValue::Null
+            }
+            "MantaFS.deleteFile" => {
+                if let Some(p) = args.first() {
+                    return JsValue::Bool(storage.db.delete_virtual_file(origin_url, &p.as_str()));
+                }
+                JsValue::Bool(false)
+            }
+            "MantaDownloads.save" => {
+                if args.len() >= 2 {
+                    let filename = args[0].as_str();
+                    let content = args[1].as_str();
+                    let mime = args
+                        .get(2)
+                        .map(|a| a.as_str())
+                        .unwrap_or_else(|| "text/plain".to_string());
+                    if let Ok(dl_id) = downloads.save_direct_bytes(
+                        origin_url,
+                        &filename,
+                        &mime,
+                        content.as_bytes(),
+                    ) {
+                        return JsValue::Number(dl_id as f64);
+                    }
+                }
+                JsValue::Number(-1.0)
+            }
             "navigator.clipboard.writeText" => {
                 if let Some(v) = args.first() {
                     clipboard.copy_text(&v.as_str());
@@ -1086,7 +1337,7 @@ impl MantaJsSandbox {
                 JsValue::Undefined
             }
             "console.log" | "console.info" | "console.warn" | "console.error" => {
-                if self.console_logs.len() < 32 {
+                if self.console_logs.len() < 64 {
                     let joined: Vec<String> = args.iter().map(|a| a.as_str()).collect();
                     self.console_logs.push(joined.join(" "));
                 }
@@ -1135,48 +1386,58 @@ mod tests {
     use crate::html_tokenizer::StreamingHtmlTokenizer;
 
     #[test]
-    fn test_bytecode_compiler_dom_and_custom_storage() {
+    fn test_bytecode_vm_user_functions_inputs_mantadb_and_vfs() {
         let mut dom = ZeroCopyDomArena::new(64 * 1024);
         let mut tokenizer = StreamingHtmlTokenizer::new();
-        tokenizer.feed_chunk(b"<div id=\"status\">Idle</div>", true, |tok| {
-            dom.ingest_token(tok);
-        });
+        tokenizer.feed_chunk(
+            b"<div id=\"status\">Idle</div><input id=\"email\" type=\"email\" value=\"\" />",
+            true,
+            |tok| dom.ingest_token(tok),
+        );
 
-        let mut vm = MantaJsSandbox::new(5000);
+        let mut vm = MantaJsSandbox::new(10_000);
         let mut clip = ClipboardSandbox::new(1024);
-        let mut storage = MantaStorageEngine::new(64 * 1024, 256 * 1024);
+        let mut storage = MantaStorageEngine::new(128 * 1024, 512 * 1024);
+        let mut downloads = MantaDownloadManager::new("", 1024 * 1024);
 
         let script = r#"
-            let bot = navigator.webdriver;
-            let count = 0;
-            let i = 1;
-            while (i <= 5) {
-                count += i;
-                i += 1;
+            function multiplyAndAdd(a, b, c) {
+                return a * b + c;
             }
-            if (count == 15) {
-                document.getElementById("status").textContent = "Sum: " + count;
-            }
-            localStorage.setItem("saved_sum", "" + count);
-            navigator.clipboard.writeText("Copied from Bytecode VM");
+            let result = multiplyAndAdd(6, 7, 8);
+            document.getElementById("status").textContent = "Computed: " + result;
+            document.getElementById("email").value = "dev@manta.browser";
+            MantaDB.putObject("users", "u1", "{\"email\":\"dev@manta.browser\"}");
+            MantaFS.writeFile("/config/profile.json", "{\"active\":true}");
+            MantaDownloads.save("export.txt", "Exported result: " + result);
         "#;
-        vm.execute_script_with_storage(
+
+        vm.execute_script_full(
             script,
-            "https://app.example.com/index.html",
+            "https://app.manta.dev/index.html",
             &mut dom,
             &mut clip,
             &mut storage,
+            &mut downloads,
         )
         .unwrap();
 
-        assert_eq!(vm.get_global("bot"), Some(&JsValue::Bool(false)));
-        assert_eq!(vm.get_global("count"), Some(&JsValue::Number(15.0)));
-        let nid = dom.find_by_id("status").unwrap();
-        assert_eq!(dom.text_content(nid), "Sum: 15");
+        assert_eq!(vm.get_global("result"), Some(&JsValue::Number(50.0)));
+        let email_id = dom.find_by_id("email").unwrap();
         assert_eq!(
-            storage.get_local_storage("https://app.example.com", "saved_sum"),
-            Some("15".to_string())
+            dom.forms.get_control(email_id).unwrap().value,
+            "dev@manta.browser"
         );
-        assert_eq!(clip.paste_text(), "Copied from Bytecode VM");
+        assert_eq!(
+            storage
+                .db
+                .get_object("https://app.manta.dev", "users", "u1"),
+            Some("{\"email\":\"dev@manta.browser\"}".to_string())
+        );
+        assert!(storage
+            .db
+            .read_virtual_file("https://app.manta.dev", "/config/profile.json")
+            .is_some());
+        assert!(downloads.get_download(1).is_some());
     }
 }
