@@ -192,7 +192,7 @@ impl MantaDownloadManager {
     pub fn clear_all(&mut self, delete_disk_files: bool) {
         let ids: Vec<u32> = self.items.keys().copied().collect();
         for id in ids {
-            self.delete_download(id, delete_disk_file);
+            self.delete_download(id, delete_disk_files);
         }
     }
 

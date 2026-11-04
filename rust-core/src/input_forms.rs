@@ -358,7 +358,6 @@ impl MantaFormEngine {
             form.action.clone()
         };
 
-        // Check if any file inputs have attached files (auto-upgrade to multipart/form-data on POST)
         let has_files = form.control_nodes.iter().any(|cid| {
             self.controls
                 .get(cid)
@@ -366,7 +365,6 @@ impl MantaFormEngine {
                 .unwrap_or(false)
         });
 
-        // Validate constraints (`required`, `min_length`)
         for &cid in &form.control_nodes {
             let Some(ctrl) = self.controls.get(&cid) else {
                 continue;
@@ -454,7 +452,6 @@ impl MantaFormEngine {
             });
         }
 
-        // Standard URL-encoded serialization (`GET` or `POST`)
         let mut pairs = Vec::new();
         for &cid in &form.control_nodes {
             let Some(ctrl) = self.controls.get(&cid) else {
@@ -545,7 +542,6 @@ fn url_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::dom_arena::ZeroCopyDomArena;
     use crate::html_tokenizer::StreamingHtmlTokenizer;
 
