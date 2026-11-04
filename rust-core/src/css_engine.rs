@@ -306,7 +306,7 @@ fn compute_specificity(selector: &str) -> (u16, u16, u16) {
     let mut classes = 0u16;
     let mut tags = 0u16;
     for part in selector.split_whitespace() {
-        let p = part.trim_Matches_combinator();
+        let p = part.trim_matches_combinator();
         if p.is_empty() {
             continue;
         }
@@ -320,11 +320,11 @@ fn compute_specificity(selector: &str) -> (u16, u16, u16) {
 }
 
 trait TrimCombinator {
-    fn trim_Matches_combinator(&self) -> &str;
+    fn trim_matches_combinator(&self) -> &str;
 }
 
 impl TrimCombinator for str {
-    fn trim_Matches_combinator(&self) -> &str {
+    fn trim_matches_combinator(&self) -> &str {
         self.trim_matches(|c| c == '>' || c == '+' || c == '~')
     }
 }
@@ -426,7 +426,6 @@ mod tests {
         });
 
         let mut css = MicroCssEngine::new();
-        // Even though `div` comes AFTER `#hero`, `#hero` has higher W3C specificity `(1,0,0)` > `(0,0,1)`
         css.parse_stylesheet("#hero { color: #00FF00; } div { color: #FF0000; }");
 
         let hero_id = dom.find_by_id("hero").unwrap();

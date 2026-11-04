@@ -72,12 +72,12 @@ jobs:
             Manta-Core-Engine-SDK.tar.gz
             dist/**
 
-      - name: Publish GitHub Release (on Tag or Manual Dispatch)
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name == 'main' && format('v2.0.{0}', github.run_number) || github.ref_name }}
-          name: "Manta Core Engine ${{ github.ref_name == 'main' && format('v2.0.{0}', github.run_number) || github.ref_name }}"
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v2.0.{0}', github.run_number) }}
+          name: "Manta Core Engine ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v2.0.{0}', github.run_number) }}"
           generate_release_notes: true
           files: |
             Manta-Core-Engine-SDK.tar.gz

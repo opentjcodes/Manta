@@ -258,7 +258,13 @@ pub fn sanitize_download_filename(suggested: &str, fallback_url: &str) -> String
             .unwrap_or("download.bin")
     };
 
-    let cleaned: String = raw
+    // Always extract only the final basename segment after any `/` or `\` to prevent path traversal
+    let basename = raw
+        .rsplit(['/', '\\'])
+        .find(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .unwrap_or("manta_download.bin");
+
+    let cleaned: String = basename
         .chars()
         .filter(|&c| {
             c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ' '
