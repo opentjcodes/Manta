@@ -17,7 +17,7 @@ pub enum AutoplayPolicy {
     BlockAll,
 }
 
-/// Complete browser settings matrix (`MantaSettings`) covering every control modern users expect.
+/// Complete browser settings & high-velocity kernel controls matrix (`MantaSettings`).
 #[derive(Debug, Clone)]
 pub struct MantaSettings {
     pub search_engine_name: String,
@@ -40,6 +40,18 @@ pub struct MantaSettings {
     pub download_auto_save: bool,
     pub download_directory: String,
     pub custom_user_agent: String,
+    /// Keeps all open tabs active in memory until explicitly closed by the user.
+    pub keep_tabs_active_until_closed: bool,
+    /// Automatically saves user-typed form/input fields per origin so site inputs are never lost.
+    pub auto_save_form_inputs: bool,
+    /// Promotes scroll-blocking touch/wheel listeners to `{ passive: true }` for 120 FPS scrolling.
+    pub kernel_passive_events: bool,
+    /// Speculatively pre-warms DNS/TCP on link hover/touchstart before click completion.
+    pub kernel_speculative_preconnect: bool,
+    /// Coalesces idle & layout tasks to prevent main-thread jank.
+    pub kernel_layout_accelerator: bool,
+    /// Injects the 99% modern web compatibility layer (ES2024, Client Hints, SPA router hooks).
+    pub web_compat_99_enabled: bool,
 }
 
 impl Default for MantaSettings {
@@ -65,6 +77,12 @@ impl Default for MantaSettings {
             download_auto_save: true,
             download_directory: String::from("./downloads"),
             custom_user_agent: String::new(),
+            keep_tabs_active_until_closed: true,
+            auto_save_form_inputs: true,
+            kernel_passive_events: true,
+            kernel_speculative_preconnect: true,
+            kernel_layout_accelerator: true,
+            web_compat_99_enabled: true,
         }
     }
 }
@@ -109,6 +127,12 @@ impl MantaSettings {
             "https_only_mode" => self.https_only_mode = parse_bool(v),
             "dns_preconnect_enabled" => self.dns_preconnect_enabled = parse_bool(v),
             "dark_mode_forced" => self.dark_mode_forced = parse_bool(v),
+            "keep_tabs_active_until_closed" => self.keep_tabs_active_until_closed = parse_bool(v),
+            "auto_save_form_inputs" => self.auto_save_form_inputs = parse_bool(v),
+            "kernel_passive_events" => self.kernel_passive_events = parse_bool(v),
+            "kernel_speculative_preconnect" => self.kernel_speculative_preconnect = parse_bool(v),
+            "kernel_layout_accelerator" => self.kernel_layout_accelerator = parse_bool(v),
+            "web_compat_99_enabled" => self.web_compat_99_enabled = parse_bool(v),
             "default_zoom_percent" => {
                 if let Ok(z) = v.parse::<u16>() {
                     self.default_zoom_percent = z.clamp(25, 500);
@@ -164,7 +188,13 @@ impl MantaSettings {
                 "\"default_zoom_percent\":{},",
                 "\"font_scale_percent\":{},",
                 "\"download_auto_save\":{},",
-                "\"download_directory\":\"{}\"",
+                "\"download_directory\":\"{}\",",
+                "\"keep_tabs_active_until_closed\":{},",
+                "\"auto_save_form_inputs\":{},",
+                "\"kernel_passive_events\":{},",
+                "\"kernel_speculative_preconnect\":{},",
+                "\"kernel_layout_accelerator\":{},",
+                "\"web_compat_99_enabled\":{}",
                 "}}"
             ),
             escape_json(&self.search_engine_name),
@@ -182,6 +212,12 @@ impl MantaSettings {
             self.font_scale_percent,
             self.download_auto_save,
             escape_json(&self.download_directory),
+            self.keep_tabs_active_until_closed,
+            self.auto_save_form_inputs,
+            self.kernel_passive_events,
+            self.kernel_speculative_preconnect,
+            self.kernel_layout_accelerator,
+            self.web_compat_99_enabled,
         )
     }
 }
@@ -372,6 +408,8 @@ mod tests {
             mgr.settings.resolve_omnibox_input("manta.dev"),
             "https://manta.dev"
         );
+        assert!(mgr.settings.keep_tabs_active_until_closed);
+        assert!(mgr.settings.auto_save_form_inputs);
 
         assert!(mgr.settings.set_by_key("default_zoom_percent", "125"));
         let st = mgr.ensure_tab_state(1);

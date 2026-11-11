@@ -1,25 +1,28 @@
-/// Central configuration for **Manta Core v2.0**.
+/// Central configuration for **Manta Core v2.5**.
 ///
-/// Designed for maximum browsing velocity, full W3C/HTML5 capability (forms, inputs,
-/// file uploads, resumable downloads, relational + IndexedDB + Virtual File System storage),
-/// hot-active multi-tab responsiveness, and zero un-clearable disk bloat.
+/// Engineered for faster-than-Chrome site execution, 99% modern web compatibility,
+/// non-destructive hot-active multi-tab residency (tabs are NEVER killed while open),
+/// and instant atomic transactional storage persistence (`manta_vault.db`).
 #[derive(Debug, Clone)]
 pub struct MantaConfig {
-    /// Maximum total bytes across the transient RAM pool before cold-compressing oldest background tabs (Default: 16 MB).
+    /// Maximum total bytes across the transient RAM pool for snapshots (Default: 64 MB).
     pub global_ram_ceiling_bytes: usize,
-    /// Maximum bytes allowed per active tab DOM/render arena (Default: 2 MB).
+    /// Maximum bytes allowed per active tab DOM/render arena (Default: 16 MB).
     pub per_tab_ram_ceiling_bytes: usize,
-    /// Maximum number of simultaneously hot-active tabs kept uncompressed in RAM (Default: 16 tabs).
-    pub max_hot_active_tabs: usize,
-    /// Maximum bytes allowed per origin inside Manta's custom storage & VFS engine (Default: 16 MB).
+    /// Keep all open tabs 100% hot and active in RAM until explicitly closed by the user.
+    pub keep_tabs_active_until_closed: bool,
+    /// Automatically commit and fsync every storage write (`localStorage`, `sessionStorage`,
+    /// `cookies`, `IndexedDB`, `MantaDB`, `MantaFS`, `form_drafts`) to disk immediately.
+    pub instant_storage_commit: bool,
+    /// Maximum bytes allowed per origin inside Manta's custom storage & VFS engine (Default: 64 MB).
     pub per_origin_storage_quota_bytes: usize,
-    /// Maximum total bytes across Manta's custom clearable storage container (Default: 128 MB).
+    /// Maximum total bytes across Manta's custom clearable storage container (Default: 512 MB).
     pub total_custom_storage_ceiling_bytes: usize,
-    /// Maximum size of a single downloaded file in bytes (Default: 512 MB).
+    /// Maximum size of a single downloaded file in bytes (Default: 1024 MB).
     pub max_single_download_bytes: usize,
-    /// Maximum bytecode VM instruction fuel per script execution (Default: 250,000 instructions).
+    /// Maximum bytecode VM instruction fuel per script execution (Default: 1,000,000 instructions).
     pub js_max_fuel_instructions: u32,
-    /// Maximum JS call-stack depth (Default: 128 frames).
+    /// Maximum JS call-stack depth (Default: 256 frames).
     pub js_max_call_depth: usize,
     /// Enforce strict RFC 6454 Same-Origin Policy & Private Network Access (SSRF) protection.
     pub strict_site_isolation: bool,
@@ -34,18 +37,19 @@ pub struct MantaConfig {
 impl Default for MantaConfig {
     fn default() -> Self {
         Self {
-            global_ram_ceiling_bytes: 16 * 1024 * 1024,          // 16 MB global hot pool
-            per_tab_ram_ceiling_bytes: 2 * 1024 * 1024,          // 2 MB per active tab arena
-            max_hot_active_tabs: 16,                             // Keep up to 16 tabs hot in RAM
-            per_origin_storage_quota_bytes: 16 * 1024 * 1024,    // 16 MB per origin (DB + VFS + KV)
-            total_custom_storage_ceiling_bytes: 128 * 1024 * 1024, // 128 MB total clearable container
-            max_single_download_bytes: 512 * 1024 * 1024,        // 512 MB per download stream
-            js_max_fuel_instructions: 250_000,
-            js_max_call_depth: 128,
+            global_ram_ceiling_bytes: 64 * 1024 * 1024,            // 64 MB global pool
+            per_tab_ram_ceiling_bytes: 16 * 1024 * 1024,           // 16 MB per active tab arena
+            keep_tabs_active_until_closed: true,                   // Never kill open tabs
+            instant_storage_commit: true,                          // Never lose site data
+            per_origin_storage_quota_bytes: 64 * 1024 * 1024,      // 64 MB per origin
+            total_custom_storage_ceiling_bytes: 512 * 1024 * 1024, // 512 MB total container
+            max_single_download_bytes: 1024 * 1024 * 1024,         // 1 GB per download stream
+            js_max_fuel_instructions: 1_000_000,
+            js_max_call_depth: 256,
             strict_site_isolation: true,
             zero_disk_cache: true,
-            custom_storage_file_path: String::new(),
-            download_directory_path: String::new(),
+            custom_storage_file_path: String::from("./manta_vault.db"),
+            download_directory_path: String::from("./downloads"),
         }
     }
 }

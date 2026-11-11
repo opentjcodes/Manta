@@ -34,8 +34,8 @@ impl DbValue {
 }
 
 /// Relational table with primary auto-increment `rowid` and named columns.
-/// Unlike standard SQLite, deleting rows or dropping tables immediately reclaims 100% of memory
-/// with zero un-cleared freelist ghost pages.
+/// Deleting rows or dropping tables immediately reclaims 100% of memory with zero ghost pages,
+/// and all rows are persisted inside the `MANTADB3` transactional binary container.
 #[derive(Debug, Clone, Default)]
 pub struct RelationalTable {
     pub name: String,
@@ -73,14 +73,6 @@ pub struct OriginDatabasePartition {
 
 /// **MantaDB (`manta_db.rs`)**:
 /// High-speed, 100% clearable Relational Database + IndexedDB + Virtual File System (OPFS) Engine.
-///
-/// Why MantaDB instead of stock SQLite?
-/// 1. **Zero Ghost Pages**: In stock SQLite, `DELETE` only marks B-Tree pages as free-list pages,
-///    leaving sensitive user data on disk until a full blocking `VACUUM` rewrites the file.
-///    MantaDB tracks every table, row, object store, and virtual file per `OriginKey` and zeroes
-///    memory immediately on deletion.
-/// 2. **Full Visibility**: `export_manifest_json()` shows every saved file, database table, and
-///    object store across all sites so the user has complete transparency and 1-click deletion.
 #[derive(Debug, Default)]
 pub struct MantaDatabaseEngine {
     pub partitions: HashMap<String, OriginDatabasePartition>,
@@ -100,7 +92,7 @@ impl MantaDatabaseEngine {
     }
 
     // =========================================================================
-    // 1. SQL-COMPATIBLE RELATIONAL TABLES (CREATE, INSERT, SELECT, DELETE, DROP)
+    // 1. SQL-COMPATIBLE RELATIONAL TABLES (CREATE, INSERT, UPSERT, SELECT, DELETE, DROP)
     // =========================================================================
 
     pub fn create_table(
@@ -147,8 +139,8 @@ impl MantaDatabaseEngine {
         if values.len() != table.columns.len() {
             return None;
         }
-        let rowid = table.next_rowid;
-        table.next_rowid += 1;
+        let rowid = table.next_rowid.max(1);
+        table.next_rowid = rowid + 1;
         table.rows.push((rowid, values));
         table.used_bytes += row_cost;
         part.used_bytes += row_cost;
@@ -320,6 +312,23 @@ impl MantaDatabaseEngine {
         false
     }
 
+    pub fn clear_object_store(&mut self, origin_url: &str, store_name: &str) -> bool {
+        let origin = OriginKey::from_url(origin_url);
+        let Some(part) = self.partitions.get_mut(&origin.serialize()) else {
+            return false;
+        };
+        let Some(store) = part.object_stores.get_mut(store_name.trim()) else {
+            return false;
+        };
+        let freed = store.used_bytes;
+        store.records.clear();
+        store.secondary_indexes.clear();
+        store.used_bytes = 0;
+        part.used_bytes = part.used_bytes.saturating_sub(freed);
+        self.total_used_bytes = self.total_used_bytes.saturating_sub(freed);
+        true
+    }
+
     // =========================================================================
     // 3. VIRTUAL FILE SYSTEM (OPFS / USER SAVED FILES VAULT)
     // =========================================================================
@@ -399,7 +408,6 @@ impl MantaDatabaseEngine {
         };
         if let Some(mut removed) = part.virtual_files.remove(&clean_path) {
             let freed = removed.virtual_path.len() + removed.mime_type.len() + removed.data.len();
-            // Zeroize file bytes on deletion
             removed.data.fill(0);
             removed.data.clear();
             removed.data.shrink_to_fit();
@@ -476,7 +484,6 @@ mod tests {
         let mut db = MantaDatabaseEngine::new(1024 * 1024, 4 * 1024 * 1024);
         let origin = "https://docs.manta.dev";
 
-        // 1. Relational Table
         assert!(db.create_table(
             origin,
             "articles",
@@ -499,22 +506,23 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
 
-        // 2. IndexedDB Object Store
         assert!(db.put_object(origin, "drafts", "draft_1", "{\"text\":\"Hello\"}"));
         assert_eq!(
             db.get_object(origin, "drafts", "draft_1"),
             Some("{\"text\":\"Hello\"}".to_string())
         );
 
-        // 3. Virtual File System (OPFS)
-        assert!(db.save_virtual_file(origin, "/exports/data.bin", "application/octet-stream", &[1, 2, 3, 4]));
+        assert!(db.save_virtual_file(
+            origin,
+            "/exports/data.bin",
+            "application/octet-stream",
+            &[1, 2, 3, 4]
+        ));
         assert_eq!(db.list_virtual_files(origin).len(), 1);
 
-        // Delete virtual file and verify immediate byte reclamation
         assert!(db.delete_virtual_file(origin, "/exports/data.bin"));
         assert_eq!(db.list_virtual_files(origin).len(), 0);
 
-        // Drop relational table
         assert!(db.drop_table(origin, "articles"));
         assert!(db.delete_object(origin, "drafts", "draft_1"));
         assert_eq!(db.total_used_bytes, 0);

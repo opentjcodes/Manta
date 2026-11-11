@@ -2,6 +2,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 use std::slice;
 
+use crate::page_compiler::PageRuntimeCompiler;
 use crate::MantaEngine;
 
 unsafe fn cstr_to_rust(ptr: *const c_char) -> String {
@@ -19,7 +20,7 @@ fn rust_to_cstr(s: &str) -> *mut c_char {
     }
 }
 
-/// Initializes Manta Core v2.0 via the Universal Bolt-On C-ABI.
+/// Initializes Manta Core v2.5 via the Universal Bolt-On C-ABI.
 #[no_mangle]
 pub unsafe extern "C" fn manta_abi_init_engine(
     storage_path: *const c_char,
@@ -89,6 +90,20 @@ pub extern "C" fn manta_abi_open_tab_count() -> u32 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn manta_abi_compile_kernel_script(origin_url: *const c_char) -> *mut c_char {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
+    };
+    let script = PageRuntimeCompiler::compile_runtime_script_with_settings(
+        &orig,
+        &engine.storage,
+        &engine.controls.settings,
+    );
+    rust_to_cstr(&script)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn manta_abi_stream_html_chunk(
     tab_id: u32,
     url: *const c_char,
@@ -134,7 +149,11 @@ pub unsafe extern "C" fn manta_abi_set_input_value(
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return false;
     };
-    engine.tabs.set_input_value(tab_id, node_id, &val_str).is_ok()
+    let engine_ref = &mut *engine;
+    engine_ref
+        .tabs
+        .set_input_value_and_persist(tab_id, node_id, &val_str, &mut engine_ref.storage)
+        .is_ok()
 }
 
 #[no_mangle]
@@ -189,6 +208,34 @@ pub extern "C" fn manta_abi_submit_form(tab_id: u32, form_or_control_node_id: u3
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn manta_abi_save_form_draft(
+    origin_url: *const c_char,
+    field_key: *const c_char,
+    value: *const c_char,
+) -> bool {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let fk = unsafe { cstr_to_rust(field_key) };
+    let val = unsafe { cstr_to_rust(value) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    engine.storage.save_form_draft(&orig, &fk, &val)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_get_form_draft(
+    origin_url: *const c_char,
+    field_key: *const c_char,
+) -> *mut c_char {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let fk = unsafe { cstr_to_rust(field_key) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
+    };
+    rust_to_cstr(engine.storage.get_form_draft(&orig, &fk).as_deref().unwrap_or(""))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn manta_abi_storage_set(
     origin_url: *const c_char,
     key: *const c_char,
@@ -204,11 +251,7 @@ pub unsafe extern "C" fn manta_abi_storage_set(
     if is_session {
         engine.storage.set_session_storage(&orig, &k, &v)
     } else {
-        let ok = engine.storage.set_local_storage(&orig, &k, &v);
-        if ok {
-            let _ = engine.storage.save_to_backing_file();
-        }
-        ok
+        engine.storage.set_local_storage(&orig, &k, &v)
     }
 }
 
@@ -229,6 +272,108 @@ pub unsafe extern "C" fn manta_abi_storage_get(
         engine.storage.get_local_storage(&orig, &k)
     };
     rust_to_cstr(val.as_deref().unwrap_or(""))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_storage_remove(
+    origin_url: *const c_char,
+    key: *const c_char,
+    is_session: bool,
+) -> bool {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let k = unsafe { cstr_to_rust(key) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    if is_session {
+        engine.storage.remove_session_storage(&orig, &k)
+    } else {
+        engine.storage.remove_local_storage(&orig, &k)
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_cookie_set(
+    origin_url: *const c_char,
+    raw_cookie_header: *const c_char,
+) -> bool {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let cookie = unsafe { cstr_to_rust(raw_cookie_header) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    engine.storage.set_cookie_from_header(&orig, &cookie)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_cookie_get(origin_url: *const c_char) -> *mut c_char {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
+    };
+    rust_to_cstr(&engine.storage.get_cookie_header_for_url(&orig, false))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_idb_put(
+    origin_url: *const c_char,
+    store_name: *const c_char,
+    key: *const c_char,
+    json_val: *const c_char,
+) -> bool {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let store = unsafe { cstr_to_rust(store_name) };
+    let k = unsafe { cstr_to_rust(key) };
+    let v = unsafe { cstr_to_rust(json_val) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    let ok = engine.storage.db.put_object(&orig, &store, &k, &v);
+    if ok {
+        let _ = engine.storage.save_to_backing_file();
+    }
+    ok
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_idb_get(
+    origin_url: *const c_char,
+    store_name: *const c_char,
+    key: *const c_char,
+) -> *mut c_char {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let store = unsafe { cstr_to_rust(store_name) };
+    let k = unsafe { cstr_to_rust(key) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
+    };
+    rust_to_cstr(
+        engine
+            .storage
+            .db
+            .get_object(&orig, &store, &k)
+            .as_deref()
+            .unwrap_or(""),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_idb_delete(
+    origin_url: *const c_char,
+    store_name: *const c_char,
+    key: *const c_char,
+) -> bool {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let store = unsafe { cstr_to_rust(store_name) };
+    let k = unsafe { cstr_to_rust(key) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    let ok = engine.storage.db.delete_object(&orig, &store, &k);
+    if ok {
+        let _ = engine.storage.save_to_backing_file();
+    }
+    ok
 }
 
 #[no_mangle]
@@ -271,11 +416,7 @@ pub unsafe extern "C" fn manta_abi_clear_origin_data(origin_url: *const c_char) 
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return false;
     };
-    let ok = engine.storage.clear_origin(&orig);
-    if ok {
-        let _ = engine.storage.save_to_backing_file();
-    }
-    ok
+    engine.storage.clear_origin(&orig)
 }
 
 #[no_mangle]

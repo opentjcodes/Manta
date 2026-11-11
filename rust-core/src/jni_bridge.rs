@@ -113,6 +113,8 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCrea
     id as JInt
 }
 
+/// Non-destructively records a backup snapshot of tab metadata & scroll offset
+/// WITHOUT killing or hibernating the live tab in memory.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCompressTabState(
     env: JNIEnv,
@@ -131,6 +133,11 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeComp
         .controls
         .ensure_tab_state(tab_id as u32)
         .record_navigation(&url, &title);
+    if let Some(tab) = engine.tabs.get_tab_mut(tab_id as u32) {
+        tab.scroll_y = scroll_y;
+        tab.is_hibernated = false;
+    }
+    engine.storage.record_history_visit(&url, &title);
     TabCompressor::store_tab_snapshot(&mut engine.vault, tab_id as u32, &url, &title, scroll_y)
         as JInt
 }
@@ -149,11 +156,19 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeRest
             let formatted = format!("{}|{}|{}", scroll_y, title, url);
             unsafe { env.new_java_string(&formatted) }
         }
-        None => unsafe { env.new_java_string("") },
+        None => {
+            if let Some(tab) = engine.tabs.get_tab(tab_id as u32) {
+                let formatted =
+                    format!("{}|{}|{}", tab.scroll_y, tab.dom.page_title, tab.current_url);
+                unsafe { env.new_java_string(&formatted) }
+            } else {
+                unsafe { env.new_java_string("") }
+            }
+        }
     }
 }
 
-/// Switches active tab while keeping background tabs hot-active in memory.
+/// Switches active tab while keeping background tabs 100% hot-active in memory.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSwitchTab(
     _env: JNIEnv,
@@ -229,8 +244,11 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetR
     let Ok(engine) = MantaEngine::global().lock() else {
         return unsafe { env.new_java_string("") };
     };
-    let script =
-        PageRuntimeCompiler::compile_runtime_script_for_origin(&origin_url, &engine.storage);
+    let script = PageRuntimeCompiler::compile_runtime_script_with_settings(
+        &origin_url,
+        &engine.storage,
+        &engine.controls.settings,
+    );
     unsafe { env.new_java_string(&script) }
 }
 
@@ -292,11 +310,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStor
     let ok = if is_session != 0 {
         engine.storage.set_session_storage(&origin, &key, &val)
     } else {
-        let saved = engine.storage.set_local_storage(&origin, &key, &val);
-        if saved {
-            let _ = engine.storage.save_to_backing_file();
-        }
-        saved
+        engine.storage.set_local_storage(&origin, &key, &val)
     };
     u8::from(ok)
 }
@@ -335,8 +349,8 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStor
     if let Ok(mut engine) = MantaEngine::global().lock() {
         if is_session != 0 {
             engine.storage.remove_session_storage(&origin, &key);
-        } else if engine.storage.remove_local_storage(&origin, &key) {
-            let _ = engine.storage.save_to_backing_file();
+        } else {
+            engine.storage.remove_local_storage(&origin, &key);
         }
     }
 }
@@ -349,9 +363,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStor
 ) {
     let origin = unsafe { env.get_rust_string(j_origin_url) };
     if let Ok(mut engine) = MantaEngine::global().lock() {
-        if engine.storage.clear_origin(&origin) {
-            let _ = engine.storage.save_to_backing_file();
-        }
+        engine.storage.clear_origin(&origin);
     }
 }
 
@@ -391,7 +403,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeTogg
         return 0;
     };
     let added = engine.storage.toggle_bookmark(&url, &title);
-    let _ = engine.storage.save_to_backing_file();
     u8::from(added)
 }
 

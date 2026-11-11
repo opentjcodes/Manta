@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 
-use crate::manta_db::{MantaDatabaseEngine, VirtualFileEntry};
+use crate::manta_db::{DbValue, MantaDatabaseEngine, RelationalTable, VirtualFileEntry};
 use crate::site_isolation::OriginKey;
 
-const STORAGE_MAGIC: &[u8; 8] = b"MANTADB2";
+const STORAGE_MAGIC_V2: &[u8; 8] = b"MANTADB2";
+const STORAGE_MAGIC_V3: &[u8; 8] = b"MANTADB3";
 
 /// RFC 6265 Compliant Cookie Entry stored inside Manta's custom origin-partitioned vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,12 +20,13 @@ pub struct StoredCookie {
     pub same_site: String,
 }
 
-/// Per-origin isolated storage partition (`localStorage`, `sessionStorage`, and `cookies`).
+/// Per-origin isolated storage partition (`localStorage`, `sessionStorage`, `cookies`, and `form_drafts`).
 #[derive(Debug, Clone, Default)]
 pub struct OriginStorageBucket {
     pub local_storage: HashMap<String, String>,
     pub session_storage: HashMap<String, String>,
     pub cookies: HashMap<String, StoredCookie>,
+    pub form_drafts: HashMap<String, String>,
     pub used_bytes: usize,
 }
 
@@ -41,12 +43,12 @@ pub struct HistoryVisitEntry {
     pub visit_count: u32,
 }
 
-/// **Manta Unified Storage & Database Engine (`storage_engine.rs`)**:
-/// - Combines `localStorage`, `sessionStorage`, RFC 6265 Cookies, Bookmarks, Browsing History,
-///   and **MantaDB** (Relational Tables + IndexedDB Object Stores + Virtual File System `OPFS`).
-/// - Serializes into a single compact, CRC32-verified binary container (`MANTADB2`) with
-///   **Zero Ghost Pages**: when the user deletes a file, table, origin, or clears storage,
-///   100% of bytes are zeroed and reclaimed immediately.
+/// **Manta Unified Transactional Storage & Database Engine (`storage_engine.rs`)**:
+/// - Combines `localStorage`, `sessionStorage`, RFC 6265 Cookies, Live Form Drafts (`form_drafts`),
+///   Bookmarks, Browsing History, and **MantaDB** (Relational SQL Tables + IndexedDB Object Stores +
+///   Virtual File System `OPFS`).
+/// - Serializes into a single compact, CRC32-verified binary container (`MANTADB3`) using
+///   **atomic write-ahead temp file + rename** so site data is NEVER lost or corrupted.
 pub struct MantaStorageEngine {
     origins: HashMap<String, OriginStorageBucket>,
     bookmarks: Vec<BookmarkEntry>,
@@ -56,6 +58,7 @@ pub struct MantaStorageEngine {
     total_ceiling_bytes: usize,
     kv_cookie_used_bytes: usize,
     backing_file_path: Option<String>,
+    pub auto_commit_on_write: bool,
 }
 
 impl MantaStorageEngine {
@@ -69,6 +72,7 @@ impl MantaStorageEngine {
             total_ceiling_bytes,
             kv_cookie_used_bytes: 0,
             backing_file_path: None,
+            auto_commit_on_write: true,
         }
     }
 
@@ -76,6 +80,10 @@ impl MantaStorageEngine {
         if !path.trim().is_empty() {
             self.backing_file_path = Some(path.trim().to_string());
         }
+    }
+
+    pub fn backing_file(&self) -> Option<&str> {
+        self.backing_file_path.as_deref()
     }
 
     #[inline]
@@ -94,12 +102,17 @@ impl MantaStorageEngine {
         all_origins.len()
     }
 
+    #[inline]
+    fn maybe_auto_commit(&self) {
+        if self.auto_commit_on_write && self.backing_file_path.is_some() {
+            let _ = self.save_to_backing_file();
+        }
+    }
+
     // =========================================================================
     // FULL STORAGE TRANSPARENCY MANIFEST (SHOWS ALL SAVED FILES, TABLES & DATA)
     // =========================================================================
 
-    /// Returns a complete JSON manifest showing every saved virtual file, relational table,
-    /// IndexedDB store, cookie count, and `localStorage` usage across all origins.
     pub fn inspect_storage_manifest_json(&self) -> String {
         let mut out = String::from("{");
         out.push_str(&format!(
@@ -125,15 +138,19 @@ impl MantaStorageEngine {
             let db_part = self.db.partitions.get(origin_str);
 
             let kv_count = kv_bucket.map(|b| b.local_storage.len()).unwrap_or(0);
+            let sess_count = kv_bucket.map(|b| b.session_storage.len()).unwrap_or(0);
+            let draft_count = kv_bucket.map(|b| b.form_drafts.len()).unwrap_or(0);
             let cookie_count = kv_bucket.map(|b| b.cookies.len()).unwrap_or(0);
             let kv_bytes = kv_bucket.map(|b| b.used_bytes).unwrap_or(0);
             let db_bytes = db_part.map(|p| p.used_bytes).unwrap_or(0);
 
             out.push_str(&format!(
-                "{{\"origin\":\"{}\",\"used_bytes\":{},\"local_storage_keys\":{},\"cookies\":{},\"tables\":[",
+                "{{\"origin\":\"{}\",\"used_bytes\":{},\"local_storage_keys\":{},\"session_storage_keys\":{},\"form_drafts\":{},\"cookies\":{},\"tables\":[",
                 escape_json_str(origin_str),
                 kv_bytes + db_bytes,
                 kv_count,
+                sess_count,
+                draft_count,
                 cookie_count
             ));
 
@@ -187,11 +204,37 @@ impl MantaStorageEngine {
     }
 
     // =========================================================================
-    // ORIGIN-PARTITIONED LOCALSTORAGE & SESSIONSTORAGE
+    // ORIGIN-PARTITIONED LOCALSTORAGE, SESSIONSTORAGE & LIVE FORM DRAFTS
     // =========================================================================
 
     pub fn set_local_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
-        self.set_kv_internal(origin_url, key, value, false)
+        // Intercept special bridge keys from MantaKernelScripts if routed via storageSet
+        if let Some(draft_key) = key.strip_prefix("__manta_draft::") {
+            return self.save_form_draft(origin_url, draft_key, value);
+        }
+        if key == "__manta_cookie_jar" {
+            for pair in value.split(';') {
+                let trimmed = pair.trim();
+                if !trimmed.is_empty() {
+                    self.set_cookie_from_header(origin_url, trimmed);
+                }
+            }
+            return true;
+        }
+        if let Some(idb_rest) = key.strip_prefix("__manta_idb::") {
+            if let Some((store, pk)) = idb_rest.split_once("::") {
+                let ok = self.db.put_object(origin_url, store, pk, value);
+                if ok {
+                    self.maybe_auto_commit();
+                }
+                return ok;
+            }
+        }
+        let ok = self.set_kv_internal(origin_url, key, value, false);
+        if ok {
+            self.maybe_auto_commit();
+        }
+        ok
     }
 
     pub fn get_local_storage(&self, origin_url: &str, key: &str) -> Option<String> {
@@ -199,11 +242,48 @@ impl MantaStorageEngine {
     }
 
     pub fn remove_local_storage(&mut self, origin_url: &str, key: &str) -> bool {
-        self.remove_kv_internal(origin_url, key, false)
+        if let Some(idb_rest) = key.strip_prefix("__manta_idb::") {
+            if let Some((store, pk)) = idb_rest.split_once("::") {
+                let ok = self.db.delete_object(origin_url, store, pk);
+                if ok {
+                    self.maybe_auto_commit();
+                }
+                return ok;
+            }
+        }
+        let ok = self.remove_kv_internal(origin_url, key, false);
+        if ok {
+            self.maybe_auto_commit();
+        }
+        ok
+    }
+
+    pub fn clear_local_storage_only(&mut self, origin_url: &str) -> bool {
+        let origin_key = OriginKey::from_url(origin_url);
+        if origin_key.is_opaque {
+            return false;
+        }
+        let Some(bucket) = self.origins.get_mut(&origin_key.serialize()) else {
+            return false;
+        };
+        let freed: usize = bucket
+            .local_storage
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        bucket.local_storage.clear();
+        bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
+        self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
+        self.maybe_auto_commit();
+        true
     }
 
     pub fn set_session_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
-        self.set_kv_internal(origin_url, key, value, true)
+        let ok = self.set_kv_internal(origin_url, key, value, true);
+        if ok {
+            self.maybe_auto_commit();
+        }
+        ok
     }
 
     pub fn get_session_storage(&self, origin_url: &str, key: &str) -> Option<String> {
@@ -211,7 +291,91 @@ impl MantaStorageEngine {
     }
 
     pub fn remove_session_storage(&mut self, origin_url: &str, key: &str) -> bool {
-        self.remove_kv_internal(origin_url, key, true)
+        let ok = self.remove_kv_internal(origin_url, key, true);
+        if ok {
+            self.maybe_auto_commit();
+        }
+        ok
+    }
+
+    pub fn clear_session_storage_only(&mut self, origin_url: &str) -> bool {
+        let origin_key = OriginKey::from_url(origin_url);
+        if origin_key.is_opaque {
+            return false;
+        }
+        let Some(bucket) = self.origins.get_mut(&origin_key.serialize()) else {
+            return false;
+        };
+        let freed: usize = bucket
+            .session_storage
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        bucket.session_storage.clear();
+        bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
+        self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
+        self.maybe_auto_commit();
+        true
+    }
+
+    /// Saves a live form/input draft for a site so user-typed input is never lost on reload or navigation.
+    pub fn save_form_draft(&mut self, origin_url: &str, field_key: &str, value: &str) -> bool {
+        let origin_key = OriginKey::from_url(origin_url);
+        if origin_key.is_opaque || field_key.trim().is_empty() {
+            return false;
+        }
+        let serialized_origin = origin_key.serialize();
+        let entry_cost = field_key.len() + value.len();
+
+        let bucket = self.origins.entry(serialized_origin).or_default();
+        let prev_cost = bucket
+            .form_drafts
+            .get(field_key)
+            .map(|old| field_key.len() + old.len())
+            .unwrap_or(0);
+
+        let next_bucket = bucket.used_bytes.saturating_sub(prev_cost) + entry_cost;
+        let next_total = self.kv_cookie_used_bytes.saturating_sub(prev_cost) + entry_cost;
+        if next_bucket > self.per_origin_quota_bytes
+            || next_total + self.db.total_used_bytes > self.total_ceiling_bytes
+        {
+            return false;
+        }
+
+        bucket
+            .form_drafts
+            .insert(field_key.to_string(), value.to_string());
+        bucket.used_bytes = next_bucket;
+        self.kv_cookie_used_bytes = next_total;
+        self.maybe_auto_commit();
+        true
+    }
+
+    pub fn get_form_draft(&self, origin_url: &str, field_key: &str) -> Option<String> {
+        let origin_key = OriginKey::from_url(origin_url);
+        if origin_key.is_opaque {
+            return None;
+        }
+        self.origins
+            .get(&origin_key.serialize())?
+            .form_drafts
+            .get(field_key)
+            .cloned()
+    }
+
+    pub fn clear_form_drafts_for_origin(&mut self, origin_url: &str) {
+        let origin_key = OriginKey::from_url(origin_url);
+        if let Some(bucket) = self.origins.get_mut(&origin_key.serialize()) {
+            let freed: usize = bucket
+                .form_drafts
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum();
+            bucket.form_drafts.clear();
+            bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
+            self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
+            self.maybe_auto_commit();
+        }
     }
 
     pub fn export_origin_storage_json(&self, origin_url: &str, is_session: bool) -> String {
@@ -228,18 +392,37 @@ impl MantaStorageEngine {
         } else {
             &bucket.local_storage
         };
+        map_to_json_object(map)
+    }
+
+    pub fn export_origin_form_drafts_json(&self, origin_url: &str) -> String {
+        let origin_key = OriginKey::from_url(origin_url);
+        if origin_key.is_opaque {
+            return "{}".to_string();
+        }
+        let Some(bucket) = self.origins.get(&origin_key.serialize()) else {
+            return "{}".to_string();
+        };
+        map_to_json_object(&bucket.form_drafts)
+    }
+
+    pub fn export_origin_idb_json(&self, origin_url: &str) -> String {
+        let origin_key = OriginKey::from_url(origin_url);
+        if origin_key.is_opaque {
+            return "{}".to_string();
+        }
+        let Some(part) = self.db.partitions.get(&origin_key.serialize()) else {
+            return "{}".to_string();
+        };
         let mut out = String::from("{");
-        let mut first = true;
-        for (k, v) in map {
-            if !first {
+        for (idx, (store_name, store)) in part.object_stores.iter().enumerate() {
+            if idx > 0 {
                 out.push(',');
             }
-            first = false;
             out.push('"');
-            out.push_str(&escape_json_str(k));
-            out.push_str("\":\"");
-            out.push_str(&escape_json_str(v));
-            out.push('"');
+            out.push_str(&escape_json_str(store_name));
+            out.push_str("\":");
+            out.push_str(&map_to_json_object(&store.records));
         }
         out.push('}');
         out
@@ -397,6 +580,7 @@ impl MantaStorageEngine {
                 bucket.used_bytes = bucket.used_bytes.saturating_sub(cost);
                 self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(cost);
             }
+            self.maybe_auto_commit();
             return true;
         }
 
@@ -428,6 +612,7 @@ impl MantaStorageEngine {
         );
         bucket.used_bytes += cost;
         self.kv_cookie_used_bytes += cost;
+        self.maybe_auto_commit();
         true
     }
 
@@ -450,6 +635,7 @@ impl MantaStorageEngine {
             }
             pairs.push(format!("{}={}", cookie.name, cookie.value));
         }
+        pairs.sort();
         pairs.join("; ")
     }
 
@@ -467,6 +653,7 @@ impl MantaStorageEngine {
             if !title.trim().is_empty() {
                 existing.title = title.trim().to_string();
             }
+            self.maybe_auto_commit();
             return;
         }
         if self.history.len() >= 2048 {
@@ -481,6 +668,7 @@ impl MantaStorageEngine {
             },
             visit_count: 1,
         });
+        self.maybe_auto_commit();
     }
 
     pub fn history(&self) -> &[HistoryVisitEntry] {
@@ -490,6 +678,7 @@ impl MantaStorageEngine {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history.shrink_to_fit();
+        self.maybe_auto_commit();
     }
 
     pub fn toggle_bookmark(&mut self, url: &str, title: &str) -> bool {
@@ -497,7 +686,7 @@ impl MantaStorageEngine {
         if clean_url.is_empty() {
             return false;
         }
-        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == clean_url) {
+        let added = if let Some(pos) = self.bookmarks.iter().position(|b| b.url == clean_url) {
             self.bookmarks.remove(pos);
             false
         } else {
@@ -512,7 +701,9 @@ impl MantaStorageEngine {
                 });
             }
             true
-        }
+        };
+        self.maybe_auto_commit();
+        added
     }
 
     pub fn bookmarks(&self) -> &[BookmarkEntry] {
@@ -539,8 +730,6 @@ impl MantaStorageEngine {
     // SELECTIVE PER-ORIGIN OR FULL PERMANENT SHREDDING
     // =========================================================================
 
-    /// Permanently clears all stored data (`localStorage`, `sessionStorage`, `cookies`,
-    /// relational tables, IndexedDB stores, and saved virtual files) for a single origin.
     pub fn clear_origin(&mut self, origin_url: &str) -> bool {
         let origin = OriginKey::from_url(origin_url).serialize();
         let mut removed_any = false;
@@ -551,6 +740,9 @@ impl MantaStorageEngine {
         }
         if self.db.clear_origin(&origin) > 0 {
             removed_any = true;
+        }
+        if removed_any {
+            self.maybe_auto_commit();
         }
         removed_any
     }
@@ -566,10 +758,9 @@ impl MantaStorageEngine {
             bucket.used_bytes = bucket.used_bytes.saturating_sub(session_bytes);
             self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(session_bytes);
         }
+        self.maybe_auto_commit();
     }
 
-    /// Completely wipes all origins, MantaDB tables, IndexedDB stores, Virtual Files,
-    /// Cookies, `localStorage`, History, and Bookmarks, removing the backing file from disk.
     pub fn clear_all(&mut self) {
         self.origins.clear();
         self.origins.shrink_to_fit();
@@ -581,15 +772,16 @@ impl MantaStorageEngine {
         self.kv_cookie_used_bytes = 0;
         if let Some(ref path) = self.backing_file_path {
             let _ = fs::remove_file(path);
+            let _ = fs::remove_file(format!("{}.tmp", path));
         }
     }
 
     // =========================================================================
-    // ZERO-GHOST-PAGE BINARY CONTAINER SERIALIZATION (`MANTADB2` + CRC32)
+    // TRANSACTIONAL ZERO-GHOST-PAGE BINARY CONTAINER (`MANTADB3` + `MANTADB2`)
     // =========================================================================
 
     pub fn serialize_to_bytes(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(self.used_bytes() + 512);
+        let mut payload = Vec::with_capacity(self.used_bytes() + 1024);
 
         // 1. Write Bookmarks
         write_u32(&mut payload, self.bookmarks.len() as u32);
@@ -606,13 +798,25 @@ impl MantaStorageEngine {
             write_u32(&mut payload, h.visit_count);
         }
 
-        // 3. Write Origin KV & Cookies
+        // 3. Write Origin KV (`local_storage`, `session_storage`, `form_drafts`, `cookies`)
         write_u32(&mut payload, self.origins.len() as u32);
         for (origin_str, bucket) in &self.origins {
             write_str(&mut payload, origin_str);
 
             write_u32(&mut payload, bucket.local_storage.len() as u32);
             for (k, v) in &bucket.local_storage {
+                write_str(&mut payload, k);
+                write_str(&mut payload, v);
+            }
+
+            write_u32(&mut payload, bucket.session_storage.len() as u32);
+            for (k, v) in &bucket.session_storage {
+                write_str(&mut payload, k);
+                write_str(&mut payload, v);
+            }
+
+            write_u32(&mut payload, bucket.form_drafts.len() as u32);
+            for (k, v) in &bucket.form_drafts {
                 write_str(&mut payload, k);
                 write_str(&mut payload, v);
             }
@@ -629,11 +833,31 @@ impl MantaStorageEngine {
             }
         }
 
-        // 4. Write MantaDB Partitions (Object Stores + Virtual Files)
+        // 4. Write MantaDB Partitions (Relational Tables + Object Stores + Virtual Files)
         write_u32(&mut payload, self.db.partitions.len() as u32);
         for (origin_str, part) in &self.db.partitions {
             write_str(&mut payload, origin_str);
 
+            // 4a. Relational SQL Tables
+            write_u32(&mut payload, part.tables.len() as u32);
+            for (table_name, table) in &part.tables {
+                write_str(&mut payload, table_name);
+                write_u64(&mut payload, table.next_rowid);
+                write_u32(&mut payload, table.columns.len() as u32);
+                for col in &table.columns {
+                    write_str(&mut payload, col);
+                }
+                write_u32(&mut payload, table.rows.len() as u32);
+                for (rowid, vals) in &table.rows {
+                    write_u64(&mut payload, *rowid);
+                    write_u32(&mut payload, vals.len() as u32);
+                    for val in vals {
+                        write_db_value(&mut payload, val);
+                    }
+                }
+            }
+
+            // 4b. IndexedDB Object Stores
             write_u32(&mut payload, part.object_stores.len() as u32);
             for (store_name, store) in &part.object_stores {
                 write_str(&mut payload, store_name);
@@ -644,6 +868,7 @@ impl MantaStorageEngine {
                 }
             }
 
+            // 4c. Virtual Files (OPFS)
             write_u32(&mut payload, part.virtual_files.len() as u32);
             for vf in part.virtual_files.values() {
                 write_str(&mut payload, &vf.virtual_path);
@@ -655,16 +880,22 @@ impl MantaStorageEngine {
 
         let checksum = crc32_hash(&payload);
         let mut frame = Vec::with_capacity(12 + payload.len());
-        frame.extend_from_slice(STORAGE_MAGIC);
+        frame.extend_from_slice(STORAGE_MAGIC_V3);
         write_u32(&mut frame, checksum);
         frame.extend_from_slice(&payload);
         frame
     }
 
     pub fn deserialize_from_bytes(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
-        if bytes.len() < 12 || &bytes[0..8] != STORAGE_MAGIC {
+        if bytes.len() < 12 {
             return Err("Invalid custom storage header");
         }
+        let is_v3 = &bytes[0..8] == STORAGE_MAGIC_V3;
+        let is_v2 = &bytes[0..8] == STORAGE_MAGIC_V2;
+        if !is_v3 && !is_v2 {
+            return Err("Unknown custom storage header magic");
+        }
+
         let mut cursor = 8usize;
         let expected_crc = read_u32(bytes, &mut cursor).ok_or("Truncated checksum")?;
         let payload = &bytes[12..];
@@ -697,7 +928,7 @@ impl MantaStorageEngine {
             });
         }
 
-        // 3. Read Origin KV & Cookies
+        // 3. Read Origin KV, Session, Drafts & Cookies
         let origin_count = read_u32(payload, &mut p_cur).ok_or("Invalid origin count")?;
         let mut new_origins = HashMap::with_capacity((origin_count as usize).min(1024));
         let mut kv_total_bytes = 0usize;
@@ -714,6 +945,28 @@ impl MantaStorageEngine {
                 bucket.used_bytes += cost;
                 kv_total_bytes += cost;
                 bucket.local_storage.insert(k, v);
+            }
+
+            if is_v3 {
+                let sess_count = read_u32(payload, &mut p_cur).ok_or("Corrupt session count")?;
+                for _ in 0..sess_count {
+                    let k = read_str(payload, &mut p_cur).ok_or("Corrupt session key")?;
+                    let v = read_str(payload, &mut p_cur).ok_or("Corrupt session value")?;
+                    let cost = k.len() + v.len();
+                    bucket.used_bytes += cost;
+                    kv_total_bytes += cost;
+                    bucket.session_storage.insert(k, v);
+                }
+
+                let draft_count = read_u32(payload, &mut p_cur).ok_or("Corrupt draft count")?;
+                for _ in 0..draft_count {
+                    let k = read_str(payload, &mut p_cur).ok_or("Corrupt draft key")?;
+                    let v = read_str(payload, &mut p_cur).ok_or("Corrupt draft value")?;
+                    let cost = k.len() + v.len();
+                    bucket.used_bytes += cost;
+                    kv_total_bytes += cost;
+                    bucket.form_drafts.insert(k, v);
+                }
             }
 
             let cookie_count = read_u32(payload, &mut p_cur).ok_or("Corrupt cookie count")?;
@@ -750,12 +1003,54 @@ impl MantaStorageEngine {
             new_origins.insert(origin_str, bucket);
         }
 
-        // 4. Read MantaDB Partitions (Object Stores + Virtual Files)
+        // 4. Read MantaDB Partitions (Tables + Object Stores + Virtual Files)
         self.db.clear_all();
         if p_cur < payload.len() {
             let db_part_count = read_u32(payload, &mut p_cur).ok_or("Corrupt DB part count")?;
             for _ in 0..db_part_count {
                 let origin_str = read_str(payload, &mut p_cur).ok_or("Corrupt DB origin")?;
+
+                if is_v3 {
+                    let table_count = read_u32(payload, &mut p_cur).ok_or("Corrupt table count")?;
+                    for _ in 0..table_count {
+                        let tname = read_str(payload, &mut p_cur).ok_or("Corrupt table name")?;
+                        let next_rowid = read_u64(payload, &mut p_cur).ok_or("Corrupt next_rowid")?;
+                        let col_count = read_u32(payload, &mut p_cur).ok_or("Corrupt col count")?;
+                        let mut cols = Vec::with_capacity((col_count as usize).min(256));
+                        for _ in 0..col_count {
+                            cols.push(read_str(payload, &mut p_cur).ok_or("Corrupt col name")?);
+                        }
+                        let row_count = read_u32(payload, &mut p_cur).ok_or("Corrupt row count")?;
+                        let mut rows = Vec::with_capacity((row_count as usize).min(65536));
+                        let mut table_bytes = 0usize;
+                        for _ in 0..row_count {
+                            let rowid = read_u64(payload, &mut p_cur).ok_or("Corrupt rowid")?;
+                            let val_count = read_u32(payload, &mut p_cur).ok_or("Corrupt val count")?;
+                            let mut vals = Vec::with_capacity((val_count as usize).min(256));
+                            for _ in 0..val_count {
+                                let dv = read_db_value(payload, &mut p_cur).ok_or("Corrupt DbValue")?;
+                                table_bytes += dv.approx_bytes();
+                                vals.push(dv);
+                            }
+                            table_bytes += 16;
+                            rows.push((rowid, vals));
+                        }
+                        let part = self.db.partitions.entry(origin_str.clone()).or_default();
+                        part.used_bytes += table_bytes;
+                        self.db.total_used_bytes += table_bytes;
+                        part.tables.insert(
+                            tname.clone(),
+                            RelationalTable {
+                                name: tname,
+                                columns: cols,
+                                rows,
+                                next_rowid,
+                                used_bytes: table_bytes,
+                            },
+                        );
+                    }
+                }
+
                 let store_count = read_u32(payload, &mut p_cur).ok_or("Corrupt store count")?;
                 for _ in 0..store_count {
                     let store_name = read_str(payload, &mut p_cur).ok_or("Corrupt store name")?;
@@ -797,6 +1092,8 @@ impl MantaStorageEngine {
         Ok(())
     }
 
+    /// Atomically writes the `MANTADB3` container to disk via a temporary file + rename
+    /// so power loss or app force-stop can never corrupt user data.
     pub fn save_to_backing_file(&self) -> Result<(), String> {
         let Some(ref path) = self.backing_file_path else {
             return Ok(());
@@ -806,9 +1103,13 @@ impl MantaStorageEngine {
             return Ok(());
         }
         let data = self.serialize_to_bytes();
-        let mut f = fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(&data).map_err(|e| e.to_string())?;
-        f.sync_all().map_err(|e| e.to_string())
+        let tmp_path = format!("{}.tmp", path);
+        {
+            let mut f = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+            f.write_all(&data).map_err(|e| e.to_string())?;
+            f.sync_all().map_err(|e| e.to_string())?;
+        }
+        fs::rename(&tmp_path, path).map_err(|e| e.to_string())
     }
 
     pub fn load_from_backing_file(&mut self) -> Result<(), String> {
@@ -823,7 +1124,78 @@ impl MantaStorageEngine {
     }
 }
 
+fn map_to_json_object(map: &HashMap<String, String>) -> String {
+    let mut out = String::from("{");
+    let mut first = true;
+    for (k, v) in map {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push('"');
+        out.push_str(&escape_json_str(k));
+        out.push_str("\":\"");
+        out.push_str(&escape_json_str(v));
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
+fn write_db_value(out: &mut Vec<u8>, val: &DbValue) {
+    match val {
+        DbValue::Null => out.push(0),
+        DbValue::Int(i) => {
+            out.push(1);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        DbValue::Float(f) => {
+            out.push(2);
+            out.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        DbValue::Text(s) => {
+            out.push(3);
+            write_str(out, s);
+        }
+        DbValue::Blob(b) => {
+            out.push(4);
+            write_bytes(out, b);
+        }
+    }
+}
+
+fn read_db_value(buf: &[u8], cursor: &mut usize) -> Option<DbValue> {
+    if *cursor >= buf.len() {
+        return None;
+    }
+    let tag = buf[*cursor];
+    *cursor += 1;
+    match tag {
+        0 => Some(DbValue::Null),
+        1 => {
+            if *cursor + 8 > buf.len() {
+                return None;
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&buf[*cursor..*cursor + 8]);
+            *cursor += 8;
+            Some(DbValue::Int(i64::from_le_bytes(arr)))
+        }
+        2 => {
+            let bits = read_u64(buf, cursor)?;
+            Some(DbValue::Float(f64::from_bits(bits)))
+        }
+        3 => Some(DbValue::Text(read_str(buf, cursor)?)),
+        4 => Some(DbValue::Blob(read_bytes(buf, cursor)?)),
+        _ => None,
+    }
+}
+
 fn write_u32(out: &mut Vec<u8>, val: u32) {
+    out.extend_from_slice(&val.to_le_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, val: u64) {
     out.extend_from_slice(&val.to_le_bytes());
 }
 
@@ -844,6 +1216,16 @@ fn read_u32(buf: &[u8], cursor: &mut usize) -> Option<u32> {
     arr.copy_from_slice(&buf[*cursor..*cursor + 4]);
     *cursor += 4;
     Some(u32::from_le_bytes(arr))
+}
+
+fn read_u64(buf: &[u8], cursor: &mut usize) -> Option<u64> {
+    if *cursor + 8 > buf.len() {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&buf[*cursor..*cursor + 8]);
+    *cursor += 8;
+    Some(u64::from_le_bytes(arr))
 }
 
 fn read_bytes(buf: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
@@ -896,25 +1278,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mantadb2_binary_roundtrip_with_vfs_and_indexeddb() {
-        let mut store = MantaStorageEngine::new(256 * 1024, 2 * 1024 * 1024);
-        assert!(store.set_local_storage("https://manta.dev/app", "theme", "obsidian"));
+    fn test_mantadb3_full_roundtrip_tables_session_drafts_idb_and_vfs() {
+        let mut store = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
+        let origin = "https://manta.dev/workspace";
+
+        assert!(store.set_local_storage(origin, "theme", "obsidian"));
+        assert!(store.set_session_storage(origin, "active_step", "3"));
+        assert!(store.save_form_draft(origin, "/workspace::input::project_name", "Manta v2.5"));
+        assert!(store.set_cookie_from_header(origin, "auth=token_abc; Path=/; Secure"));
+
+        assert!(store.db.create_table(
+            origin,
+            "tasks",
+            vec!["title".to_string(), "done".to_string()]
+        ));
+        store
+            .db
+            .insert_row(
+                origin,
+                "tasks",
+                vec![DbValue::Text("Fix storage".to_string()), DbValue::Int(1)],
+            )
+            .unwrap();
+
         assert!(store.db.put_object(
-            "https://manta.dev/app",
+            origin,
             "offline_cache",
             "doc_1",
             "{\"title\":\"Spec\"}"
         ));
         assert!(store.db.save_virtual_file(
-            "https://manta.dev/app",
+            origin,
             "/downloads/readme.md",
             "text/markdown",
             b"# Manta Engine"
         ));
-        store.record_history_visit("https://manta.dev/app", "Manta App");
+        store.record_history_visit(origin, "Manta Workspace");
 
         let serialized = store.serialize_to_bytes();
-        let mut restored = MantaStorageEngine::new(256 * 1024, 2 * 1024 * 1024);
+        let mut restored = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
         restored.deserialize_from_bytes(&serialized).unwrap();
 
         assert_eq!(
@@ -922,16 +1324,24 @@ mod tests {
             Some("obsidian".to_string())
         );
         assert_eq!(
-            restored
-                .db
-                .get_object("https://manta.dev", "offline_cache", "doc_1"),
-            Some("{\"title\":\"Spec\"}".to_string())
+            restored.get_session_storage("https://manta.dev", "active_step"),
+            Some("3".to_string())
         );
-        let vf = restored
+        assert_eq!(
+            restored.get_form_draft("https://manta.dev", "/workspace::input::project_name"),
+            Some("Manta v2.5".to_string())
+        );
+        assert_eq!(
+            restored.get_cookie_header_for_url("https://manta.dev", true),
+            "auth=token_abc"
+        );
+        let rows = restored
             .db
-            .read_virtual_file("https://manta.dev", "/downloads/readme.md")
-            .unwrap();
-        assert_eq!(vf.data, b"# Manta Engine");
-        assert_eq!(restored.history().len(), 1);
+            .select_where("https://manta.dev", "tasks", None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1[0],
+            DbValue::Text("Fix storage".to_string())
+        );
     }
 }

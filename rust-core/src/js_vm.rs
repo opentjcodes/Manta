@@ -355,7 +355,7 @@ impl<'a> JsLexer<'a> {
 }
 
 /// Recursive-descent Bytecode Compiler (`JsBytecodeCompiler`) supporting user functions,
-/// control flow, DOM manipulation, Form/Input value bindings, MantaDB, and Virtual Files.
+/// control flow, DOM manipulation, Form/Input value bindings, Cookies, MantaDB, and Virtual Files.
 pub struct JsBytecodeCompiler {
     tokens: Vec<Token>,
     pos: usize,
@@ -423,7 +423,6 @@ impl JsBytecodeCompiler {
                     self.advance();
                 }
 
-                // Jump over function body during top-level execution
                 let skip_jump_idx = self.program.instructions.len();
                 self.program.instructions.push(OpCode::Jump(0));
 
@@ -438,7 +437,6 @@ impl JsBytecodeCompiler {
                 );
 
                 self.compile_statement()?;
-                // Ensure implicit `return undefined` at end of function body
                 let undef_c = self.program.add_const(JsValue::Undefined);
                 self.program.instructions.push(OpCode::LoadConst(undef_c));
                 self.program.instructions.push(OpCode::Return);
@@ -550,7 +548,6 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_assignment(&mut self) -> Result<(), &'static str> {
-        // Support `document.getElementById("id").textContent = expr` AND `.value = expr`
         if let Token::Ident(ref name) = self.peek().clone() {
             if name == "document.getElementById" || name == "document.querySelector" {
                 let saved_pos = self.pos;
@@ -813,8 +810,8 @@ struct CallFrame {
 /// High-Efficiency Bytecode JS Sandbox (`MantaJsSandbox`).
 /// - Compiles JS into compact stack bytecode (`CompiledJsProgram`) with user functions & call frames.
 /// - Fuel-metered execution (prevents infinite loops and CPU/battery drain).
-/// - Bindings to `ZeroCopyDomArena` (including `<input>.value`), `MantaStorageEngine` (`localStorage`,
-///   `sessionStorage`, `MantaDB`, `MantaFS`), `MantaDownloadManager`, and `ClipboardSandbox`.
+/// - Direct bindings to `ZeroCopyDomArena`, `MantaStorageEngine` (`localStorage`, `sessionStorage`,
+///   `document.cookie`, `MantaDB`, `MantaFS`, `MantaForm` drafts), `MantaDownloadManager`, and `ClipboardSandbox`.
 pub struct MantaJsSandbox {
     globals: HashMap<String, JsValue>,
     fuel_remaining: u32,
@@ -829,7 +826,7 @@ impl MantaJsSandbox {
         globals.insert("navigator.cookieEnabled".to_string(), JsValue::Bool(true));
         globals.insert(
             "navigator.userAgent".to_string(),
-            JsValue::Str("Manta/2.0 (Native Rust Core; W3C Standard)".to_string()),
+            JsValue::Str("Manta/2.5 (Native Rust Core; W3C Standard)".to_string()),
         );
         globals.insert("window.isSecureContext".to_string(), JsValue::Bool(true));
 
@@ -935,13 +932,19 @@ impl MantaJsSandbox {
                         .get(*idx as usize)
                         .map(|s| s.as_str())
                         .unwrap_or("");
-                    let val = if name == "document.title" {
-                        JsValue::Str(dom.page_title.clone())
-                    } else {
-                        self.globals
+                    let val = match name {
+                        "document.title" => JsValue::Str(dom.page_title.clone()),
+                        "document.cookie" => {
+                            JsValue::Str(storage.get_cookie_header_for_url(origin_url, false))
+                        }
+                        "window.location.href" | "location.href" => {
+                            JsValue::Str(origin_url.to_string())
+                        }
+                        _ => self
+                            .globals
                             .get(name)
                             .cloned()
-                            .unwrap_or(JsValue::Undefined)
+                            .unwrap_or(JsValue::Undefined),
                     };
                     stack.push(val);
                     pc += 1;
@@ -958,6 +961,8 @@ impl MantaJsSandbox {
                     if let Some(name) = program.identifiers.get(*idx as usize) {
                         if name == "document.title" {
                             dom.page_title = val.as_str();
+                        } else if name == "document.cookie" {
+                            storage.set_cookie_from_header(origin_url, &val.as_str());
                         } else {
                             self.globals.insert(name.clone(), val);
                         }
@@ -1075,9 +1080,8 @@ impl MantaJsSandbox {
                     }
                     args.reverse();
 
-                    // 1. Check if this is a user-defined JS function in the current program
                     if let Some(user_fn) = program.functions.get(fn_name_id) {
-                        if call_frames.len() >= 128 {
+                        if call_frames.len() >= 256 {
                             return Err("JS call stack overflow");
                         }
                         let mut locals = HashMap::with_capacity(user_fn.params.len());
@@ -1093,7 +1097,6 @@ impl MantaJsSandbox {
                         continue;
                     }
 
-                    // 2. Otherwise invoke built-in Manta Host API
                     let fn_name = program
                         .identifiers
                         .get(*fn_name_id as usize)
@@ -1159,8 +1162,11 @@ impl MantaJsSandbox {
             }
             "__dom_set_value_by_id" => {
                 if args.len() >= 2 {
-                    if let Some(nid) = dom.find_by_id(&args[0].as_str()) {
-                        let _ = dom.forms.set_value(nid, &args[1].as_str());
+                    let field_id = args[0].as_str();
+                    let val_str = args[1].as_str();
+                    if let Some(nid) = dom.find_by_id(&field_id) {
+                        let _ = dom.forms.set_value(nid, &val_str);
+                        storage.save_form_draft(origin_url, &field_id, &val_str);
                     }
                     return args[1].clone();
                 }
@@ -1177,8 +1183,11 @@ impl MantaJsSandbox {
             }
             "__dom_set_value_by_sel" => {
                 if args.len() >= 2 {
-                    if let Some(nid) = dom.query_selector(&args[0].as_str()) {
-                        let _ = dom.forms.set_value(nid, &args[1].as_str());
+                    let sel = args[0].as_str();
+                    let val_str = args[1].as_str();
+                    if let Some(nid) = dom.query_selector(&sel) {
+                        let _ = dom.forms.set_value(nid, &val_str);
+                        storage.save_form_draft(origin_url, &sel, &val_str);
                     }
                     return args[1].clone();
                 }
@@ -1241,6 +1250,10 @@ impl MantaJsSandbox {
                 }
                 JsValue::Undefined
             }
+            "localStorage.clear" => {
+                storage.clear_local_storage_only(origin_url);
+                JsValue::Undefined
+            }
             "sessionStorage.setItem" => {
                 if args.len() >= 2 {
                     storage.set_session_storage(origin_url, &args[0].as_str(), &args[1].as_str());
@@ -1256,6 +1269,32 @@ impl MantaJsSandbox {
                 }
                 JsValue::Null
             }
+            "sessionStorage.removeItem" => {
+                if let Some(k) = args.first() {
+                    storage.remove_session_storage(origin_url, &k.as_str());
+                }
+                JsValue::Undefined
+            }
+            "sessionStorage.clear" => {
+                storage.clear_session_storage_only(origin_url);
+                JsValue::Undefined
+            }
+            "MantaForm.saveDraft" => {
+                if args.len() >= 2 {
+                    let ok = storage.save_form_draft(origin_url, &args[0].as_str(), &args[1].as_str());
+                    return JsValue::Bool(ok);
+                }
+                JsValue::Bool(false)
+            }
+            "MantaForm.getDraft" => {
+                if let Some(k) = args.first() {
+                    return match storage.get_form_draft(origin_url, &k.as_str()) {
+                        Some(v) => JsValue::Str(v),
+                        None => JsValue::Null,
+                    };
+                }
+                JsValue::Null
+            }
             "MantaDB.putObject" | "indexedDB.put" => {
                 if args.len() >= 3 {
                     let ok = storage.db.put_object(
@@ -1264,6 +1303,9 @@ impl MantaJsSandbox {
                         &args[1].as_str(),
                         &args[2].as_str(),
                     );
+                    if ok && storage.auto_commit_on_write {
+                        let _ = storage.save_to_backing_file();
+                    }
                     return JsValue::Bool(ok);
                 }
                 JsValue::Bool(false)
@@ -1281,6 +1323,20 @@ impl MantaJsSandbox {
                 }
                 JsValue::Null
             }
+            "MantaDB.deleteObject" | "indexedDB.delete" => {
+                if args.len() >= 2 {
+                    let ok = storage.db.delete_object(
+                        origin_url,
+                        &args[0].as_str(),
+                        &args[1].as_str(),
+                    );
+                    if ok && storage.auto_commit_on_write {
+                        let _ = storage.save_to_backing_file();
+                    }
+                    return JsValue::Bool(ok);
+                }
+                JsValue::Bool(false)
+            }
             "MantaFS.writeFile" => {
                 if args.len() >= 2 {
                     let vpath = args[0].as_str();
@@ -1293,6 +1349,9 @@ impl MantaJsSandbox {
                         storage
                             .db
                             .save_virtual_file(origin_url, &vpath, &mime, content.as_bytes());
+                    if ok && storage.auto_commit_on_write {
+                        let _ = storage.save_to_backing_file();
+                    }
                     return JsValue::Bool(ok);
                 }
                 JsValue::Bool(false)
@@ -1307,7 +1366,11 @@ impl MantaJsSandbox {
             }
             "MantaFS.deleteFile" => {
                 if let Some(p) = args.first() {
-                    return JsValue::Bool(storage.db.delete_virtual_file(origin_url, &p.as_str()));
+                    let ok = storage.db.delete_virtual_file(origin_url, &p.as_str());
+                    if ok && storage.auto_commit_on_write {
+                        let _ = storage.save_to_backing_file();
+                    }
+                    return JsValue::Bool(ok);
                 }
                 JsValue::Bool(false)
             }
@@ -1336,12 +1399,25 @@ impl MantaJsSandbox {
                 }
                 JsValue::Undefined
             }
+            "navigator.clipboard.readText" => JsValue::Str(clipboard.paste_text().to_string()),
             "console.log" | "console.info" | "console.warn" | "console.error" => {
                 if self.console_logs.len() < 64 {
                     let joined: Vec<String> = args.iter().map(|a| a.as_str()).collect();
                     self.console_logs.push(joined.join(" "));
                 }
                 JsValue::Undefined
+            }
+            "parseInt" => {
+                let n = args
+                    .first()
+                    .and_then(|a| a.as_str().trim().parse::<i64>().ok())
+                    .map(|v| v as f64)
+                    .unwrap_or(f64::NAN);
+                JsValue::Number(n)
+            }
+            "parseFloat" => {
+                let n = args.first().map(|a| a.as_number()).unwrap_or(f64::NAN);
+                JsValue::Number(n)
             }
             "Math.max" => {
                 let max_val = args
@@ -1386,7 +1462,7 @@ mod tests {
     use crate::html_tokenizer::StreamingHtmlTokenizer;
 
     #[test]
-    fn test_bytecode_vm_user_functions_inputs_mantadb_and_vfs() {
+    fn test_bytecode_vm_user_functions_inputs_cookies_mantadb_and_vfs() {
         let mut dom = ZeroCopyDomArena::new(64 * 1024);
         let mut tokenizer = StreamingHtmlTokenizer::new();
         tokenizer.feed_chunk(
@@ -1407,6 +1483,7 @@ mod tests {
             let result = multiplyAndAdd(6, 7, 8);
             document.getElementById("status").textContent = "Computed: " + result;
             document.getElementById("email").value = "dev@manta.browser";
+            document.cookie = "session_id=manta_999; Path=/";
             MantaDB.putObject("users", "u1", "{\"email\":\"dev@manta.browser\"}");
             MantaFS.writeFile("/config/profile.json", "{\"active\":true}");
             MantaDownloads.save("export.txt", "Exported result: " + result);
@@ -1427,6 +1504,14 @@ mod tests {
         assert_eq!(
             dom.forms.get_control(email_id).unwrap().value,
             "dev@manta.browser"
+        );
+        assert_eq!(
+            storage.get_form_draft("https://app.manta.dev", "email"),
+            Some("dev@manta.browser".to_string())
+        );
+        assert_eq!(
+            storage.get_cookie_header_for_url("https://app.manta.dev", false),
+            "session_id=manta_999"
         );
         assert_eq!(
             storage
