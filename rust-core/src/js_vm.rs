@@ -82,7 +82,7 @@ impl JsValue {
         if n.is_nan() || n.is_infinite() || n == 0.0 {
             0
         } else {
-            (n.trunc() as i64 as i32)
+            n.trunc() as i64 as i32
         }
     }
 
@@ -113,7 +113,6 @@ impl JsValue {
 pub struct JsParam {
     pub name_id: u16,
     pub default_pc: Option<usize>,
-    pub default_end_pc: Option<usize>,
     pub is_rest: bool,
 }
 
@@ -145,8 +144,8 @@ pub enum OpCode {
     DeleteProp(u16),
     GetIndex,
     SetIndex,
-    DestructureObj { pairs: Vec<(u16, u16, bool)> }, // (prop_id, target_var_id, has_default)
-    DestructureArr { targets: Vec<(u16, bool)> },     // (var_id, is_rest)
+    DestructureObj { pairs: Vec<(u16, u16, bool)> },
+    DestructureArr { targets: Vec<(u16, bool)> },
     Add,
     Sub,
     Mul,
@@ -179,7 +178,6 @@ pub enum OpCode {
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
-    JumpIfNullish(usize),
     PushTry(usize),
     PopTry,
     Throw,
@@ -379,14 +377,12 @@ impl<'a> JsLexer<'a> {
                 }
             }
 
-            // Template literals `` `hello ${expr}` `` with full nested interpolation
             if b == b'`' {
                 self.pos += 1;
                 self.lex_template_literal(tokens);
                 continue;
             }
 
-            // Standard quoted strings '...' / "..."
             if b == b'"' || b == b'\'' {
                 let quote = b;
                 self.pos += 1;
@@ -414,7 +410,6 @@ impl<'a> JsLexer<'a> {
                 continue;
             }
 
-            // RegExp literal `/pattern/flags` vs Division `/`
             if b == b'/' {
                 let is_div = tokens.last().map(|t| t.can_end_expr()).unwrap_or(false);
                 if !is_div {
@@ -450,7 +445,6 @@ impl<'a> JsLexer<'a> {
                 }
             }
 
-            // Numbers (hex, binary, decimal, scientific)
             if b.is_ascii_digit() {
                 let start = self.pos;
                 if b == b'0' && self.pos + 1 < self.bytes.len() {
@@ -498,7 +492,6 @@ impl<'a> JsLexer<'a> {
                 continue;
             }
 
-            // Identifiers & Keywords
             if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
                 let start = self.pos;
                 while self.pos < self.bytes.len()
@@ -797,78 +790,7 @@ impl JsBytecodeCompiler {
             compiler.compile_statement()?;
         }
         compiler.program.instructions.push(OpCode::Halt);
-        compiler.fold_constant_arithmetic();
         Ok(compiler.program)
-    }
-
-    /// Peephole constant folder: folds compile-time numeric/string constants (`LoadConst; LoadConst; Op`)
-    /// into a single `LoadConst`, reducing VM dispatch overhead by up to 4x on static expressions.
-    fn fold_constant_arithmetic(&mut self) {
-        // Safely fold side-effect-free arithmetic pairs when no Jump targets land inside them
-        let mut jump_targets = std::collections::HashSet::new();
-        for op in &self.program.instructions {
-            match *op {
-                OpCode::Jump(t)
-                | OpCode::JumpIfFalse(t)
-                | OpCode::JumpIfTrue(t)
-                | OpCode::JumpIfNullish(t)
-                | OpCode::PushTry(t) => {
-                    jump_targets.insert(t);
-                }
-                _ => {}
-            }
-        }
-        for f in &self.program.functions {
-            jump_targets.insert(f.entry_pc);
-            for p in &f.params {
-                if let Some(d) = p.default_pc {
-                    jump_targets.insert(d);
-                }
-                if let Some(e) = p.default_end_pc {
-                    jump_targets.insert(e);
-                }
-            }
-        }
-
-        let mut i = 0usize;
-        while i + 2 < self.program.instructions.len() {
-            if jump_targets.contains(&(i + 1)) || jump_targets.contains(&(i + 2)) {
-                i += 1;
-                continue;
-            }
-            if let (OpCode::LoadConst(a_id), OpCode::LoadConst(b_id), bin_op) = (
-                self.program.instructions[i].clone(),
-                self.program.instructions[i + 1].clone(),
-                self.program.instructions[i + 2].clone(),
-            ) {
-                let a = self.program.constants[a_id as usize].clone();
-                let b = self.program.constants[b_id as usize].clone();
-                let folded = match (a, b, bin_op) {
-                    (JsValue::Number(x), JsValue::Number(y), OpCode::Add) => {
-                        Some(JsValue::Number(x + y))
-                    }
-                    (JsValue::Number(x), JsValue::Number(y), OpCode::Sub) => {
-                        Some(JsValue::Number(x - y))
-                    }
-                    (JsValue::Number(x), JsValue::Number(y), OpCode::Mul) => {
-                        Some(JsValue::Number(x * y))
-                    }
-                    (JsValue::Number(x), JsValue::Number(y), OpCode::Div) if y != 0.0 => {
-                        Some(JsValue::Number(x / y))
-                    }
-                    (JsValue::Str(x), JsValue::Str(y), OpCode::Add) => {
-                        Some(JsValue::Str(format!("{}{}", x, y)))
-                    }
-                    _ => None,
-                };
-                if let Some(res_val) = folded {
-                    let c_id = self.program.add_const(res_val);
-                    // Replace first two with Jump over or LoadConst + Pop? No: replace [i] = Jump(i+2), [i+2] = LoadConst(c_id) (only if i+2 wasn't target)!
-                    let _ = c_id;
-                }
-            }
-            i += 1;
-        }
     }
 
     fn peek(&self) -> &Token {
@@ -898,8 +820,8 @@ impl JsBytecodeCompiler {
         match self.peek().clone() {
             Token::Eof | Token::RBrace => Ok(()),
             Token::KeywordAsync if self.peek_at(1) == &Token::KeywordFunction => {
-                self.advance(); // async
-                self.advance(); // function
+                self.advance();
+                self.advance();
                 let fn_name = if let Token::Ident(n) = self.peek().clone() {
                     self.advance();
                     Some(n)
@@ -1157,7 +1079,7 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_object_destructure_decl(&mut self) -> Result<(), &'static str> {
-        self.advance(); // '{'
+        self.advance();
         let mut pairs = Vec::new();
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
             let Token::Ident(prop_name) = self.advance() else {
@@ -1201,7 +1123,7 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_array_destructure_decl(&mut self) -> Result<(), &'static str> {
-        self.advance(); // '['
+        self.advance();
         let mut targets = Vec::new();
         while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
             let is_rest = if self.peek() == &Token::Spread {
@@ -1232,7 +1154,7 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_class_declaration(&mut self) -> Result<(), &'static str> {
-        self.advance(); // 'class'
+        self.advance();
         let Token::Ident(class_name) = self.advance() else {
             return Err("Expected class name");
         };
@@ -1297,7 +1219,7 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_for_statement(&mut self) -> Result<(), &'static str> {
-        self.advance(); // 'for'
+        self.advance();
         if self.peek() == &Token::LParen {
             self.advance();
         }
@@ -1570,20 +1492,18 @@ impl JsBytecodeCompiler {
             };
             if let Token::Ident(p) = self.advance() {
                 let name_id = self.program.add_ident(&p);
-                let (default_pc, default_end_pc) = if self.peek() == &Token::Assign {
+                let default_pc = if self.peek() == &Token::Assign {
                     self.advance();
                     let dp = self.program.instructions.len();
                     self.compile_expr()?;
                     self.program.instructions.push(OpCode::Return);
-                    let de = self.program.instructions.len();
-                    (Some(dp), Some(de))
+                    Some(dp)
                 } else {
-                    (None, None)
+                    None
                 };
                 params.push(JsParam {
                     name_id,
                     default_pc,
-                    default_end_pc,
                     is_rest,
                 });
             }
@@ -1729,7 +1649,6 @@ impl JsBytecodeCompiler {
             params.push(JsParam {
                 name_id: self.program.add_ident(&p),
                 default_pc: None,
-                default_end_pc: None,
                 is_rest: false,
             });
         } else if self.peek() == &Token::LParen {
@@ -1743,20 +1662,18 @@ impl JsBytecodeCompiler {
                 };
                 if let Token::Ident(p) = self.advance() {
                     let name_id = self.program.add_ident(&p);
-                    let (default_pc, default_end_pc) = if self.peek() == &Token::Assign {
+                    let default_pc = if self.peek() == &Token::Assign {
                         self.advance();
                         let dp = self.program.instructions.len();
                         self.compile_expr()?;
                         self.program.instructions.push(OpCode::Return);
-                        let de = self.program.instructions.len();
-                        (Some(dp), Some(de))
+                        Some(dp)
                     } else {
-                        (None, None)
+                        None
                     };
                     params.push(JsParam {
                         name_id,
                         default_pc,
-                        default_end_pc,
                         is_rest,
                     });
                 }
@@ -2378,7 +2295,6 @@ struct CallFrame {
     prev_scope: u32,
     try_depth: usize,
     async_promise_oid: Option<u32>,
-    construct_this_oid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -2400,8 +2316,16 @@ struct AsyncSuspension {
 
 #[derive(Debug, Clone)]
 enum Microtask {
-    Callback { cb: JsValue, arg: JsValue },
-    ResumeAsync { susp: AsyncSuspension, val: JsValue, is_err: bool },
+    Callback {
+        cb: JsValue,
+        arg: JsValue,
+        resolve_promise_oid: Option<u32>,
+    },
+    ResumeAsync {
+        susp: AsyncSuspension,
+        val: JsValue,
+        is_err: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2413,16 +2337,12 @@ struct RegexEntry {
 
 #[derive(Debug, Clone)]
 struct PromiseRecord {
-    fulfilled: Option<bool>, // None = pending, Some(true) = fulfilled, Some(false) = rejected
+    fulfilled: Option<bool>,
     value: JsValue,
     then_waiters: Vec<(Option<JsValue>, Option<JsValue>, u32)>,
     async_waiters: Vec<AsyncSuspension>,
 }
 
-/// High-Efficiency Hybrid Rust + C++20/17 JS Engine (`MantaJsSandbox`):
-/// - Lexical closures, `class`/`extends`/`super`/`this`, true `async`/`await` + `Promise`,
-///   destructuring, `...` spread/rest, `RegExp` (via C++ engine), `Map`/`Set`/`TypedArray`
-///   (with C++ SIMD numeric fast-paths), `URL`, `JSON`, `fetch()`, and full live DOM/Storage bindings.
 pub struct MantaJsSandbox {
     scopes: Vec<ScopeFrame>,
     objects: Vec<HashMap<String, JsValue>>,
@@ -2536,10 +2456,6 @@ impl MantaJsSandbox {
             let oid = self.alloc_obj_map(map);
             self.scopes[0].vars.insert(ns.to_string(), JsValue::Object(oid));
         }
-
-        // Attach static methods onto Promise constructor callable? Keep Promise as Object or Callable!
-        // Note: `new Promise(...)` uses Builtin("Promise"), while `Promise.resolve` / `Promise.all`
-        // work via GetProp/CallMethod on JsValue::Fn! Let's handle static methods on JsValue::Fn too!
     }
 
     fn register_builtin_fn(&mut self, global_name: &'static str, id: &'static str) {
@@ -2603,15 +2519,18 @@ impl MantaJsSandbox {
         let then_waiters = std::mem::take(&mut rec.then_waiters);
         let async_waiters = std::mem::take(&mut rec.async_waiters);
 
-        for (on_ok, on_err, _child_oid) in then_waiters {
+        for (on_ok, on_err, child_oid) in then_waiters {
             let cb_opt = if is_fulfilled { on_ok } else { on_err };
             if let Some(cb) = cb_opt {
                 if self.microtasks.len() < 2048 {
                     self.microtasks.push_back(Microtask::Callback {
                         cb,
                         arg: val.clone(),
+                        resolve_promise_oid: Some(child_oid),
                     });
                 }
+            } else {
+                self.settle_promise(child_oid, is_fulfilled, val.clone());
             }
         }
         for susp in async_waiters {
@@ -2728,12 +2647,15 @@ impl MantaJsSandbox {
             }
             tasks_run += 1;
             match task {
-                Microtask::Callback { cb, arg } => {
-                    let _ = self.invoke_callable_val(
+                Microtask::Callback {
+                    cb,
+                    arg,
+                    resolve_promise_oid,
+                } => {
+                    let cb_res = self.invoke_callable_val(
                         &program,
                         &cb,
                         &[arg],
-                        None,
                         None,
                         origin_url,
                         dom,
@@ -2741,6 +2663,12 @@ impl MantaJsSandbox {
                         storage,
                         downloads,
                     );
+                    if let Some(child_oid) = resolve_promise_oid {
+                        match cb_res {
+                            Ok(v) => self.settle_promise(child_oid, true, v),
+                            Err(e) => self.settle_promise(child_oid, false, JsValue::Str(e.to_string())),
+                        }
+                    }
                 }
                 Microtask::ResumeAsync {
                     mut susp,
@@ -2801,7 +2729,6 @@ impl MantaJsSandbox {
         callee: &JsValue,
         args: &[JsValue],
         this_val: Option<JsValue>,
-        construct_this_oid: Option<u32>,
         origin_url: &str,
         dom: &mut ZeroCopyDomArena,
         clipboard: &mut ClipboardSandbox,
@@ -2899,7 +2826,6 @@ impl MantaJsSandbox {
                         prev_scope: 0,
                         try_depth: 0,
                         async_promise_oid: Some(p_oid),
-                        construct_this_oid,
                     };
                     match self.run_vm_loop(
                         program,
@@ -2917,17 +2843,6 @@ impl MantaJsSandbox {
                         Ok(ret_val) => {
                             if let Some(rec) = self.promises.get(&p_oid) {
                                 if rec.fulfilled.is_none() {
-                                    // Synchronous completion of async fn
-                                    if matches!(ret_val, JsValue::Object(_))
-                                        && matches!(
-                                            self.objects
-                                                .get(match ret_val { JsValue::Object(o) => o as usize, _ => 0 })
-                                                .and_then(|m| m.get("__manta_ns")),
-                                            Some(JsValue::Str(ref s)) if s == "promise"
-                                        )
-                                    {
-                                        // Pass through
-                                    }
                                     self.settle_promise(p_oid, true, ret_val);
                                 }
                             }
@@ -3027,7 +2942,7 @@ impl MantaJsSandbox {
                 }
                 OpCode::ArrayPush => {
                     let item = stack.pop().unwrap_or(JsValue::Undefined);
-                    if let Some(JsValue::Array(aid)) = stack.last().copied() {
+                    if let Some(JsValue::Array(aid)) = stack.last().cloned() {
                         if let Some(arr) = self.arrays.get_mut(aid as usize) {
                             arr.push(item);
                         }
@@ -3036,12 +2951,14 @@ impl MantaJsSandbox {
                 }
                 OpCode::ArraySpread => {
                     let spread_val = stack.pop().unwrap_or(JsValue::Undefined);
-                    if let Some(JsValue::Array(dst_id)) = stack.last().copied() {
+                    if let Some(JsValue::Array(dst_id)) = stack.last().cloned() {
                         let extra: Vec<JsValue> = match spread_val {
                             JsValue::Array(src_id) => {
                                 self.arrays.get(src_id as usize).cloned().unwrap_or_default()
                             }
-                            JsValue::Str(s) => s.chars().map(|c| JsValue::Str(c.to_string())).collect(),
+                            JsValue::Str(s) => {
+                                s.chars().map(|c| JsValue::Str(c.to_string())).collect()
+                            }
                             _ => Vec::new(),
                         };
                         if let Some(dst) = self.arrays.get_mut(dst_id as usize) {
@@ -3057,7 +2974,7 @@ impl MantaJsSandbox {
                 }
                 OpCode::ObjectSpread => {
                     let src_val = stack.pop().unwrap_or(JsValue::Undefined);
-                    if let Some(JsValue::Object(dst_oid)) = stack.last().copied() {
+                    if let Some(JsValue::Object(dst_oid)) = stack.last().cloned() {
                         if let JsValue::Object(src_oid) = src_val {
                             if let Some(src_map) = self.objects.get(src_oid as usize).cloned() {
                                 if let Some(dst_map) = self.objects.get_mut(dst_oid as usize) {
@@ -3128,7 +3045,8 @@ impl MantaJsSandbox {
                             .and_then(|m| m.get("prototype"))
                             .cloned()
                         {
-                            self.objects[proto_oid as usize].insert("__proto".to_string(), parent_proto);
+                            self.objects[proto_oid as usize]
+                                .insert("__proto".to_string(), parent_proto);
                         }
                     }
 
@@ -3152,6 +3070,8 @@ impl MantaJsSandbox {
                     pc += 1;
                 }
                 OpCode::DestructureObj { pairs } => {
+                    // Pop `src_obj` FIRST because it was compiled/pushed AFTER default expressions
+                    let src_obj = stack.pop().unwrap_or(JsValue::Undefined);
                     let mut defaults = Vec::with_capacity(pairs.len());
                     for (_, _, has_def) in pairs.iter().rev() {
                         if *has_def {
@@ -3161,14 +3081,14 @@ impl MantaJsSandbox {
                         }
                     }
                     defaults.reverse();
-                    let src_obj = stack.pop().unwrap_or(JsValue::Undefined);
                     for (idx, (prop_id, target_var_id, _)) in pairs.iter().enumerate() {
                         let prop_name = program
                             .identifiers
                             .get(*prop_id as usize)
                             .map(|s| s.as_str())
                             .unwrap_or("");
-                        let mut v = self.get_property(&src_obj, prop_name, origin_url, dom, storage);
+                        let mut v =
+                            self.get_property(&src_obj, prop_name, origin_url, dom, storage);
                         if matches!(v, JsValue::Undefined) {
                             if let Some(Some(ref def_val)) = defaults.get(idx) {
                                 v = def_val.clone();
@@ -3186,7 +3106,9 @@ impl MantaJsSandbox {
                 OpCode::DestructureArr { targets } => {
                     let src = stack.pop().unwrap_or(JsValue::Undefined);
                     let items = match src {
-                        JsValue::Array(aid) => self.arrays.get(aid as usize).cloned().unwrap_or_default(),
+                        JsValue::Array(aid) => {
+                            self.arrays.get(aid as usize).cloned().unwrap_or_default()
+                        }
                         _ => Vec::new(),
                     };
                     for (i, (var_id, is_rest)) in targets.iter().enumerate() {
@@ -3585,14 +3507,6 @@ impl MantaJsSandbox {
                     let cond = stack.pop().unwrap_or(JsValue::Undefined);
                     pc = if cond.is_truthy() { *target } else { pc + 1 };
                 }
-                OpCode::JumpIfNullish(target) => {
-                    let v = stack.last().cloned().unwrap_or(JsValue::Undefined);
-                    pc = if matches!(v, JsValue::Undefined | JsValue::Null) {
-                        *target
-                    } else {
-                        pc + 1
-                    };
-                }
                 OpCode::PushTry(catch_pc) => {
                     try_stack.push(TryHandler {
                         catch_pc: *catch_pc,
@@ -3641,7 +3555,6 @@ impl MantaJsSandbox {
                                     return Err("Unhandled async rejection");
                                 }
                                 None => {
-                                    // Suspend async execution until promise resolves!
                                     rec.async_waiters.push(AsyncSuspension {
                                         pc: pc + 1,
                                         stack,
@@ -3669,7 +3582,6 @@ impl MantaJsSandbox {
                                 &JsValue::Fn(cid),
                                 &args,
                                 None,
-                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -3686,7 +3598,8 @@ impl MantaJsSandbox {
                                 .and_then(|m| m.get("prototype"))
                                 .cloned()
                             {
-                                self.objects[inst_oid as usize].insert("__proto".to_string(), proto_val);
+                                self.objects[inst_oid as usize]
+                                    .insert("__proto".to_string(), proto_val);
                             }
                             if let Some(ctor_fn) = self
                                 .objects
@@ -3694,7 +3607,6 @@ impl MantaJsSandbox {
                                 .and_then(|m| m.get("__ctor"))
                                 .cloned()
                             {
-                                // Bind `super` to parent class if `extends` was used
                                 let parent_cls = self
                                     .objects
                                     .get(c_oid as usize)
@@ -3740,7 +3652,6 @@ impl MantaJsSandbox {
                                         &JsValue::Fn(cid),
                                         &args,
                                         None,
-                                        None,
                                         origin_url,
                                         dom,
                                         clipboard,
@@ -3770,10 +3681,14 @@ impl MantaJsSandbox {
                                         } else {
                                             Vec::new()
                                         };
-                                        vars.insert(pname, JsValue::Array(self.alloc_arr(rest_items)?));
+                                        vars.insert(
+                                            pname,
+                                            JsValue::Array(self.alloc_arr(rest_items)?),
+                                        );
                                         break;
                                     }
-                                    let mut arg_val = args.get(i).cloned().unwrap_or(JsValue::Undefined);
+                                    let mut arg_val =
+                                        args.get(i).cloned().unwrap_or(JsValue::Undefined);
                                     if matches!(arg_val, JsValue::Undefined) {
                                         if let Some(d_pc) = param.default_pc {
                                             arg_val = self.run_vm_loop(
@@ -3803,7 +3718,6 @@ impl MantaJsSandbox {
                                     prev_scope: current_scope,
                                     try_depth: try_stack.len(),
                                     async_promise_oid: None,
-                                    construct_this_oid: None,
                                 });
                                 current_scope = new_scope;
                                 pc = def.entry_pc;
@@ -3811,7 +3725,8 @@ impl MantaJsSandbox {
                             }
                             Some(Callable::Builtin(bname)) => {
                                 let ret = self.invoke_builtin_fn(
-                                    program, bname, &args, origin_url, dom, clipboard, storage, downloads,
+                                    program, bname, &args, origin_url, dom, clipboard, storage,
+                                    downloads,
                                 )?;
                                 stack.push(ret);
                             }
@@ -3905,47 +3820,43 @@ impl MantaJsSandbox {
         let JsValue::Fn(cid) = *ctor_fn else {
             return Ok(JsValue::Object(inst_oid));
         };
-        let Some(Callable::UserClosure { fn_idx, env_scope }) = self.callables.get(cid as usize).cloned() else {
+        let Some(Callable::UserClosure { fn_idx, env_scope }) =
+            self.callables.get(cid as usize).cloned()
+        else {
             return Ok(JsValue::Object(inst_oid));
         };
-        let def = program.functions.get(fn_idx as usize).ok_or("Missing ctor")?.clone();
+        let def = program
+            .functions
+            .get(fn_idx as usize)
+            .ok_or("Missing ctor")?
+            .clone();
         let mut vars = HashMap::with_capacity(def.params.len() + 2);
         vars.insert("this".to_string(), JsValue::Object(inst_oid));
 
         if let Some(JsValue::Object(p_cls_oid)) = parent_class {
-            // Create a `super` wrapper callable bound to `inst_oid`
             if let Some(p_ctor) = self
                 .objects
                 .get(p_cls_oid as usize)
                 .and_then(|m| m.get("__ctor"))
                 .cloned()
             {
-                let gp = self
-                    .objects
-                    .get(p_cls_oid as usize)
-                    .and_then(|m| m.get("__parent_class"))
-                    .cloned();
-                // Install `__super_invoke` shim via scope or direct handling
-                let super_fn_cid = self.callables.len() as u32;
                 if let JsValue::Fn(pcid) = p_ctor {
                     if let Some(Callable::UserClosure {
                         fn_idx: p_fn_idx,
                         env_scope: p_env,
                     }) = self.callables.get(pcid as usize).cloned()
                     {
+                        let super_scope = self.scopes.len() as u32;
+                        let mut sm = HashMap::new();
+                        sm.insert("this".to_string(), JsValue::Object(inst_oid));
+                        self.scopes.push(ScopeFrame {
+                            parent: Some(p_env),
+                            vars: sm,
+                        });
+                        let super_fn_cid = self.callables.len() as u32;
                         self.callables.push(Callable::UserClosure {
                             fn_idx: p_fn_idx,
-                            env_scope: {
-                                let super_scope = self.scopes.len() as u32;
-                                let mut sm = HashMap::new();
-                                sm.insert("this".to_string(), JsValue::Object(inst_oid));
-                                let _ = gp;
-                                self.scopes.push(ScopeFrame {
-                                    parent: Some(p_env),
-                                    vars: sm,
-                                });
-                                super_scope
-                            },
+                            env_scope: super_scope,
                         });
                         vars.insert("super".to_string(), JsValue::Fn(super_fn_cid));
                     }
@@ -4307,6 +4218,7 @@ impl MantaJsSandbox {
                         self.microtasks.push_back(Microtask::Callback {
                             cb,
                             arg: JsValue::Undefined,
+                            resolve_promise_oid: None,
                         });
                     }
                 }
@@ -4389,7 +4301,6 @@ impl MantaJsSandbox {
                         program,
                         &executor,
                         &[JsValue::Fn(res_cid), JsValue::Fn(rej_cid)],
-                        None,
                         None,
                         origin_url,
                         dom,
@@ -4480,7 +4391,10 @@ impl MantaJsSandbox {
                     Ok(outcome) => {
                         let body_text = String::from_utf8_lossy(&body).into_owned();
                         let mut resp_map = HashMap::new();
-                        resp_map.insert("__manta_ns".to_string(), JsValue::Str("fetch_resp".to_string()));
+                        resp_map.insert(
+                            "__manta_ns".to_string(),
+                            JsValue::Str("fetch_resp".to_string()),
+                        );
                         resp_map.insert(
                             "ok".to_string(),
                             JsValue::Bool((200..300).contains(&outcome.status_code)),
@@ -4519,7 +4433,8 @@ impl MantaJsSandbox {
     ) -> Result<JsValue, &'static str> {
         match receiver {
             JsValue::Fn(cid) => {
-                if let Some(Callable::Builtin("Promise")) = self.callables.get(*cid as usize).cloned()
+                if let Some(Callable::Builtin("Promise")) =
+                    self.callables.get(*cid as usize).cloned()
                 {
                     match method {
                         "resolve" => {
@@ -4552,13 +4467,17 @@ impl MantaJsSandbox {
                         }
                         "all" => {
                             if let Some(JsValue::Array(aid)) = args.first() {
-                                let items = self.arrays.get(*aid as usize).cloned().unwrap_or_default();
+                                let items =
+                                    self.arrays.get(*aid as usize).cloned().unwrap_or_default();
                                 let mut results = Vec::with_capacity(items.len());
                                 for it in items {
                                     if let JsValue::Object(poid) = it {
                                         if let Some(rec) = self.promises.get(&poid) {
                                             if rec.fulfilled == Some(false) {
-                                                let rej = self.alloc_promise(Some(false), rec.value.clone())?;
+                                                let rej = self.alloc_promise(
+                                                    Some(false),
+                                                    rec.value.clone(),
+                                                )?;
                                                 return Ok(JsValue::Object(rej));
                                             }
                                             results.push(rec.value.clone());
@@ -4583,7 +4502,11 @@ impl MantaJsSandbox {
                     return Ok(JsValue::Null);
                 };
                 let is_global = entry.flags.contains('g');
-                let start_pos = if is_global { entry.last_index.min(text.len()) } else { 0 };
+                let start_pos = if is_global {
+                    entry.last_index.min(text.len())
+                } else {
+                    0
+                };
                 match method {
                     "test" => {
                         let matched = regex_find(&entry.pattern, &entry.flags, &text, start_pos);
@@ -4600,7 +4523,8 @@ impl MantaJsSandbox {
                         }
                     }
                     "exec" => {
-                        if let Some((s, e)) = regex_find(&entry.pattern, &entry.flags, &text, start_pos)
+                        if let Some((s, e)) =
+                            regex_find(&entry.pattern, &entry.flags, &text, start_pos)
                         {
                             if is_global {
                                 self.regexes[*rid as usize].last_index = e;
@@ -4712,13 +4636,16 @@ impl MantaJsSandbox {
                     }
                     let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let mut acc = args.get(1).cloned().unwrap_or(JsValue::Number(0.0));
-                    let items = self.typed_arrays.get(*tid as usize).cloned().unwrap_or_default();
+                    let items = self
+                        .typed_arrays
+                        .get(*tid as usize)
+                        .cloned()
+                        .unwrap_or_default();
                     for (i, n) in items.into_iter().enumerate() {
                         acc = self.invoke_callable_val(
                             program,
                             &cb,
                             &[acc, JsValue::Number(n), JsValue::Number(i as f64)],
-                            None,
                             None,
                             origin_url,
                             dom,
@@ -4764,7 +4691,10 @@ impl MantaJsSandbox {
                 }
                 "indexOf" => {
                     let sub = args.first().map(|a| a.as_str()).unwrap_or_default();
-                    let from = args.get(1).map(|a| a.as_number().max(0.0) as usize).unwrap_or(0);
+                    let from = args
+                        .get(1)
+                        .map(|a| a.as_number().max(0.0) as usize)
+                        .unwrap_or(0);
                     Ok(JsValue::Number(
                         find_substr(s, &sub, from).map(|i| i as f64).unwrap_or(-1.0),
                     ))
@@ -4791,7 +4721,9 @@ impl MantaJsSandbox {
                                 let mut out = Vec::new();
                                 let mut pos = 0usize;
                                 while pos <= s.len() {
-                                    if let Some((st, en)) = regex_find(&r.pattern, &r.flags, s, pos) {
+                                    if let Some((st, en)) =
+                                        regex_find(&r.pattern, &r.flags, s, pos)
+                                    {
                                         out.push(JsValue::Str(s[st..en].to_string()));
                                         pos = if en == st { st + 1 } else { en };
                                     } else {
@@ -4919,7 +4851,8 @@ impl MantaJsSandbox {
                             .first()
                             .map(|a| a.as_str())
                             .unwrap_or_else(|| ",".to_string());
-                        let joined: Vec<String> = items_snapshot.iter().map(|v| v.as_str()).collect();
+                        let joined: Vec<String> =
+                            items_snapshot.iter().map(|v| v.as_str()).collect();
                         Ok(JsValue::Str(joined.join(&sep)))
                     }
                     "includes" => {
@@ -4958,10 +4891,25 @@ impl MantaJsSandbox {
                     "slice" => {
                         let len = items_snapshot.len();
                         let s = args.first().map(|a| a.as_number() as isize).unwrap_or(0);
-                        let e = args.get(1).map(|a| a.as_number() as isize).unwrap_or(len as isize);
-                        let st = if s < 0 { (len as isize + s).max(0) as usize } else { (s as usize).min(len) };
-                        let en = if e < 0 { (len as isize + e).max(0) as usize } else { (e as usize).min(len) };
-                        let sliced = if st < en { items_snapshot[st..en].to_vec() } else { Vec::new() };
+                        let e = args
+                            .get(1)
+                            .map(|a| a.as_number() as isize)
+                            .unwrap_or(len as isize);
+                        let st = if s < 0 {
+                            (len as isize + s).max(0) as usize
+                        } else {
+                            (s as usize).min(len)
+                        };
+                        let en = if e < 0 {
+                            (len as isize + e).max(0) as usize
+                        } else {
+                            (e as usize).min(len)
+                        };
+                        let sliced = if st < en {
+                            items_snapshot[st..en].to_vec()
+                        } else {
+                            Vec::new()
+                        };
                         Ok(JsValue::Array(self.alloc_arr(sliced)?))
                     }
                     "map" => {
@@ -4972,7 +4920,6 @@ impl MantaJsSandbox {
                                 program,
                                 &cb,
                                 &[item, JsValue::Number(idx as f64)],
-                                None,
                                 None,
                                 origin_url,
                                 dom,
@@ -4992,7 +4939,6 @@ impl MantaJsSandbox {
                                 program,
                                 &cb,
                                 &[item.clone(), JsValue::Number(idx as f64)],
-                                None,
                                 None,
                                 origin_url,
                                 dom,
@@ -5020,7 +4966,6 @@ impl MantaJsSandbox {
                                 &cb,
                                 &[acc, item, JsValue::Number(idx as f64)],
                                 None,
-                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -5038,7 +4983,6 @@ impl MantaJsSandbox {
                                     program,
                                     &cb,
                                     &[item, JsValue::Number(idx as f64)],
-                                    None,
                                     None,
                                     origin_url,
                                     dom,
@@ -5062,7 +5006,6 @@ impl MantaJsSandbox {
                                     &cb,
                                     &[item, JsValue::Number(idx as f64)],
                                     None,
-                                    None,
                                     origin_url,
                                     dom,
                                     clipboard,
@@ -5084,7 +5027,6 @@ impl MantaJsSandbox {
                                 &cb,
                                 &[item, JsValue::Number(idx as f64)],
                                 None,
-                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -5101,7 +5043,6 @@ impl MantaJsSandbox {
                                 program,
                                 &cb,
                                 &[item.clone(), JsValue::Number(idx as f64)],
-                                None,
                                 None,
                                 origin_url,
                                 dom,
@@ -5180,7 +5121,6 @@ impl MantaJsSandbox {
                                         program,
                                         &JsValue::Fn(cid),
                                         &[JsValue::DomNode(*nid)],
-                                        None,
                                         None,
                                         origin_url,
                                         dom,
@@ -5341,13 +5281,25 @@ impl MantaJsSandbox {
                                 Some(true) => {
                                     let val = rec.value.clone();
                                     if let Some(cb) = on_ok {
-                                        self.microtasks.push_back(Microtask::Callback { cb, arg: val });
+                                        self.microtasks.push_back(Microtask::Callback {
+                                            cb,
+                                            arg: val,
+                                            resolve_promise_oid: Some(child_oid),
+                                        });
+                                    } else {
+                                        self.settle_promise(child_oid, true, val);
                                     }
                                 }
                                 Some(false) => {
                                     let err = rec.value.clone();
                                     if let Some(cb) = on_err {
-                                        self.microtasks.push_back(Microtask::Callback { cb, arg: err });
+                                        self.microtasks.push_back(Microtask::Callback {
+                                            cb,
+                                            arg: err,
+                                            resolve_promise_oid: Some(child_oid),
+                                        });
+                                    } else {
+                                        self.settle_promise(child_oid, false, err);
                                     }
                                 }
                                 None => {
@@ -5389,7 +5341,11 @@ impl MantaJsSandbox {
                     }
                     ("localStorage", "setItem") => {
                         if args.len() >= 2 {
-                            storage.set_local_storage(origin_url, &args[0].as_str(), &args[1].as_str());
+                            storage.set_local_storage(
+                                origin_url,
+                                &args[0].as_str(),
+                                &args[1].as_str(),
+                            );
                         }
                         Ok(JsValue::Undefined)
                     }
@@ -5510,7 +5466,9 @@ impl MantaJsSandbox {
                     }
                     ("MantaFS", "readFile") => {
                         if let Some(p) = args.first() {
-                            if let Some(entry) = storage.db.read_virtual_file(origin_url, &p.as_str()) {
+                            if let Some(entry) =
+                                storage.db.read_virtual_file(origin_url, &p.as_str())
+                            {
                                 return Ok(JsValue::Str(
                                     String::from_utf8_lossy(&entry.data).into_owned(),
                                 ));
@@ -5541,7 +5499,9 @@ impl MantaJsSandbox {
                         }
                         Ok(JsValue::Undefined)
                     }
-                    ("clipboard", "readText") => Ok(JsValue::Str(clipboard.paste_text().to_string())),
+                    ("clipboard", "readText") => {
+                        Ok(JsValue::Str(clipboard.paste_text().to_string()))
+                    }
                     ("console", "log" | "info" | "warn" | "error") => {
                         if self.console_logs.len() < 64 {
                             let joined: Vec<String> = args.iter().map(|a| a.as_str()).collect();
@@ -5592,25 +5552,26 @@ impl MantaJsSandbox {
                     }
                     ("Object", "keys" | "values" | "entries") => {
                         if let Some(JsValue::Object(target_oid)) = args.first() {
-                            let items: Vec<JsValue> = match self.objects.get(*target_oid as usize) {
-                                Some(m) => {
-                                    let mut vec = Vec::new();
-                                    for (k, v) in m {
-                                        if k.starts_with("__") {
-                                            continue;
-                                        }
-                                        match method {
-                                            "keys" => vec.push(JsValue::Str(k.clone())),
-                                            "values" => vec.push(v.clone()),
-                                            _ => vec.push(JsValue::Array(
-                                                self.alloc_arr(vec![JsValue::Str(k.clone()), v.clone()])?,
-                                            )),
-                                        }
-                                    }
-                                    vec
+                            let entries: Vec<(String, JsValue)> = self
+                                .objects
+                                .get(*target_oid as usize)
+                                .map(|m| {
+                                    m.iter()
+                                        .filter(|(k, _)| !k.starts_with("__"))
+                                        .map(|(k, v)| (k.clone(), v.clone()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let mut items = Vec::with_capacity(entries.len());
+                            for (k, v) in entries {
+                                match method {
+                                    "keys" => items.push(JsValue::Str(k)),
+                                    "values" => items.push(v),
+                                    _ => items.push(JsValue::Array(
+                                        self.alloc_arr(vec![JsValue::Str(k), v])?,
+                                    )),
                                 }
-                                None => Vec::new(),
-                            };
+                            }
                             return Ok(JsValue::Array(self.alloc_arr(items)?));
                         }
                         Ok(JsValue::Array(self.alloc_arr(Vec::new())?))
@@ -5619,7 +5580,8 @@ impl MantaJsSandbox {
                         if let Some(JsValue::Object(dst_oid)) = args.first().cloned() {
                             for src in &args[1..] {
                                 if let JsValue::Object(src_oid) = src {
-                                    if let Some(src_map) = self.objects.get(*src_oid as usize).cloned()
+                                    if let Some(src_map) =
+                                        self.objects.get(*src_oid as usize).cloned()
                                     {
                                         if let Some(dst_map) = self.objects.get_mut(dst_oid as usize)
                                         {
@@ -5642,7 +5604,8 @@ impl MantaJsSandbox {
                     ))),
                     ("Array", "from") => match args.first() {
                         Some(JsValue::Array(aid)) => {
-                            let items = self.arrays.get(*aid as usize).cloned().unwrap_or_default();
+                            let items =
+                                self.arrays.get(*aid as usize).cloned().unwrap_or_default();
                             Ok(JsValue::Array(self.alloc_arr(items)?))
                         }
                         Some(JsValue::Set(sid)) => {
@@ -5650,7 +5613,8 @@ impl MantaJsSandbox {
                             Ok(JsValue::Array(self.alloc_arr(items)?))
                         }
                         Some(JsValue::Str(s)) => {
-                            let items: Vec<JsValue> = s.chars().map(|c| JsValue::Str(c.to_string())).collect();
+                            let items: Vec<JsValue> =
+                                s.chars().map(|c| JsValue::Str(c.to_string())).collect();
                             Ok(JsValue::Array(self.alloc_arr(items)?))
                         }
                         _ => Ok(JsValue::Array(self.alloc_arr(Vec::new())?)),
@@ -5670,7 +5634,6 @@ impl MantaJsSandbox {
                                 &fn_val,
                                 args,
                                 Some(JsValue::Object(*oid)),
-                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -5713,7 +5676,11 @@ impl MantaJsSandbox {
                 let mut pairs = Vec::new();
                 for (k, v) in map {
                     if !k.starts_with("__") {
-                        pairs.push(format!("\"{}\":{}", escape_json_str(k), self.json_stringify(v)));
+                        pairs.push(format!(
+                            "\"{}\":{}",
+                            escape_json_str(k),
+                            self.json_stringify(v)
+                        ));
                     }
                 }
                 format!("{{{}}}", pairs.join(","))
@@ -6040,12 +6007,10 @@ mod tests {
             const [first, ...rest] = [10, 20, 30];
             const spreadArr = [...rest, 40];
 
-            // C++ SIMD RegExp & TypedArray fast math
             let reOk = /manta\d+/i.test("Powered by MANTA3000!");
             let nums = new Float64Array([1.5, 2.5, 3.0, 3.0]);
             let vecSum = nums.sum();
 
-            // True async / await
             let asyncRes = 0;
             async function computeAsync(base) {
                 let added = await Promise.resolve(15);
@@ -6062,7 +6027,7 @@ mod tests {
             for (let v of arr) {
                 sum += v;
             }
-            let result = times6(7) + sum - 2; // 50
+            let result = times6(7) + sum - 2;
 
             let caught = "";
             try { throw "boom"; } catch (e) { caught = e; }
@@ -6094,11 +6059,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(vm.get_global("result"), Some(&JsValue::Number(50.0)));
-        assert_eq!(vm.get_global("caught"), Some(&JsValue::Str("boom".to_string())));
+        assert_eq!(
+            vm.get_global("caught"),
+            Some(&JsValue::Str("boom".to_string()))
+        );
         assert_eq!(vm.get_global("clicked"), Some(&JsValue::Number(1.0)));
         assert_eq!(vm.get_global("asyncVal"), Some(&JsValue::Number(99.0)));
         assert_eq!(vm.get_global("asyncRes"), Some(&JsValue::Number(50.0)));
-        assert_eq!(vm.get_global("clsOut"), Some(&JsValue::Str("[Manta] v3".to_string())));
+        assert_eq!(
+            vm.get_global("clsOut"),
+            Some(&JsValue::Str("[Manta] v3".to_string()))
+        );
         assert_eq!(vm.get_global("ver"), Some(&JsValue::Number(3.0)));
         assert_eq!(vm.get_global("missing"), Some(&JsValue::Number(10.0)));
         assert_eq!(vm.get_global("first"), Some(&JsValue::Number(10.0)));
