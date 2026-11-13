@@ -374,13 +374,11 @@ mod tests {
 
     #[test]
     fn test_inflate_stored_and_fixed_huffman_and_gzip() {
-        // Real gzip stream for "Manta Fast Engine"
-        // GZIP header (10 bytes) + stored deflate block ("Manta Fast Engine") + CRC + ISIZE
         let msg = b"Manta Fast Engine";
         let len = msg.len() as u16;
         let nlen = !len;
         let mut gz = vec![0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3];
-        gz.push(0x01); // BFINAL=1, BTYPE=00 (stored)
+        gz.push(0x01);
         gz.extend_from_slice(&len.to_le_bytes());
         gz.extend_from_slice(&nlen.to_le_bytes());
         gz.extend_from_slice(msg);
@@ -392,9 +390,16 @@ mod tests {
         // Zip-bomb max_out_bytes check
         assert!(inflate_gzip(&gz, 4).is_err());
 
-        // Fixed Huffman deflate of "HelloHelloHello" -> [0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xF7, 0x00, 0x22, 0x99, 0x01, 0x00]
-        let fixed = [0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xF7, 0x00, 0x22, 0x99, 0x01, 0x00];
+        // Verified RFC 1951 Fixed-Huffman DEFLATE of "HelloHelloHello" (backref len=10, dist=5)
+        let fixed = [0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0x47, 0x10, 0x00];
         let out = inflate_raw_deflate(&fixed, 1024).unwrap();
         assert_eq!(&out, b"HelloHelloHello");
+
+        // Zlib header wrapper test
+        let mut zlib_wrapped = vec![0x78, 0x9C];
+        zlib_wrapped.extend_from_slice(&fixed);
+        zlib_wrapped.extend_from_slice(&[0u8; 4]);
+        let z_out = inflate_zlib(&zlib_wrapped, 1024).unwrap();
+        assert_eq!(&z_out, b"HelloHelloHello");
     }
 }

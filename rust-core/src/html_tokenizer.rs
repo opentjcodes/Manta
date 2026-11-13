@@ -38,7 +38,7 @@ enum LexState {
 
 /// High-Speed Streaming HTML5 Tokenizer with C++ SIMD Delimiter Scanning:
 /// - Jumps across plain text runs via SSE2/NEON `manta_cpp_scan_html_delim`.
-/// - Zero-allocation `RawText` closing tag matching for `<script>`, `<style>`, `<textarea>`, `<title>`.
+/// - Zero-allocation closing tag matching for RAWTEXT (`<script>`, `<style>`) and RCDATA (`<title>`, `<textarea>`).
 /// - Strict `<!-- ... -->` comment parsing (`>` inside comments never leaks markup).
 /// - Comprehensive HTML5 + Windows-1252 named/decimal/hex character entity decoding.
 pub struct StreamingHtmlTokenizer {
@@ -51,6 +51,7 @@ pub struct StreamingHtmlTokenizer {
     current_attr_val: String,
     text_buf: String,
     rawtext_end_tag: String,
+    rawtext_decode_entities: bool,
     utf8_carry: Vec<u8>,
 }
 
@@ -72,6 +73,7 @@ impl StreamingHtmlTokenizer {
             current_attr_val: String::with_capacity(32),
             text_buf: String::with_capacity(128),
             rawtext_end_tag: String::new(),
+            rawtext_decode_entities: false,
             utf8_carry: Vec::with_capacity(4),
         }
     }
@@ -91,7 +93,6 @@ impl StreamingHtmlTokenizer {
         self.rawtext_end_tag.shrink_to_fit();
     }
 
-    /// Feeds a byte chunk from the network stream and emits parsed tokens immediately.
     pub fn feed_chunk<F>(&mut self, chunk: &[u8], is_eof: bool, mut on_token: F)
     where
         F: FnMut(HtmlToken),
@@ -121,7 +122,6 @@ impl StreamingHtmlTokenizer {
         let mut byte_idx = 0usize;
 
         while byte_idx < raw_bytes.len() {
-            // Fast path: SIMD skip straight to next '<' in Data state
             if self.state == LexState::Data {
                 let mut scan_pos = byte_idx;
                 loop {
@@ -140,7 +140,6 @@ impl StreamingHtmlTokenizer {
                         byte_idx = next_delim + 1;
                         break;
                     }
-                    // Found '&': advance past '&' and keep SIMD scanning
                     scan_pos = next_delim + 1;
                 }
                 continue;
@@ -155,12 +154,20 @@ impl StreamingHtmlTokenizer {
                 LexState::RawText => {
                     self.text_buf.push(ch);
                     if b == b'>' {
-                        if let Some(tag_start) = match_rawtext_close(&self.text_buf, &self.rawtext_end_tag) {
+                        if let Some(tag_start) =
+                            match_rawtext_close(&self.text_buf, &self.rawtext_end_tag)
+                        {
                             let content = self.text_buf[..tag_start].to_string();
                             self.text_buf.clear();
                             if !content.trim().is_empty() {
-                                on_token(HtmlToken::Text(content));
+                                let final_txt = if self.rawtext_decode_entities {
+                                    decode_html_entities(&content)
+                                } else {
+                                    content
+                                };
+                                on_token(HtmlToken::Text(final_txt));
                             }
+                            self.rawtext_decode_entities = false;
                             let end_name = std::mem::take(&mut self.rawtext_end_tag);
                             on_token(HtmlToken::EndTag { name: end_name });
                             self.state = LexState::Data;
@@ -220,12 +227,10 @@ impl StreamingHtmlTokenizer {
                     }
                 }
                 LexState::CommentEndDash2 => {
-                    if b == b'>' || b == b'!' {
-                        if b == b'>' {
-                            self.state = LexState::Data;
-                        }
-                    } else if b == b'-' {
-                        // Stay in CommentEndDash2 for `--->`
+                    if b == b'>' {
+                        self.state = LexState::Data;
+                    } else if b == b'!' || b == b'-' {
+                        // Stay in CommentEndDash2 for `--!>` or `--->`
                     } else {
                         self.state = LexState::CommentBody;
                     }
@@ -392,17 +397,19 @@ impl StreamingHtmlTokenizer {
                     | "track"
                     | "wbr"
             );
-            let is_rawtext = !self.current_self_closing
-                && (name == "script" || name == "style" || name == "textarea" || name == "title");
-            if is_rawtext {
+            let is_rawtext_tag = name == "script" || name == "style";
+            let is_rcdata_tag = name == "textarea" || name == "title";
+            let is_raw_mode = !self.current_self_closing && (is_rawtext_tag || is_rcdata_tag);
+            if is_raw_mode {
                 self.rawtext_end_tag = name.clone();
+                self.rawtext_decode_entities = is_rcdata_tag;
             }
             on_token(HtmlToken::StartTag {
                 name,
                 attributes: std::mem::take(&mut self.current_attrs),
                 self_closing: self.current_self_closing || is_void,
             });
-            self.state = if is_rawtext {
+            self.state = if is_raw_mode {
                 LexState::RawText
             } else {
                 LexState::Data
@@ -425,7 +432,6 @@ impl StreamingHtmlTokenizer {
     }
 }
 
-/// Zero-allocation check for closing rawtext tag (`</script>`, `</style>`, `</textarea>`, `</title>`).
 fn match_rawtext_close(buf: &str, tag_name: &str) -> Option<usize> {
     let bytes = buf.as_bytes();
     if bytes.is_empty() || bytes[bytes.len() - 1] != b'>' {
