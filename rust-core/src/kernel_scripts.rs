@@ -3,17 +3,16 @@ use crate::storage_engine::MantaStorageEngine;
 
 /// **High-Level Custom Kernel Scripts Engine (`kernel_scripts.rs`)**:
 ///
-/// Generates ultra-fast, zero-bloat JavaScript kernel modules injected at `document-start`
-/// to achieve:
-/// 1. **Zero Data Loss Persistence Kernel**: Hydrates and write-through syncs `localStorage`,
-///    `sessionStorage`, `document.cookie`, `indexedDB` object stores, and live user `<input>` /
-///    `<textarea>` / `<select>` / `[contenteditable]` form drafts directly into `MantaStorageEngine`.
-/// 2. **Faster-Than-Chrome Execution Kernel**:
-///    - Promotes scroll-blocking `touchstart`, `touchmove`, `wheel`, and `mousewheel` listeners
-///      to `{ passive: true }` by default for 120 FPS lock-free scrolling.
-///    - Coalesces `ResizeObserver` and `requestIdleCallback` tasks to prevent layout thrashing.
-///    - Speculatively pre-warms DNS/TCP connections on link hover / touchstart (`~200ms` head-start).
-///    - Injects GPU compositing and `content-visibility` layout acceleration for large DOM trees.
+/// Injects lightweight `document-start` kernel hooks delivering:
+/// 1. **Zero Data Loss Persistence Kernel**: Write-through `localStorage`, volatile-only `sessionStorage`,
+///    `document.cookie`, `indexedDB`, and live form drafts (`MantaStorageEngine` encrypted WAL).
+/// 2. **CPU/GPU Saver & Background Tab Throttler**:
+///    - Coalesces and throttles `requestAnimationFrame` on hidden/background tabs (`document.hidden`)
+///      so inactive tabs burn near-zero CPU & GPU battery.
+///    - Promotes scroll-blocking touch/wheel listeners to `{ passive: true }` for lock-free scrolling.
+///    - Enables `content-visibility: auto` containment on large offscreen containers.
+///    - Pre-warms DNS/TCP on link hover/touchstart.
+///    - Tunes HTML5 `<video>` / `<audio>` buffer preload & low-latency MSE hints.
 pub struct MantaKernelScripts;
 
 impl MantaKernelScripts {
@@ -29,14 +28,15 @@ impl MantaKernelScripts {
         let drafts_json = storage.export_origin_form_drafts_json(origin_url);
 
         let passive_enabled = settings.kernel_passive_events;
-        let preconnect_enabled = settings.dns_preconnect_enabled && settings.kernel_speculative_preconnect;
+        let preconnect_enabled =
+            settings.dns_preconnect_enabled && settings.kernel_speculative_preconnect;
         let auto_save_forms = settings.auto_save_form_inputs;
         let layout_accel = settings.kernel_layout_accelerator;
 
         format!(
             r#"(function() {{
-    if (window.__mantaKernelV25) return;
-    window.__mantaKernelV25 = true;
+    if (window.__mantaKernelV30) return;
+    window.__mantaKernelV30 = true;
 
     const MANTA_LOCAL_INIT = {local_json};
     const MANTA_SESSION_INIT = {session_json};
@@ -44,9 +44,7 @@ impl MantaKernelScripts {
     const MANTA_IDB_INIT = {idb_json};
     const MANTA_FORM_DRAFTS = {drafts_json};
 
-    /* =====================================================================
-     * 1. TRANSACTIONAL STORAGE KERNEL (localStorage, sessionStorage, Cookie)
-     * ===================================================================== */
+    /* 1. TRANSACTIONAL STORAGE KERNEL */
     try {{
         const origSetItem = Storage.prototype.setItem;
         const origRemoveItem = Storage.prototype.removeItem;
@@ -136,9 +134,7 @@ impl MantaKernelScripts {
         }}
     }} catch (_) {{}}
 
-    /* =====================================================================
-     * 2. WRITE-THROUGH INDEXEDDB PERSISTENCE KERNEL
-     * ===================================================================== */
+    /* 2. WRITE-THROUGH INDEXEDDB PERSISTENCE KERNEL */
     try {{
         window.__mantaIdbMirror = MANTA_IDB_INIT || {{}};
         if (typeof IDBObjectStore !== 'undefined') {{
@@ -183,9 +179,7 @@ impl MantaKernelScripts {
         }}
     }} catch (_) {{}}
 
-    /* =====================================================================
-     * 3. LIVE FORM & USER INPUT AUTO-PERSISTENCE KERNEL
-     * ===================================================================== */
+    /* 3. LIVE FORM & INPUT AUTO-PERSISTENCE KERNEL */
     if ({auto_save_forms}) {{
         try {{
             const computeFieldKey = function(el) {{
@@ -264,9 +258,7 @@ impl MantaKernelScripts {
         }} catch (_) {{}}
     }}
 
-    /* =====================================================================
-     * 4. FASTER-THAN-CHROME PASSIVE EVENT & SPECULATIVE PREWARM KERNEL
-     * ===================================================================== */
+    /* 4. PASSIVE EVENT PROMOTION & LOW-LATENCY VIDEO / CPU-GPU THROTTLING */
     if ({passive_enabled}) {{
         try {{
             const origAddEventListener = EventTarget.prototype.addEventListener;
@@ -318,6 +310,29 @@ impl MantaKernelScripts {
 
     if ({layout_accel}) {{
         try {{
+            /* Throttle requestAnimationFrame on background tabs to cut CPU/GPU drain */
+            if (typeof window.requestAnimationFrame === 'function') {{
+                const origRaf = window.requestAnimationFrame;
+                window.requestAnimationFrame = function(cb) {{
+                    if (document.hidden) {{
+                        return setTimeout(function() {{
+                            origRaf.call(window, cb);
+                        }}, 250);
+                    }}
+                    return origRaf.call(window, cb);
+                }};
+            }}
+            /* Fast low-latency video playback hints without permanent disk buffering */
+            document.addEventListener('play', function(ev) {{
+                const media = ev.target;
+                if (media && (media.tagName === 'VIDEO' || media.tagName === 'AUDIO')) {{
+                    try {{
+                        media.playsInline = true;
+                        if (media.preload === 'none') media.preload = 'metadata';
+                    }} catch (_) {{}}
+                }}
+            }}, true);
+
             if (!window.requestIdleCallback) {{
                 window.requestIdleCallback = function(cb) {{
                     const start = Date.now();
@@ -365,7 +380,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_kernel_script_hydrates_storage_idb_cookies_and_form_drafts() {
+    fn test_kernel_script_hydrates_storage_and_throttles_background_raf() {
         let mut storage = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
         let settings = MantaSettings::default();
         let origin = "https://app.example.com";
@@ -381,6 +396,6 @@ mod tests {
         assert!(kernel_js.contains("\"step\":\"2\""));
         assert!(kernel_js.contains("sid=xyz987"));
         assert!(kernel_js.contains("user@manta.dev"));
-        assert!(kernel_js.contains("IDBObjectStore.prototype.put"));
+        assert!(kernel_js.contains("document.hidden"));
     }
 }

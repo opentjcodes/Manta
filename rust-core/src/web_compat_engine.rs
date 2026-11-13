@@ -1,15 +1,14 @@
 /// **99% Modern Web Compatibility Engine (`web_compat_engine.rs`)**:
 ///
-/// Ensures modern Single-Page Applications (React 19, Next.js, Vue, Angular, Svelte,
-/// YouTube, X/Twitter, Reddit, GitHub, Figma, Shopify, Banking portals) run without
-/// missing-API crashes or false bot-blocks:
+/// Ensures modern Single-Page Applications, streaming video sites, and complex web apps
+/// run cleanly without missing-API crashes or false automation blocks:
 /// - **ES2024 / WHATWG Web API Completeness**: `Promise.withResolvers`, `Object.groupBy`,
 ///   `Map.groupBy`, `URL.canParse`, `structuredClone`, `crypto.randomUUID`,
 ///   `Array.prototype.toSorted/toReversed/toSpliced/with/at`.
 /// - **Navigator Client Hints & Capabilities**: `navigator.userAgentData`, `navigator.locks`,
-///   `navigator.storage.estimate/persist`, `BroadcastChannel`, `window.chrome` compatibility object.
-/// - **SPA History Router Bridge**: Hooks `history.pushState` and `history.replaceState` so dynamic
-///   route changes preserve scroll and form state without full page reloads.
+///   `navigator.storage.estimate/persist`, `BroadcastChannel`, `window.chrome` object.
+/// - **SPA History Router & Media Capabilities Shims**: `history.pushState`/`replaceState`
+///   and `navigator.mediaCapabilities.decodingInfo` fast hardware codec hints.
 pub struct WebCompatEngine;
 
 impl WebCompatEngine {
@@ -33,7 +32,7 @@ impl WebCompatEngine {
         }
     } catch (_) {}
 
-    /* 1. Standard window.chrome & navigator.userAgentData Client Hints for 99% site checks */
+    /* 1. Standard window.chrome, Client Hints & MediaCapabilities */
     try {
         if (!window.chrome) {
             window.chrome = {
@@ -69,15 +68,25 @@ impl WebCompatEngine {
                     return { brands: this.brands, mobile: this.mobile, platform: this.platform };
                 }
             };
-            Object.defineProperty( Object.getPrototypeOf(navigator), 'userAgentData', {
+            Object.defineProperty(Object.getPrototypeOf(navigator), 'userAgentData', {
                 get: function() { return uaData; },
                 configurable: true,
                 enumerable: true
             });
         }
+        if (!navigator.mediaCapabilities) {
+            navigator.mediaCapabilities = {
+                decodingInfo: function() {
+                    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true });
+                },
+                encodingInfo: function() {
+                    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true });
+                }
+            };
+        }
     } catch (_) {}
 
-    /* 2. ES2024 & WHATWG Standards Polyfills (Promise.withResolvers, Object.groupBy, URL.canParse, etc.) */
+    /* 2. ES2024 & WHATWG Standards Polyfills */
     try {
         if (typeof Promise.withResolvers !== 'function') {
             Promise.withResolvers = function() {
@@ -135,11 +144,25 @@ impl WebCompatEngine {
         if (!Array.prototype.toReversed) {
             Array.prototype.toReversed = function() { return Array.from(this).reverse(); };
         }
+        if (!Array.prototype.toSpliced) {
+            Array.prototype.toSpliced = function(start, deleteCount) {
+                const copy = Array.from(this);
+                const items = Array.prototype.slice.call(arguments, 2);
+                copy.splice.apply(copy, [start, deleteCount].concat(items));
+                return copy;
+            };
+        }
         if (!Array.prototype.with) {
             Array.prototype.with = function(index, value) {
                 const copy = Array.from(this);
                 copy[index < 0 ? copy.length + index : index] = value;
                 return copy;
+            };
+        }
+        if (!Array.prototype.at) {
+            Array.prototype.at = function(n) {
+                const idx = Math.trunc(n) || 0;
+                return this[idx < 0 ? this.length + idx : idx];
             };
         }
     } catch (_) {}
@@ -168,9 +191,19 @@ impl WebCompatEngine {
                 query: function() { return Promise.resolve({ held: [], pending: [] }); }
             };
         }
+        if (typeof BroadcastChannel === 'undefined') {
+            window.BroadcastChannel = function(name) {
+                this.name = name;
+                this.onmessage = null;
+                this.postMessage = function() {};
+                this.close = function() {};
+                this.addEventListener = function() {};
+                this.removeEventListener = function() {};
+            };
+        }
     } catch (_) {}
 
-    /* 4. SPA History Router Hook (React Router / Next.js / Vue Router) */
+    /* 4. SPA History Router Hook */
     try {
         const origPushState = History.prototype.pushState;
         const origReplaceState = History.prototype.replaceState;
@@ -204,6 +237,7 @@ mod tests {
         assert!(script.contains("Object.groupBy"));
         assert!(script.contains("URL.canParse"));
         assert!(script.contains("navigator.userAgentData"));
+        assert!(script.contains("navigator.mediaCapabilities"));
         assert!(script.contains("History.prototype.pushState"));
     }
 }

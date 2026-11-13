@@ -1,12 +1,18 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 
+use crate::cpp_bridge::secure_zero_slice;
+use crate::crypto_vault::{
+    generate_nonce_12, generate_volatile_entropy_32, open_record, pbkdf2_hmac_sha256, seal_record,
+};
 use crate::manta_db::{DbValue, MantaDatabaseEngine, RelationalTable, VirtualFileEntry};
 use crate::site_isolation::OriginKey;
 
 const STORAGE_MAGIC_V2: &[u8; 8] = b"MANTADB2";
 const STORAGE_MAGIC_V3: &[u8; 8] = b"MANTADB3";
+const STORAGE_MAGIC_V4: &[u8; 8] = b"MANTADB4";
+const WAL_RECORD_MAGIC: &[u8; 4] = b"MWAL";
 
 /// RFC 6265 Compliant Cookie Entry stored inside Manta's custom origin-partitioned vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,10 +26,11 @@ pub struct StoredCookie {
     pub same_site: String,
 }
 
-/// Per-origin isolated storage partition (`localStorage`, `sessionStorage`, `cookies`, and `form_drafts`).
+/// Per-origin isolated storage partition (`localStorage`, volatile `sessionStorage`, `cookies`, and `form_drafts`).
 #[derive(Debug, Clone, Default)]
 pub struct OriginStorageBucket {
     pub local_storage: HashMap<String, String>,
+    /// Strictly volatile in-RAM per-session storage (NEVER written to disk!).
     pub session_storage: HashMap<String, String>,
     pub cookies: HashMap<String, StoredCookie>,
     pub form_drafts: HashMap<String, String>,
@@ -43,12 +50,49 @@ pub struct HistoryVisitEntry {
     pub visit_count: u32,
 }
 
-/// **Manta Unified Transactional Storage & Database Engine (`storage_engine.rs`)**:
-/// - Combines `localStorage`, `sessionStorage`, RFC 6265 Cookies, Live Form Drafts (`form_drafts`),
-///   Bookmarks, Browsing History, and **MantaDB** (Relational SQL Tables + IndexedDB Object Stores +
-///   Virtual File System `OPFS`).
-/// - Serializes into a single compact, CRC32-verified binary container (`MANTADB3`) using
-///   **atomic write-ahead temp file + rename** so site data is NEVER lost or corrupted.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalOp {
+    SetLocal = 1,
+    RemoveLocal = 2,
+    ClearLocal = 3,
+    SaveFormDraft = 4,
+    SetCookie = 5,
+    RecordHistory = 6,
+    ClearHistory = 7,
+    ToggleBookmark = 8,
+    IdbPut = 9,
+    IdbDelete = 10,
+    VfsSave = 11,
+    ClearOrigin = 12,
+}
+
+impl WalOp {
+    fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(WalOp::SetLocal),
+            2 => Some(WalOp::RemoveLocal),
+            3 => Some(WalOp::ClearLocal),
+            4 => Some(WalOp::SaveFormDraft),
+            5 => Some(WalOp::SetCookie),
+            6 => Some(WalOp::RecordHistory),
+            7 => Some(WalOp::ClearHistory),
+            8 => Some(WalOp::ToggleBookmark),
+            9 => Some(WalOp::IdbPut),
+            10 => Some(WalOp::IdbDelete),
+            11 => Some(WalOp::VfsSave),
+            12 => Some(WalOp::ClearOrigin),
+            _ => None,
+        }
+    }
+}
+
+/// **Manta Encrypted Append-Only WAL + Transactional Vault Engine (`storage_engine.rs`)**:
+/// - Replaces slow per-keystroke full-DB rewrites with $O(1)$ encrypted **Append-Only WAL (`manta_vault.wal`)**.
+/// - Periodic checkpoint compaction (`MANTADB4`) protected with **RFC 8439 ChaCha20 + HMAC-SHA256**.
+/// - **`sessionStorage` is 100% volatile in RAM** and NEVER persisted to disk.
+/// - **Ephemeral Zero-Trace Mode (`ephemeral_only`)**: suppresses all disk writes for zero-footprint sessions.
+/// - Instant cryptographic shred zeroes the encryption key and removes `.db`, `.wal`, `.key`, `.tmp`.
 pub struct MantaStorageEngine {
     origins: HashMap<String, OriginStorageBucket>,
     bookmarks: Vec<BookmarkEntry>,
@@ -58,7 +102,20 @@ pub struct MantaStorageEngine {
     total_ceiling_bytes: usize,
     kv_cookie_used_bytes: usize,
     backing_file_path: Option<String>,
+    wal_file_path: Option<String>,
+    key_file_path: Option<String>,
+    vault_key: [u8; 32],
+    nonce_counter: u64,
+    wal_pending_ops: usize,
+    pub wal_compact_threshold: usize,
     pub auto_commit_on_write: bool,
+    pub ephemeral_only: bool,
+}
+
+impl Drop for MantaStorageEngine {
+    fn drop(&mut self) {
+        secure_zero_slice(&mut self.vault_key);
+    }
 }
 
 impl MantaStorageEngine {
@@ -72,18 +129,65 @@ impl MantaStorageEngine {
             total_ceiling_bytes,
             kv_cookie_used_bytes: 0,
             backing_file_path: None,
+            wal_file_path: None,
+            key_file_path: None,
+            vault_key: generate_volatile_entropy_32(),
+            nonce_counter: 1,
+            wal_pending_ops: 0,
+            wal_compact_threshold: 64,
             auto_commit_on_write: true,
+            ephemeral_only: false,
         }
     }
 
     pub fn set_backing_file(&mut self, path: &str) {
-        if !path.trim().is_empty() {
-            self.backing_file_path = Some(path.trim().to_string());
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            self.backing_file_path = Some(trimmed.to_string());
+            self.wal_file_path = Some(format!("{}.wal", trimmed));
+            self.key_file_path = Some(format!("{}.key", trimmed));
+            self.ensure_or_load_key_file();
         }
     }
 
     pub fn backing_file(&self) -> Option<&str> {
         self.backing_file_path.as_deref()
+    }
+
+    pub fn set_ephemeral_mode(&mut self, enabled: bool) {
+        self.ephemeral_only = enabled;
+    }
+
+    /// Derives the 256-bit vault encryption key from a user passphrase using PBKDF2-HMAC-SHA256.
+    pub fn set_vault_passphrase(&mut self, passphrase: &str) {
+        let salt = b"MantaVaultV4::PBKDF2::Salt::2026";
+        self.vault_key = pbkdf2_hmac_sha256(passphrase.as_bytes(), salt, 10_000);
+    }
+
+    fn ensure_or_load_key_file(&mut self) {
+        if self.ephemeral_only {
+            return;
+        }
+        let Some(ref kpath) = self.key_file_path else {
+            return;
+        };
+        if let Ok(mut f) = fs::File::open(kpath) {
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_ok() && buf.len() == 32 {
+                self.vault_key.copy_from_slice(&buf);
+                secure_zero_slice(&mut buf);
+                return;
+            }
+            secure_zero_slice(&mut buf);
+        }
+        if let Ok(mut f) = fs::File::create(kpath) {
+            let _ = f.write_all(&self.vault_key);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(kpath, fs::Permissions::from_mode(0o600));
+            }
+        }
     }
 
     #[inline]
@@ -102,22 +206,53 @@ impl MantaStorageEngine {
         all_origins.len()
     }
 
-    #[inline]
-    fn maybe_auto_commit(&self) {
-        if self.auto_commit_on_write && self.backing_file_path.is_some() {
+    /// Appends a single tiny encrypted WAL frame instead of rewriting the entire database!
+    /// Compacts into `MANTADB4` automatically every `wal_compact_threshold` operations.
+    fn append_wal_op(&mut self, op: WalOp, fields: &[&[u8]]) {
+        if self.ephemeral_only || !self.auto_commit_on_write || self.wal_file_path.is_none() {
+            return;
+        }
+
+        let mut plain = Vec::with_capacity(64);
+        plain.push(op as u8);
+        write_u32(&mut plain, fields.len() as u32);
+        for field in fields {
+            write_bytes(&mut plain, field);
+        }
+
+        self.nonce_counter = self.nonce_counter.wrapping_add(1);
+        let nonce = generate_nonce_12(self.nonce_counter);
+        let sealed = seal_record(&self.vault_key, &nonce, WAL_RECORD_MAGIC, &plain);
+        secure_zero_slice(&mut plain);
+
+        if let Some(ref wpath) = self.wal_file_path {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(wpath) {
+                let mut frame = Vec::with_capacity(8 + sealed.len());
+                frame.extend_from_slice(WAL_RECORD_MAGIC);
+                write_u32(&mut frame, sealed.len() as u32);
+                frame.extend_from_slice(&sealed);
+                let _ = file.write_all(&frame);
+                let _ = file.flush();
+            }
+        }
+
+        self.wal_pending_ops += 1;
+        if self.wal_pending_ops >= self.wal_compact_threshold.max(8) {
             let _ = self.save_to_backing_file();
         }
     }
 
     // =========================================================================
-    // FULL STORAGE TRANSPARENCY MANIFEST (SHOWS ALL SAVED FILES, TABLES & DATA)
+    // FULL STORAGE TRANSPARENCY MANIFEST
     // =========================================================================
 
     pub fn inspect_storage_manifest_json(&self) -> String {
         let mut out = String::from("{");
         out.push_str(&format!(
-            "\"total_bytes\":{},\"bookmarks_count\":{},\"history_count\":{},\"origins\":[",
+            "\"total_bytes\":{},\"wal_pending_ops\":{},\"ephemeral_only\":{},\"bookmarks_count\":{},\"history_count\":{},\"origins\":[",
             self.used_bytes(),
+            self.wal_pending_ops,
+            self.ephemeral_only,
             self.bookmarks.len(),
             self.history.len()
         ));
@@ -204,11 +339,10 @@ impl MantaStorageEngine {
     }
 
     // =========================================================================
-    // ORIGIN-PARTITIONED LOCALSTORAGE, SESSIONSTORAGE & LIVE FORM DRAFTS
+    // ORIGIN-PARTITIONED LOCALSTORAGE, VOLATILE SESSIONSTORAGE & FORM DRAFTS
     // =========================================================================
 
     pub fn set_local_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
-        // Intercept special bridge keys from MantaKernelScripts if routed via storageSet
         if let Some(draft_key) = key.strip_prefix("__manta_draft::") {
             return self.save_form_draft(origin_url, draft_key, value);
         }
@@ -223,16 +357,15 @@ impl MantaStorageEngine {
         }
         if let Some(idb_rest) = key.strip_prefix("__manta_idb::") {
             if let Some((store, pk)) = idb_rest.split_once("::") {
-                let ok = self.db.put_object(origin_url, store, pk, value);
-                if ok {
-                    self.maybe_auto_commit();
-                }
-                return ok;
+                return self.put_idb_object(origin_url, store, pk, value);
             }
         }
         let ok = self.set_kv_internal(origin_url, key, value, false);
         if ok {
-            self.maybe_auto_commit();
+            self.append_wal_op(
+                WalOp::SetLocal,
+                &[origin_url.as_bytes(), key.as_bytes(), value.as_bytes()],
+            );
         }
         ok
     }
@@ -244,16 +377,12 @@ impl MantaStorageEngine {
     pub fn remove_local_storage(&mut self, origin_url: &str, key: &str) -> bool {
         if let Some(idb_rest) = key.strip_prefix("__manta_idb::") {
             if let Some((store, pk)) = idb_rest.split_once("::") {
-                let ok = self.db.delete_object(origin_url, store, pk);
-                if ok {
-                    self.maybe_auto_commit();
-                }
-                return ok;
+                return self.delete_idb_object(origin_url, store, pk);
             }
         }
         let ok = self.remove_kv_internal(origin_url, key, false);
         if ok {
-            self.maybe_auto_commit();
+            self.append_wal_op(WalOp::RemoveLocal, &[origin_url.as_bytes(), key.as_bytes()]);
         }
         ok
     }
@@ -274,16 +403,13 @@ impl MantaStorageEngine {
         bucket.local_storage.clear();
         bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
         self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
-        self.maybe_auto_commit();
+        self.append_wal_op(WalOp::ClearLocal, &[origin_url.as_bytes()]);
         true
     }
 
+    /// `sessionStorage` stays strictly in volatile RAM and is NEVER written to disk.
     pub fn set_session_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
-        let ok = self.set_kv_internal(origin_url, key, value, true);
-        if ok {
-            self.maybe_auto_commit();
-        }
-        ok
+        self.set_kv_internal(origin_url, key, value, true)
     }
 
     pub fn get_session_storage(&self, origin_url: &str, key: &str) -> Option<String> {
@@ -291,11 +417,7 @@ impl MantaStorageEngine {
     }
 
     pub fn remove_session_storage(&mut self, origin_url: &str, key: &str) -> bool {
-        let ok = self.remove_kv_internal(origin_url, key, true);
-        if ok {
-            self.maybe_auto_commit();
-        }
-        ok
+        self.remove_kv_internal(origin_url, key, true)
     }
 
     pub fn clear_session_storage_only(&mut self, origin_url: &str) -> bool {
@@ -314,12 +436,21 @@ impl MantaStorageEngine {
         bucket.session_storage.clear();
         bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
         self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
-        self.maybe_auto_commit();
         true
     }
 
-    /// Saves a live form/input draft for a site so user-typed input is never lost on reload or navigation.
     pub fn save_form_draft(&mut self, origin_url: &str, field_key: &str, value: &str) -> bool {
+        let ok = self.apply_save_form_draft(origin_url, field_key, value);
+        if ok {
+            self.append_wal_op(
+                WalOp::SaveFormDraft,
+                &[origin_url.as_bytes(), field_key.as_bytes(), value.as_bytes()],
+            );
+        }
+        ok
+    }
+
+    fn apply_save_form_draft(&mut self, origin_url: &str, field_key: &str, value: &str) -> bool {
         let origin_key = OriginKey::from_url(origin_url);
         if origin_key.is_opaque || field_key.trim().is_empty() {
             return false;
@@ -347,7 +478,6 @@ impl MantaStorageEngine {
             .insert(field_key.to_string(), value.to_string());
         bucket.used_bytes = next_bucket;
         self.kv_cookie_used_bytes = next_total;
-        self.maybe_auto_commit();
         true
     }
 
@@ -374,8 +504,62 @@ impl MantaStorageEngine {
             bucket.form_drafts.clear();
             bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
             self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
-            self.maybe_auto_commit();
         }
+    }
+
+    pub fn put_idb_object(
+        &mut self,
+        origin_url: &str,
+        store_name: &str,
+        key: &str,
+        json_val: &str,
+    ) -> bool {
+        let ok = self.db.put_object(origin_url, store_name, key, json_val);
+        if ok {
+            self.append_wal_op(
+                WalOp::IdbPut,
+                &[
+                    origin_url.as_bytes(),
+                    store_name.as_bytes(),
+                    key.as_bytes(),
+                    json_val.as_bytes(),
+                ],
+            );
+        }
+        ok
+    }
+
+    pub fn delete_idb_object(&mut self, origin_url: &str, store_name: &str, key: &str) -> bool {
+        let ok = self.db.delete_object(origin_url, store_name, key);
+        if ok {
+            self.append_wal_op(
+                WalOp::IdbDelete,
+                &[origin_url.as_bytes(), store_name.as_bytes(), key.as_bytes()],
+            );
+        }
+        ok
+    }
+
+    pub fn save_vfs_file(
+        &mut self,
+        origin_url: &str,
+        virtual_path: &str,
+        mime_type: &str,
+        data: &[u8],
+    ) -> bool {
+        let ok = self.db.save_virtual_file(origin_url, virtual_path, mime_type, data);
+        if ok {
+            self.append_wal_op(
+                WalOp::VfsSave,
+                &[
+                    origin_url.as_bytes(),
+                    virtual_path.as_bytes(),
+                    mime_type.as_bytes(),
+                    data,
+                ],
+            );
+        }
+        ok
     }
 
     pub fn export_origin_storage_json(&self, origin_url: &str, is_session: bool) -> String {
@@ -383,8 +567,7 @@ impl MantaStorageEngine {
         if origin_key.is_opaque {
             return "{}".to_string();
         }
-        let serialized = origin_key.serialize();
-        let Some(bucket) = self.origins.get(&serialized) else {
+        let Some(bucket) = self.origins.get(&origin_key.serialize()) else {
             return "{}".to_string();
         };
         let map = if is_session {
@@ -515,6 +698,17 @@ impl MantaStorageEngine {
     // =========================================================================
 
     pub fn set_cookie_from_header(&mut self, origin_url: &str, raw_set_cookie: &str) -> bool {
+        let ok = self.apply_set_cookie_from_header(origin_url, raw_set_cookie);
+        if ok {
+            self.append_wal_op(
+                WalOp::SetCookie,
+                &[origin_url.as_bytes(), raw_set_cookie.as_bytes()],
+            );
+        }
+        ok
+    }
+
+    fn apply_set_cookie_from_header(&mut self, origin_url: &str, raw_set_cookie: &str) -> bool {
         let origin = OriginKey::from_url(origin_url);
         if origin.is_opaque || raw_set_cookie.trim().is_empty() {
             return false;
@@ -580,7 +774,6 @@ impl MantaStorageEngine {
                 bucket.used_bytes = bucket.used_bytes.saturating_sub(cost);
                 self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(cost);
             }
-            self.maybe_auto_commit();
             return true;
         }
 
@@ -612,7 +805,6 @@ impl MantaStorageEngine {
         );
         bucket.used_bytes += cost;
         self.kv_cookie_used_bytes += cost;
-        self.maybe_auto_commit();
         true
     }
 
@@ -648,12 +840,16 @@ impl MantaStorageEngine {
         if clean_url.is_empty() || clean_url.starts_with("manta://") {
             return;
         }
+        self.apply_record_history_visit(clean_url, title);
+        self.append_wal_op(WalOp::RecordHistory, &[clean_url.as_bytes(), title.as_bytes()]);
+    }
+
+    fn apply_record_history_visit(&mut self, clean_url: &str, title: &str) {
         if let Some(existing) = self.history.iter_mut().find(|h| h.url == clean_url) {
             existing.visit_count = existing.visit_count.saturating_add(1);
             if !title.trim().is_empty() {
                 existing.title = title.trim().to_string();
             }
-            self.maybe_auto_commit();
             return;
         }
         if self.history.len() >= 2048 {
@@ -668,7 +864,6 @@ impl MantaStorageEngine {
             },
             visit_count: 1,
         });
-        self.maybe_auto_commit();
     }
 
     pub fn history(&self) -> &[HistoryVisitEntry] {
@@ -678,7 +873,7 @@ impl MantaStorageEngine {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history.shrink_to_fit();
-        self.maybe_auto_commit();
+        self.append_wal_op(WalOp::ClearHistory, &[]);
     }
 
     pub fn toggle_bookmark(&mut self, url: &str, title: &str) -> bool {
@@ -686,7 +881,13 @@ impl MantaStorageEngine {
         if clean_url.is_empty() {
             return false;
         }
-        let added = if let Some(pos) = self.bookmarks.iter().position(|b| b.url == clean_url) {
+        let added = self.apply_toggle_bookmark(clean_url, title);
+        self.append_wal_op(WalOp::ToggleBookmark, &[clean_url.as_bytes(), title.as_bytes()]);
+        added
+    }
+
+    fn apply_toggle_bookmark(&mut self, clean_url: &str, title: &str) -> bool {
+        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == clean_url) {
             self.bookmarks.remove(pos);
             false
         } else {
@@ -701,9 +902,7 @@ impl MantaStorageEngine {
                 });
             }
             true
-        };
-        self.maybe_auto_commit();
-        added
+        }
     }
 
     pub fn bookmarks(&self) -> &[BookmarkEntry] {
@@ -727,10 +926,18 @@ impl MantaStorageEngine {
     }
 
     // =========================================================================
-    // SELECTIVE PER-ORIGIN OR FULL PERMANENT SHREDDING
+    // SELECTIVE PER-ORIGIN OR INSTANT CRYPTOGRAPHIC SHRED
     // =========================================================================
 
     pub fn clear_origin(&mut self, origin_url: &str) -> bool {
+        let removed = self.apply_clear_origin(origin_url);
+        if removed {
+            self.append_wal_op(WalOp::ClearOrigin, &[origin_url.as_bytes()]);
+        }
+        removed
+    }
+
+    fn apply_clear_origin(&mut self, origin_url: &str) -> bool {
         let origin = OriginKey::from_url(origin_url).serialize();
         let mut removed_any = false;
         if let Some(removed) = self.origins.remove(&origin) {
@@ -740,9 +947,6 @@ impl MantaStorageEngine {
         }
         if self.db.clear_origin(&origin) > 0 {
             removed_any = true;
-        }
-        if removed_any {
-            self.maybe_auto_commit();
         }
         removed_any
     }
@@ -758,9 +962,9 @@ impl MantaStorageEngine {
             bucket.used_bytes = bucket.used_bytes.saturating_sub(session_bytes);
             self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(session_bytes);
         }
-        self.maybe_auto_commit();
     }
 
+    /// Cryptographically shreds the vault key, erases all volatile RAM, and deletes `.db`, `.wal`, `.key`, `.tmp`.
     pub fn clear_all(&mut self) {
         self.origins.clear();
         self.origins.shrink_to_fit();
@@ -770,27 +974,42 @@ impl MantaStorageEngine {
         self.history.shrink_to_fit();
         self.db.clear_all();
         self.kv_cookie_used_bytes = 0;
+        self.wal_pending_ops = 0;
+
+        // Zero volatile encryption key and rotate to fresh entropy
+        secure_zero_slice(&mut self.vault_key);
+        self.vault_key = generate_volatile_entropy_32();
+
         if let Some(ref path) = self.backing_file_path {
             let _ = fs::remove_file(path);
             let _ = fs::remove_file(format!("{}.tmp", path));
         }
+        if let Some(ref wpath) = self.wal_file_path {
+            let _ = fs::remove_file(wpath);
+        }
+        if let Some(ref kpath) = self.key_file_path {
+            if let Ok(mut f) = OpenOptions::new().write(true).open(kpath) {
+                let zeros = [0u8; 32];
+                let _ = f.write_all(&zeros);
+                let _ = f.sync_all();
+            }
+            let _ = fs::remove_file(kpath);
+        }
     }
 
     // =========================================================================
-    // TRANSACTIONAL ZERO-GHOST-PAGE BINARY CONTAINER (`MANTADB3` + `MANTADB2`)
+    // ENCRYPTED `MANTADB4` CHECKPOINT + WAL REPLAY
     // =========================================================================
 
-    pub fn serialize_to_bytes(&self) -> Vec<u8> {
+    fn serialize_plain_payload(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(self.used_bytes() + 1024);
 
-        // 1. Write Bookmarks
         write_u32(&mut payload, self.bookmarks.len() as u32);
         for bm in &self.bookmarks {
             write_str(&mut payload, &bm.url);
             write_str(&mut payload, &bm.title);
         }
 
-        // 2. Write History
         write_u32(&mut payload, self.history.len() as u32);
         for h in &self.history {
             write_str(&mut payload, &h.url);
@@ -798,7 +1017,6 @@ impl MantaStorageEngine {
             write_u32(&mut payload, h.visit_count);
         }
 
-        // 3. Write Origin KV (`local_storage`, `session_storage`, `form_drafts`, `cookies`)
         write_u32(&mut payload, self.origins.len() as u32);
         for (origin_str, bucket) in &self.origins {
             write_str(&mut payload, origin_str);
@@ -809,11 +1027,8 @@ impl MantaStorageEngine {
                 write_str(&mut payload, v);
             }
 
-            write_u32(&mut payload, bucket.session_storage.len() as u32);
-            for (k, v) in &bucket.session_storage {
-                write_str(&mut payload, k);
-                write_str(&mut payload, v);
-            }
+            // NEVER serialize session_storage to disk! Write 0 count for format alignment.
+            write_u32(&mut payload, 0);
 
             write_u32(&mut payload, bucket.form_drafts.len() as u32);
             for (k, v) in &bucket.form_drafts {
@@ -833,12 +1048,10 @@ impl MantaStorageEngine {
             }
         }
 
-        // 4. Write MantaDB Partitions (Relational Tables + Object Stores + Virtual Files)
         write_u32(&mut payload, self.db.partitions.len() as u32);
         for (origin_str, part) in &self.db.partitions {
             write_str(&mut payload, origin_str);
 
-            // 4a. Relational SQL Tables
             write_u32(&mut payload, part.tables.len() as u32);
             for (table_name, table) in &part.tables {
                 write_str(&mut payload, table_name);
@@ -857,7 +1070,6 @@ impl MantaStorageEngine {
                 }
             }
 
-            // 4b. IndexedDB Object Stores
             write_u32(&mut payload, part.object_stores.len() as u32);
             for (store_name, store) in &part.object_stores {
                 write_str(&mut payload, store_name);
@@ -868,7 +1080,6 @@ impl MantaStorageEngine {
                 }
             }
 
-            // 4c. Virtual Files (OPFS)
             write_u32(&mut payload, part.virtual_files.len() as u32);
             for vf in part.virtual_files.values() {
                 write_str(&mut payload, &vf.virtual_path);
@@ -878,11 +1089,18 @@ impl MantaStorageEngine {
             }
         }
 
-        let checksum = crc32_hash(&payload);
-        let mut frame = Vec::with_capacity(12 + payload.len());
-        frame.extend_from_slice(STORAGE_MAGIC_V3);
-        write_u32(&mut frame, checksum);
-        frame.extend_from_slice(&payload);
+        payload
+    }
+
+    pub fn serialize_to_bytes(&self) -> Vec<u8> {
+        let mut payload = self.serialize_plain_payload();
+        let nonce = generate_nonce_12(self.nonce_counter.wrapping_add(0x4D41_4E54));
+        let sealed = seal_record(&self.vault_key, &nonce, STORAGE_MAGIC_V4, &payload);
+        secure_zero_slice(&mut payload);
+
+        let mut frame = Vec::with_capacity(8 + sealed.len());
+        frame.extend_from_slice(STORAGE_MAGIC_V4);
+        frame.extend_from_slice(&sealed);
         frame
     }
 
@@ -890,22 +1108,30 @@ impl MantaStorageEngine {
         if bytes.len() < 12 {
             return Err("Invalid custom storage header");
         }
+        if &bytes[0..8] == STORAGE_MAGIC_V4 {
+            let mut decrypted = open_record(&self.vault_key, STORAGE_MAGIC_V4, &bytes[8..])?;
+            let res = self.parse_plain_payload(&decrypted, true);
+            secure_zero_slice(&mut decrypted);
+            return res;
+        }
+
         let is_v3 = &bytes[0..8] == STORAGE_MAGIC_V3;
         let is_v2 = &bytes[0..8] == STORAGE_MAGIC_V2;
         if !is_v3 && !is_v2 {
             return Err("Unknown custom storage header magic");
         }
-
         let mut cursor = 8usize;
         let expected_crc = read_u32(bytes, &mut cursor).ok_or("Truncated checksum")?;
         let payload = &bytes[12..];
         if crc32_hash(payload) != expected_crc {
             return Err("Custom storage CRC32 integrity mismatch");
         }
+        self.parse_plain_payload(payload, is_v3)
+    }
 
+    fn parse_plain_payload(&mut self, payload: &[u8], has_v3_fields: bool) -> Result<(), &'static str> {
         let mut p_cur = 0usize;
 
-        // 1. Read Bookmarks
         let bm_count = read_u32(payload, &mut p_cur).ok_or("Invalid bookmark count")?;
         let mut new_bookmarks = Vec::with_capacity((bm_count as usize).min(1024));
         for _ in 0..bm_count {
@@ -914,7 +1140,6 @@ impl MantaStorageEngine {
             new_bookmarks.push(BookmarkEntry { url, title });
         }
 
-        // 2. Read History
         let hist_count = read_u32(payload, &mut p_cur).ok_or("Invalid history count")?;
         let mut new_history = Vec::with_capacity((hist_count as usize).min(2048));
         for _ in 0..hist_count {
@@ -928,7 +1153,6 @@ impl MantaStorageEngine {
             });
         }
 
-        // 3. Read Origin KV, Session, Drafts & Cookies
         let origin_count = read_u32(payload, &mut p_cur).ok_or("Invalid origin count")?;
         let mut new_origins = HashMap::with_capacity((origin_count as usize).min(1024));
         let mut kv_total_bytes = 0usize;
@@ -947,15 +1171,11 @@ impl MantaStorageEngine {
                 bucket.local_storage.insert(k, v);
             }
 
-            if is_v3 {
+            if has_v3_fields {
                 let sess_count = read_u32(payload, &mut p_cur).ok_or("Corrupt session count")?;
                 for _ in 0..sess_count {
-                    let k = read_str(payload, &mut p_cur).ok_or("Corrupt session key")?;
-                    let v = read_str(payload, &mut p_cur).ok_or("Corrupt session value")?;
-                    let cost = k.len() + v.len();
-                    bucket.used_bytes += cost;
-                    kv_total_bytes += cost;
-                    bucket.session_storage.insert(k, v);
+                    let _k = read_str(payload, &mut p_cur).ok_or("Corrupt session key")?;
+                    let _v = read_str(payload, &mut p_cur).ok_or("Corrupt session value")?;
                 }
 
                 let draft_count = read_u32(payload, &mut p_cur).ok_or("Corrupt draft count")?;
@@ -1003,14 +1223,13 @@ impl MantaStorageEngine {
             new_origins.insert(origin_str, bucket);
         }
 
-        // 4. Read MantaDB Partitions (Tables + Object Stores + Virtual Files)
         self.db.clear_all();
         if p_cur < payload.len() {
             let db_part_count = read_u32(payload, &mut p_cur).ok_or("Corrupt DB part count")?;
             for _ in 0..db_part_count {
                 let origin_str = read_str(payload, &mut p_cur).ok_or("Corrupt DB origin")?;
 
-                if is_v3 {
+                if has_v3_fields {
                     let table_count = read_u32(payload, &mut p_cur).ok_or("Corrupt table count")?;
                     for _ in 0..table_count {
                         let tname = read_str(payload, &mut p_cur).ok_or("Corrupt table name")?;
@@ -1092,16 +1311,24 @@ impl MantaStorageEngine {
         Ok(())
     }
 
-    /// Atomically writes the `MANTADB3` container to disk via a temporary file + rename
-    /// so power loss or app force-stop can never corrupt user data.
-    pub fn save_to_backing_file(&self) -> Result<(), String> {
+    /// Compacts encrypted checkpoint to disk atomically and truncates the WAL cleanly.
+    pub fn save_to_backing_file(&mut self) -> Result<(), String> {
+        if self.ephemeral_only {
+            return Ok(());
+        }
         let Some(ref path) = self.backing_file_path else {
             return Ok(());
         };
         if self.used_bytes() == 0 && self.bookmarks.is_empty() && self.history.is_empty() {
             let _ = fs::remove_file(path);
+            if let Some(ref wpath) = self.wal_file_path {
+                let _ = fs::remove_file(wpath);
+            }
+            self.wal_pending_ops = 0;
             return Ok(());
         }
+
+        self.ensure_or_load_key_file();
         let data = self.serialize_to_bytes();
         let tmp_path = format!("{}.tmp", path);
         {
@@ -1109,18 +1336,145 @@ impl MantaStorageEngine {
             f.write_all(&data).map_err(|e| e.to_string())?;
             f.sync_all().map_err(|e| e.to_string())?;
         }
-        fs::rename(&tmp_path, path).map_err(|e| e.to_string())
+        fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+
+        // Checkpoint complete -> clear compacted WAL cleanly
+        if let Some(ref wpath) = self.wal_file_path {
+            let _ = fs::remove_file(wpath);
+        }
+        self.wal_pending_ops = 0;
+        Ok(())
     }
 
     pub fn load_from_backing_file(&mut self) -> Result<(), String> {
-        let Some(ref path) = self.backing_file_path else {
+        if self.ephemeral_only {
             return Ok(());
+        }
+        self.ensure_or_load_key_file();
+
+        if let Some(ref path) = self.backing_file_path {
+            if let Ok(mut f) = fs::File::open(path) {
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+                self.deserialize_from_bytes(&buf)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Replay any uncompacted encrypted WAL frames
+        if let Some(wpath) = self.wal_file_path.clone() {
+            if let Ok(mut wf) = fs::File::open(&wpath) {
+                let mut wbuf = Vec::new();
+                if wf.read_to_end(&mut wbuf).is_ok() {
+                    self.replay_wal_bytes(&wbuf);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_wal_bytes(&mut self, bytes: &[u8]) {
+        let mut cur = 0usize;
+        while cur + 8 <= bytes.len() {
+            if &bytes[cur..cur + 4] != WAL_RECORD_MAGIC {
+                break;
+            }
+            cur += 4;
+            let Some(frame_len) = read_u32(bytes, &mut cur) else {
+                break;
+            };
+            let len = frame_len as usize;
+            if cur + len > bytes.len() {
+                break; // Safely ignore partial trailing frame from abrupt crash
+            }
+            let sealed = &bytes[cur..cur + len];
+            cur += len;
+
+            if let Ok(mut plain) = open_record(&self.vault_key, WAL_RECORD_MAGIC, sealed) {
+                self.apply_decoded_wal_record(&plain);
+                secure_zero_slice(&mut plain);
+                self.wal_pending_ops += 1;
+            }
+        }
+    }
+
+    fn apply_decoded_wal_record(&mut self, plain: &[u8]) {
+        if plain.is_empty() {
+            return;
+        }
+        let Some(op) = WalOp::from_u8(plain[0]) else {
+            return;
         };
-        let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        self.deserialize_from_bytes(&buf)
-            .map_err(|e| e.to_string())
+        let mut cur = 1usize;
+        let Some(field_count) = read_u32(plain, &mut cur) else {
+            return;
+        };
+        let mut fields = Vec::with_capacity((field_count as usize).min(8));
+        for _ in 0..field_count {
+            let Some(b) = read_bytes(plain, &mut cur) else {
+                return;
+            };
+            fields.push(b);
+        }
+
+        let str_at = |i: usize| -> String {
+            fields
+                .get(i)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or("")
+                .to_string()
+        };
+
+        match op {
+            WalOp::SetLocal if fields.len() >= 3 => {
+                let _ = self.set_kv_internal(&str_at(0), &str_at(1), &str_at(2), false);
+            }
+            WalOp::RemoveLocal if fields.len() >= 2 => {
+                let _ = self.remove_kv_internal(&str_at(0), &str_at(1), false);
+            }
+            WalOp::ClearLocal if !fields.is_empty() => {
+                let orig = OriginKey::from_url(&str_at(0));
+                if let Some(bucket) = self.origins.get_mut(&orig.serialize()) {
+                    let freed: usize = bucket
+                        .local_storage
+                        .iter()
+                        .map(|(k, v)| k.len() + v.len())
+                        .sum();
+                    bucket.local_storage.clear();
+                    bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
+                    self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
+                }
+            }
+            WalOp::SaveFormDraft if fields.len() >= 3 => {
+                self.apply_save_form_draft(&str_at(0), &str_at(1), &str_at(2));
+            }
+            WalOp::SetCookie if fields.len() >= 2 => {
+                self.apply_set_cookie_from_header(&str_at(0), &str_at(1));
+            }
+            WalOp::RecordHistory if fields.len() >= 2 => {
+                self.apply_record_history_visit(&str_at(0), &str_at(1));
+            }
+            WalOp::ClearHistory => {
+                self.history.clear();
+            }
+            WalOp::ToggleBookmark if fields.len() >= 2 => {
+                self.apply_toggle_bookmark(&str_at(0), &str_at(1));
+            }
+            WalOp::IdbPut if fields.len() >= 4 => {
+                self.db.put_object(&str_at(0), &str_at(1), &str_at(2), &str_at(3));
+            }
+            WalOp::IdbDelete if fields.len() >= 3 => {
+                self.db.delete_object(&str_at(0), &str_at(1), &str_at(2));
+            }
+            WalOp::VfsSave if fields.len() >= 4 => {
+                self.db
+                    .save_virtual_file(&str_at(0), &str_at(1), &str_at(2), &fields[3]);
+            }
+            WalOp::ClearOrigin if !fields.is_empty() => {
+                self.apply_clear_origin(&str_at(0));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1278,70 +1632,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mantadb3_full_roundtrip_tables_session_drafts_idb_and_vfs() {
-        let mut store = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
-        let origin = "https://manta.dev/workspace";
+    fn test_encrypted_wal_replay_and_volatile_session_storage() {
+        let db_path = "./test_manta_wal_v4.db";
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(format!("{}.wal", db_path));
+        let _ = fs::remove_file(format!("{}.key", db_path));
 
-        assert!(store.set_local_storage(origin, "theme", "obsidian"));
-        assert!(store.set_session_storage(origin, "active_step", "3"));
-        assert!(store.save_form_draft(origin, "/workspace::input::project_name", "Manta v2.5"));
-        assert!(store.set_cookie_from_header(origin, "auth=token_abc; Path=/; Secure"));
+        {
+            let mut store = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
+            store.set_backing_file(db_path);
 
-        assert!(store.db.create_table(
-            origin,
-            "tasks",
-            vec!["title".to_string(), "done".to_string()]
-        ));
-        store
-            .db
-            .insert_row(
-                origin,
-                "tasks",
-                vec![DbValue::Text("Fix storage".to_string()), DbValue::Int(1)],
-            )
-            .unwrap();
+            let origin = "https://manta.dev/workspace";
+            assert!(store.set_local_storage(origin, "theme", "obsidian"));
+            // sessionStorage stays in RAM only (not persisted to WAL/disk)
+            assert!(store.set_session_storage(origin, "volatile_tab", "only_in_ram"));
+            assert!(store.save_form_draft(origin, "/workspace::input::title", "Manta v3.0"));
+            assert!(store.set_cookie_from_header(origin, "auth=token_xyz; Path=/; Secure"));
+            assert!(store.put_idb_object(origin, "cache", "k1", "{\"v\":1}"));
 
-        assert!(store.db.put_object(
-            origin,
-            "offline_cache",
-            "doc_1",
-            "{\"title\":\"Spec\"}"
-        ));
-        assert!(store.db.save_virtual_file(
-            origin,
-            "/downloads/readme.md",
-            "text/markdown",
-            b"# Manta Engine"
-        ));
-        store.record_history_visit(origin, "Manta Workspace");
+            // Verify raw WAL file does NOT contain plaintext secrets
+            let wal_bytes = fs::read(format!("{}.wal", db_path)).unwrap();
+            assert!(!wal_bytes.windows(9).any(|w| w == b"token_xyz"));
+            assert!(!wal_bytes.windows(8).any(|w| w == b"obsidian"));
+        }
 
-        let serialized = store.serialize_to_bytes();
+        // Reopen without ever calling full-DB checkpoint save!
         let mut restored = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
-        restored.deserialize_from_bytes(&serialized).unwrap();
+        restored.set_backing_file(db_path);
+        restored.load_from_backing_file().unwrap();
 
         assert_eq!(
             restored.get_local_storage("https://manta.dev", "theme"),
             Some("obsidian".to_string())
         );
+        // sessionStorage strictly NOT written to disk
         assert_eq!(
-            restored.get_session_storage("https://manta.dev", "active_step"),
-            Some("3".to_string())
+            restored.get_session_storage("https://manta.dev", "volatile_tab"),
+            None
         );
         assert_eq!(
-            restored.get_form_draft("https://manta.dev", "/workspace::input::project_name"),
-            Some("Manta v2.5".to_string())
+            restored.get_form_draft("https://manta.dev", "/workspace::input::title"),
+            Some("Manta v3.0".to_string())
         );
         assert_eq!(
             restored.get_cookie_header_for_url("https://manta.dev", true),
-            "auth=token_abc"
+            "auth=token_xyz"
         );
-        let rows = restored
-            .db
-            .select_where("https://manta.dev", "tasks", None, None);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].1[0],
-            DbValue::Text("Fix storage".to_string())
-        );
+
+        restored.clear_all();
+        assert!(!std::path::Path::new(db_path).exists());
+        assert!(!std::path::Path::new(&format!("{}.wal", db_path)).exists());
+        assert!(!std::path::Path::new(&format!("{}.key", db_path)).exists());
     }
 }

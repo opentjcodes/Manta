@@ -1,5 +1,7 @@
-/// Sandboxed, size-capped Clipboard Manager in 100% Safe Rust.
-/// Supports user-initiated copy/paste & selection extraction with instant O(1) clear.
+use crate::cpp_bridge::secure_zero_string;
+
+/// Sandboxed, size-capped Clipboard Manager in Safe Rust + C++ volatile zeroing.
+/// Supports user-initiated copy/paste & selection extraction with cryptographic clear.
 pub struct ClipboardSandbox {
     buffer: String,
     max_bytes: usize,
@@ -17,7 +19,7 @@ impl ClipboardSandbox {
         if text.len() > self.max_bytes {
             return false;
         }
-        self.buffer.clear();
+        secure_zero_string(&mut self.buffer);
         self.buffer.push_str(text);
         true
     }
@@ -27,7 +29,13 @@ impl ClipboardSandbox {
     }
 
     pub fn clear(&mut self) {
-        self.buffer.clear();
+        secure_zero_string(&mut self.buffer);
         self.buffer.shrink_to_fit();
+    }
+}
+
+impl Drop for ClipboardSandbox {
+    fn drop(&mut self) {
+        secure_zero_string(&mut self.buffer);
     }
 }

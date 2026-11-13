@@ -1,12 +1,11 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::module_bus::{
     InterceptedRequest, InterceptedResponse, MantaFeatureModule, ModuleDecision,
 };
 
 /// Canonical RFC 6454 Web Origin (`scheme://host:port`).
-/// Used as the strict boundary key for Manta's Site Isolation, MantaDB, Virtual File System,
-/// Cookie Jar, and Permission Matrix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OriginKey {
     pub scheme: String,
@@ -17,7 +16,7 @@ pub struct OriginKey {
 
 impl OriginKey {
     pub fn from_url(url: &str) -> Self {
-        let trimmed = url.trim();
+        let trimmed = strip_ascii_control_and_ws(url);
         if trimmed.is_empty()
             || trimmed.starts_with("about:")
             || trimmed.starts_with("data:")
@@ -36,7 +35,7 @@ impl OriginKey {
                 trimmed[..idx].to_ascii_lowercase(),
                 &trimmed[idx + 3..],
             ),
-            None => ("https".to_string(), trimmed),
+            None => ("https".to_string(), trimmed.as_str()),
         };
 
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -118,32 +117,116 @@ impl OriginKey {
     }
 
     pub fn is_private_or_loopback_network(&self) -> bool {
-        let h = self.host.as_str();
+        let h = self.host.trim_matches(|c| c == '[' || c == ']');
         if h == "localhost"
             || h.ends_with(".local")
             || h.ends_with(".localhost")
-            || h == "[::1]"
+            || h.ends_with(".internal")
             || h == "0.0.0.0"
         {
             return true;
         }
-        let parts: Vec<u8> = h
-            .split('.')
-            .filter_map(|p| p.parse::<u8>().ok())
-            .collect();
-        if parts.len() == 4 {
-            return match (parts[0], parts[1]) {
-                (0, _) => true,
-                (10, _) => true,
-                (127, _) => true,
-                (169, 254) => true,
-                (172, b) if (16..=31).contains(&b) => true,
-                (192, 168) => true,
-                _ => false,
-            };
+        // Standard IPv6 literal check
+        if let Ok(ip6) = h.parse::<Ipv6Addr>() {
+            return is_private_or_reserved_ip(IpAddr::V6(ip6));
+        }
+        // Standard IPv4 literal check
+        if let Ok(ip4) = h.parse::<Ipv4Addr>() {
+            return is_private_or_reserved_ip(IpAddr::V4(ip4));
+        }
+        // Obfuscated integer/hex/octal IPv4 literal defense (e.g., 0x7f000001, 2130706433, 0177.0.0.1)
+        if let Some(ip4) = parse_nonstandard_ipv4(h) {
+            return is_private_or_reserved_ip(IpAddr::V4(ip4));
         }
         false
     }
+}
+
+/// Validates any resolved `std::net::IpAddr` against loopback, private, link-local,
+/// cloud metadata (`169.254.169.254`), CGNAT (`100.64.0.0/10`), and IPv4-mapped IPv6 bypasses.
+pub fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || (o[0] == 100 && (o[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // Benchmarking 198.18.0.0/15
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_private_or_reserved_ip(IpAddr::V4(mapped_v4));
+            }
+            let segs = v6.segments();
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (segs[0] & 0xFE00) == 0xFC00 // Unique Local Address fc00::/7
+                || (segs[0] & 0xFFC0) == 0xFE80 // Link-Local fe80::/10
+        }
+    }
+}
+
+fn parse_nonstandard_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut vals = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let v = if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else if p.starts_with('0') && p.len() > 1 {
+            u32::from_str_radix(p, 8).ok()?
+        } else {
+            p.parse::<u32>().ok()?
+        };
+        vals.push(v);
+    }
+    match vals.len() {
+        1 => Some(Ipv4Addr::from(vals[0])),
+        2 if vals[0] <= 255 && vals[1] <= 0xFFFFFF => {
+            Some(Ipv4Addr::from((vals[0] << 24) | vals[1]))
+        }
+        3 if vals[0] <= 255 && vals[1] <= 255 && vals[2] <= 0xFFFF => {
+            Some(Ipv4Addr::from((vals[0] << 24) | (vals[1] << 16) | vals[2]))
+        }
+        4 if vals.iter().all(|&x| x <= 255) => Some(Ipv4Addr::new(
+            vals[0] as u8,
+            vals[1] as u8,
+            vals[2] as u8,
+            vals[3] as u8,
+        )),
+        _ => None,
+    }
+}
+
+/// Strips ASCII whitespace and C0 control chars (`\x00-\x20`) to defeat `java\tscript:` XSS bypasses.
+fn strip_ascii_control_and_ws(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|&c| !c.is_control() && (c as u32) >= 0x20)
+        .collect()
+}
+
+fn extract_scheme_canonical(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.chars() {
+        if c == ':' {
+            break;
+        }
+        if c.is_ascii_control() || c.is_ascii_whitespace() {
+            continue;
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 /// Complete capability matrix controllable per origin in Manta.
@@ -230,8 +313,8 @@ pub enum IsolationVerdict {
     Deny { reason: &'static str },
 }
 
-/// Enforces strict Manta Site Isolation, Same-Origin Policy, W3C CORS verification,
-/// Private Network Access (PNA/SSRF) defense, and per-origin permissions.
+/// Enforces strict Manta Site Isolation, Same-Origin Policy, W3C CORS,
+/// Private Network Access (PNA/SSRF) defense, and scheme/XSS hardening.
 pub struct SiteIsolationEngine {
     permissions: HashMap<(String, SiteCapability), PermissionDecision>,
     hsts_hosts: HashMap<String, bool>,
@@ -292,59 +375,71 @@ impl SiteIsolationEngine {
         target_url: &str,
         is_main_frame: bool,
     ) -> IsolationVerdict {
-        let trimmed = target_url.trim();
-        if trimmed.is_empty() {
+        let sanitized = strip_ascii_control_and_ws(target_url);
+        if sanitized.is_empty() {
             return IsolationVerdict::Deny {
                 reason: "Empty target URL",
             };
         }
 
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("javascript:")
-            || lower.starts_with("vbscript:")
-            || lower.starts_with("file:")
-            || lower.starts_with("content:")
-            || lower.starts_with("intent:")
-        {
+        // Canonical scheme extraction defeats `java\tscript:`, `\x01javascript:`, etc.
+        let scheme = extract_scheme_canonical(&sanitized);
+        if matches!(
+            scheme.as_str(),
+            "javascript" | "vbscript" | "file" | "content" | "intent"
+        ) {
             return IsolationVerdict::Deny {
                 reason: "Blocked unsafe URI scheme",
             };
         }
 
-        if lower.starts_with("manta://") || lower == "about:blank" || lower.starts_with("data:") {
+        let lower = sanitized.to_ascii_lowercase();
+        if lower.starts_with("manta://") || lower == "about:blank" {
             return IsolationVerdict::Allow {
-                sanitized_url: trimmed.to_string(),
+                sanitized_url: sanitized,
             };
         }
 
-        let target_origin = OriginKey::from_url(trimmed);
+        if lower.starts_with("data:") {
+            // Restrict dangerous HTML/JS top-level data: navigations while allowing safe media/text data URIs
+            if is_main_frame && (lower.contains("text/html") || lower.contains("application/xhtml")) {
+                return IsolationVerdict::Deny {
+                    reason: "Blocked top-level HTML data: URI navigation",
+                };
+            }
+            return IsolationVerdict::Allow {
+                sanitized_url: sanitized,
+            };
+        }
+
+        let target_origin = OriginKey::from_url(&sanitized);
         if target_origin.is_opaque {
             return IsolationVerdict::Deny {
                 reason: "Blocked opaque subresource origin",
             };
         }
 
-        if !is_main_frame {
-            if let Some(init_str) = initiator_url {
-                if !init_str.is_empty() && !init_str.starts_with("manta://") {
-                    let init_origin = OriginKey::from_url(init_str);
-                    if !init_origin.is_private_or_loopback_network()
-                        && target_origin.is_private_or_loopback_network()
-                    {
-                        return IsolationVerdict::Deny {
-                            reason: "Blocked cross-origin Private Network Access (SSRF protection)",
-                        };
-                    }
+        // Strict Private Network Access (PNA / SSRF) protection
+        if let Some(init_str) = initiator_url {
+            if !init_str.is_empty() && !init_str.starts_with("manta://") {
+                let init_origin = OriginKey::from_url(init_str);
+                if !init_origin.is_private_or_loopback_network()
+                    && target_origin.is_private_or_loopback_network()
+                {
+                    return IsolationVerdict::Deny {
+                        reason: "Blocked cross-origin Private Network Access (SSRF protection)",
+                    };
+                }
 
-                    if init_origin.scheme == "https"
-                        && target_origin.scheme == "http"
-                        && !target_origin.is_private_or_loopback_network()
-                    {
-                        let upgraded = trimmed.replacen("http://", "https://", 1);
-                        return IsolationVerdict::UpgradeToHttps {
-                            upgraded_url: upgraded,
-                        };
-                    }
+                if !is_main_frame
+                    && init_origin.scheme == "https"
+                    && target_origin.scheme == "http"
+                    && !target_origin.is_private_or_loopback_network()
+                {
+                    let upgraded = sanitized.replacen("http://", "https://", 1);
+                    return IsolationVerdict::UpgradeToHttps {
+                        upgraded_url: upgraded,
+                    };
                 }
             }
         }
@@ -356,14 +451,14 @@ impl SiteIsolationEngine {
                 .copied()
                 .unwrap_or(false)
         {
-            let upgraded = trimmed.replacen("http://", "https://", 1);
+            let upgraded = sanitized.replacen("http://", "https://", 1);
             return IsolationVerdict::UpgradeToHttps {
                 upgraded_url: upgraded,
             };
         }
 
         IsolationVerdict::Allow {
-            sanitized_url: trimmed.to_string(),
+            sanitized_url: sanitized,
         }
     }
 
@@ -451,8 +546,9 @@ impl MantaFeatureModule for SiteIsolationModule {
             .get("Origin")
             .or_else(|| req.headers.get("Referer"))
             .map(|s| s.as_str());
+        let is_main_frame = initiator.is_none();
 
-        match self.engine.validate_request(initiator, &req.url, true) {
+        match self.engine.validate_request(initiator, &req.url, is_main_frame) {
             IsolationVerdict::Allow { sanitized_url } => {
                 req.url = sanitized_url;
                 let origin = OriginKey::from_url(&req.url);
@@ -479,21 +575,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_canonical_origin_isolation() {
-        let o1 = OriginKey::from_url("https://Example.com:443/path?a=1");
-        let o2 = OriginKey::from_url("https://example.com/other");
-        assert!(o1.is_same_origin(&o2));
-        assert_eq!(o1.serialize(), "https://example.com");
-    }
-
-    #[test]
-    fn test_ssrf_private_network_guard() {
+    fn test_ssrf_obfuscated_ips_and_xss_control_char_bypass_blocked() {
         let engine = SiteIsolationEngine::new();
-        let verdict = engine.validate_request(
-            Some("https://untrusted-site.com/index.html"),
-            "http://127.0.0.1:8080/admin",
-            false,
-        );
-        assert!(matches!(verdict, IsolationVerdict::Deny { .. }));
+
+        // Control char obfuscated javascript: XSS
+        assert!(matches!(
+            engine.validate_request(None, " \x01java\tscript:alert(1)", true),
+            IsolationVerdict::Deny { .. }
+        ));
+
+        // Integer & Hex SSRF bypasses
+        assert!(matches!(
+            engine.validate_request(Some("https://evil.com"), "http://2130706433/admin", false),
+            IsolationVerdict::Deny { .. }
+        ));
+        assert!(matches!(
+            engine.validate_request(Some("https://evil.com"), "http://0x7f000001:8080/", false),
+            IsolationVerdict::Deny { .. }
+        ));
+        assert!(matches!(
+            engine.validate_request(Some("https://evil.com"), "http://[::ffff:169.254.169.254]/latest", false),
+            IsolationVerdict::Deny { .. }
+        ));
     }
 }

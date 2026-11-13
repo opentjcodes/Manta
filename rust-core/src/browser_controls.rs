@@ -32,6 +32,7 @@ pub struct MantaSettings {
     pub https_only_mode: bool,
     pub dns_preconnect_enabled: bool,
     pub dark_mode_forced: bool,
+    pub reduced_motion: bool,
     pub default_zoom_percent: u16,
     pub font_scale_percent: u16,
     pub minimum_font_size_sp: u8,
@@ -40,17 +41,12 @@ pub struct MantaSettings {
     pub download_auto_save: bool,
     pub download_directory: String,
     pub custom_user_agent: String,
-    /// Keeps all open tabs active in memory until explicitly closed by the user.
     pub keep_tabs_active_until_closed: bool,
-    /// Automatically saves user-typed form/input fields per origin so site inputs are never lost.
     pub auto_save_form_inputs: bool,
-    /// Promotes scroll-blocking touch/wheel listeners to `{ passive: true }` for 120 FPS scrolling.
+    pub ephemeral_zero_trace_mode: bool,
     pub kernel_passive_events: bool,
-    /// Speculatively pre-warms DNS/TCP on link hover/touchstart before click completion.
     pub kernel_speculative_preconnect: bool,
-    /// Coalesces idle & layout tasks to prevent main-thread jank.
     pub kernel_layout_accelerator: bool,
-    /// Injects the 99% modern web compatibility layer (ES2024, Client Hints, SPA router hooks).
     pub web_compat_99_enabled: bool,
 }
 
@@ -66,9 +62,10 @@ impl Default for MantaSettings {
             popups_blocked: true,
             do_not_track: true,
             global_privacy_control: true,
-            https_only_mode: false,
+            https_only_mode: true,
             dns_preconnect_enabled: true,
             dark_mode_forced: true,
+            reduced_motion: false,
             default_zoom_percent: 100,
             font_scale_percent: 100,
             minimum_font_size_sp: 10,
@@ -79,6 +76,7 @@ impl Default for MantaSettings {
             custom_user_agent: String::new(),
             keep_tabs_active_until_closed: true,
             auto_save_form_inputs: true,
+            ephemeral_zero_trace_mode: false,
             kernel_passive_events: true,
             kernel_speculative_preconnect: true,
             kernel_layout_accelerator: true,
@@ -88,7 +86,6 @@ impl Default for MantaSettings {
 }
 
 impl MantaSettings {
-    /// Resolves any omnibox input (URL, IP, localhost, `manta://`, or search query) into a target URL.
     pub fn resolve_omnibox_input(&self, raw_input: &str) -> String {
         let trimmed = raw_input.trim();
         if trimmed.is_empty() {
@@ -111,7 +108,6 @@ impl MantaSettings {
         self.search_url_template.replace("{query}", &encoded)
     }
 
-    /// Updates a setting dynamically by key name.
     pub fn set_by_key(&mut self, key: &str, value: &str) -> bool {
         let v = value.trim();
         match key.trim() {
@@ -127,8 +123,10 @@ impl MantaSettings {
             "https_only_mode" => self.https_only_mode = parse_bool(v),
             "dns_preconnect_enabled" => self.dns_preconnect_enabled = parse_bool(v),
             "dark_mode_forced" => self.dark_mode_forced = parse_bool(v),
+            "reduced_motion" => self.reduced_motion = parse_bool(v),
             "keep_tabs_active_until_closed" => self.keep_tabs_active_until_closed = parse_bool(v),
             "auto_save_form_inputs" => self.auto_save_form_inputs = parse_bool(v),
+            "ephemeral_zero_trace_mode" => self.ephemeral_zero_trace_mode = parse_bool(v),
             "kernel_passive_events" => self.kernel_passive_events = parse_bool(v),
             "kernel_speculative_preconnect" => self.kernel_speculative_preconnect = parse_bool(v),
             "kernel_layout_accelerator" => self.kernel_layout_accelerator = parse_bool(v),
@@ -185,12 +183,14 @@ impl MantaSettings {
                 "\"https_only_mode\":{},",
                 "\"dns_preconnect_enabled\":{},",
                 "\"dark_mode_forced\":{},",
+                "\"reduced_motion\":{},",
                 "\"default_zoom_percent\":{},",
                 "\"font_scale_percent\":{},",
                 "\"download_auto_save\":{},",
                 "\"download_directory\":\"{}\",",
                 "\"keep_tabs_active_until_closed\":{},",
                 "\"auto_save_form_inputs\":{},",
+                "\"ephemeral_zero_trace_mode\":{},",
                 "\"kernel_passive_events\":{},",
                 "\"kernel_speculative_preconnect\":{},",
                 "\"kernel_layout_accelerator\":{},",
@@ -208,12 +208,14 @@ impl MantaSettings {
             self.https_only_mode,
             self.dns_preconnect_enabled,
             self.dark_mode_forced,
+            self.reduced_motion,
             self.default_zoom_percent,
             self.font_scale_percent,
             self.download_auto_save,
             escape_json(&self.download_directory),
             self.keep_tabs_active_until_closed,
             self.auto_save_form_inputs,
+            self.ephemeral_zero_trace_mode,
             self.kernel_passive_events,
             self.kernel_speculative_preconnect,
             self.kernel_layout_accelerator,
@@ -222,14 +224,14 @@ impl MantaSettings {
     }
 }
 
-/// Per-tab navigation, zoom, find-in-page, reader mode, and media controls managed in Rust.
 #[derive(Debug, Clone)]
 pub struct TabControlState {
     pub tab_id: u32,
-    pub history_entries: Vec<(String, String)>, // (url, title)
+    pub history_entries: Vec<(String, String)>,
     pub history_cursor: usize,
     pub desktop_mode: bool,
     pub reader_mode: bool,
+    pub pinned: bool,
     pub zoom_percent: u16,
     pub audio_muted: bool,
     pub fullscreen: bool,
@@ -246,6 +248,7 @@ impl TabControlState {
             history_cursor: 0,
             desktop_mode: false,
             reader_mode: false,
+            pinned: false,
             zoom_percent: default_zoom,
             audio_muted: false,
             fullscreen: false,
@@ -306,7 +309,6 @@ impl TabControlState {
     }
 }
 
-/// Manages global `MantaSettings` and per-tab `TabControlState` across all open tabs.
 pub struct MantaControlsManager {
     pub settings: MantaSettings,
     tab_controls: HashMap<u32, TabControlState>,
@@ -331,6 +333,10 @@ impl MantaControlsManager {
         self.tab_controls
             .entry(tab_id)
             .or_insert_with(|| TabControlState::new(tab_id, default_zoom))
+    }
+
+    pub fn get_tab_state(&self, tab_id: u32) -> Option<&TabControlState> {
+        self.tab_controls.get(&tab_id)
     }
 
     pub fn set_desktop_mode(&mut self, tab_id: u32, enabled: bool) {

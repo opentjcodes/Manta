@@ -1,4 +1,4 @@
-name: Build, Test & Release Manta Rust Core Engine
+name: Build, Test & Release Manta Rust + C++ Core Engine
 
 on:
   push:
@@ -55,12 +55,13 @@ jobs:
             -o dist/android-jniLibs \
             build --release --manifest-path Cargo.toml
 
-      - name: Package Manta Core SDK Bundle (Libraries + C Header)
+      - name: Package Manta Core SDK Bundle (Libraries + C/C++ Headers)
         run: |
           mkdir -p dist/linux-x86_64 dist/include
           cp target/x86_64-unknown-linux-gnu/release/libmanta_core.so dist/linux-x86_64/
           cp target/x86_64-unknown-linux-gnu/release/libmanta_core.a dist/linux-x86_64/
           cp include/manta_core.h dist/include/
+          cp cpp-accel/include/manta_accel.h dist/include/
           ls -lh dist/linux-x86_64/ dist/android-jniLibs/arm64-v8a/
           tar -czvf Manta-Core-Engine-SDK.tar.gz -C dist .
 
@@ -76,9 +77,10 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v2.0.{0}', github.run_number) }}
-          name: "Manta Core Engine ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v2.0.{0}', github.run_number) }}"
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v3.0.{0}', github.run_number) }}
+          name: "Manta Core Engine ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v3.0.{0}', github.run_number) }}"
           generate_release_notes: true
           files: |
             Manta-Core-Engine-SDK.tar.gz
             include/manta_core.h
+            cpp-accel/include/manta_accel.h

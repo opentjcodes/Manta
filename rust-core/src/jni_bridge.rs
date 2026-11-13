@@ -113,8 +113,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCrea
     id as JInt
 }
 
-/// Non-destructively records a backup snapshot of tab metadata & scroll offset
-/// WITHOUT killing or hibernating the live tab in memory.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCompressTabState(
     env: JNIEnv,
@@ -168,7 +166,6 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeRest
     }
 }
 
-/// Switches active tab while keeping background tabs 100% hot-active in memory.
 #[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSwitchTab(
     _env: JNIEnv,
@@ -232,6 +229,132 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetT
         return 100;
     };
     engine.controls.get_zoom_percent(tab_id as u32) as JInt
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeResolveOmnibox(
+    env: JNIEnv,
+    _class: JClass,
+    j_input: JString,
+) -> JString {
+    let raw = unsafe { env.get_rust_string(j_input) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    let resolved = engine.controls.settings.resolve_omnibox_input(&raw);
+    unsafe { env.new_java_string(&resolved) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeFindInPage(
+    env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+    j_query: JString,
+) -> JInt {
+    let query = unsafe { env.get_rust_string(j_query) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    let count = engine.tabs.find_in_page(tab_id as u32, &query);
+    engine.controls.update_find_in_page(tab_id as u32, &query, count);
+    count as JInt
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetReaderModeText(
+    env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    let txt = engine.tabs.get_reader_text(tab_id as u32);
+    unsafe { env.new_java_string(&txt) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSetEphemeralMode(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: JBoolean,
+) {
+    if let Ok(mut engine) = MantaEngine::global().lock() {
+        let on = enabled != 0;
+        engine.storage.set_ephemeral_mode(on);
+        engine.controls.settings.ephemeral_zero_trace_mode = on;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetMemoryStatsJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("{}") };
+    };
+    let json = engine.memory_stats_json();
+    unsafe { env.new_java_string(&json) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeMediaOpenStream(
+    env: JNIEnv,
+    _class: JClass,
+    j_url: JString,
+    ring_bytes: JInt,
+) -> JInt {
+    let url = unsafe { env.get_rust_string(j_url) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    engine
+        .media
+        .open_stream(&url, ring_bytes.max(0) as u32)
+        .unwrap_or(0) as JInt
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeMediaIngestManifest(
+    env: JNIEnv,
+    _class: JClass,
+    stream_id: JInt,
+    j_base_url: JString,
+    j_manifest: JString,
+) -> JBoolean {
+    let base = unsafe { env.get_rust_string(j_base_url) };
+    let text = unsafe { env.get_rust_string(j_manifest) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    u8::from(engine.media.ingest_manifest(stream_id as u32, &base, &text))
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeMediaGetStatsJson(
+    env: JNIEnv,
+    _class: JClass,
+    stream_id: JInt,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("{}") };
+    };
+    let json = engine.media.get_stats_json(stream_id as u32);
+    unsafe { env.new_java_string(&json) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeMediaCloseStream(
+    _env: JNIEnv,
+    _class: JClass,
+    stream_id: JInt,
+) -> JBoolean {
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    u8::from(engine.media.close_stream(stream_id as u32))
 }
 
 #[no_mangle]
@@ -384,7 +507,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeFlus
     _env: JNIEnv,
     _class: JClass,
 ) -> JBoolean {
-    let Ok(engine) = MantaEngine::global().lock() else {
+    let Ok(mut engine) = MantaEngine::global().lock() else {
         return 0;
     };
     u8::from(engine.storage.save_to_backing_file().is_ok())
@@ -438,7 +561,15 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStre
         &mut engine_ref.storage,
         &mut engine_ref.downloads,
     ) {
-        Ok(frame) => unsafe { env.new_java_string(&frame.to_compact_wire_string()) },
+        Ok(frame) => {
+            if is_eof != 0 && !url.is_empty() {
+                engine_ref
+                    .controls
+                    .ensure_tab_state(tab_id as u32)
+                    .record_navigation(&url, &frame.page_title);
+            }
+            unsafe { env.new_java_string(&frame.to_compact_wire_string()) }
+        }
         Err(e) => unsafe { env.new_java_string(&format!("MANTA_ERR|{}", e)) },
     }
 }

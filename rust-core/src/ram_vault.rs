@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-/// Fast, 100% safe Rust in-memory buffer for transient tab snapshots.
+use crate::cpp_bridge::secure_zero_slice;
+
+/// Fast, 100% safe Rust in-memory buffer for transient tab snapshots with compiler-proof zeroing.
 pub struct EphemeralBuffer {
     data: Vec<u8>,
 }
@@ -28,13 +30,20 @@ impl EphemeralBuffer {
     }
 
     pub fn release(&mut self) {
+        secure_zero_slice(&mut self.data);
         self.data.clear();
         self.data.shrink_to_fit();
     }
 }
 
+impl Drop for EphemeralBuffer {
+    fn drop(&mut self) {
+        secure_zero_slice(&mut self.data);
+    }
+}
+
 /// High-speed in-memory RAM pool for compressed background tab states and transient buffers.
-/// Strictly capped at `max_bytes` with automatic FIFO/LRU eviction.
+/// Strictly capped at `max_bytes` with automatic FIFO eviction & secure zeroing.
 pub struct VolatileRamVault {
     entries: HashMap<u64, (u32, EphemeralBuffer)>,
     insertion_order: Vec<u64>,
@@ -72,7 +81,7 @@ impl VolatileRamVault {
     }
 
     pub fn put_ephemeral(&mut self, tab_id: u32, key: &str, payload: &[u8]) -> bool {
-        if payload.len() > self.max_bytes / 2 {
+        if self.max_bytes < 2 || payload.len() > self.max_bytes / 2 {
             return false;
         }
 
@@ -96,6 +105,12 @@ impl VolatileRamVault {
     pub fn get_ephemeral(&self, tab_id: u32, key: &str) -> Option<&[u8]> {
         let key_hash = Self::hash_key(tab_id, key);
         self.entries.get(&key_hash).map(|(_, buf)| buf.as_slice())
+    }
+
+    pub fn remove_ephemeral(&mut self, tab_id: u32, key: &str) {
+        let key_hash = Self::hash_key(tab_id, key);
+        self.remove_by_hash(key_hash);
+        self.insertion_order.retain(|&k| k != key_hash);
     }
 
     pub fn purge_tab(&mut self, tab_id: u32) {
