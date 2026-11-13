@@ -37,16 +37,11 @@ pub struct DownloadItem {
     pub total_bytes_expected: Option<usize>,
     pub crc32_checksum: u32,
     pub status: DownloadStatus,
-    /// Only retained when no disk `download_dir` is configured (capped at 4 MB to avoid OOM).
     pub in_memory_payload: Vec<u8>,
 }
 
 const MAX_IN_MEMORY_FALLBACK_BYTES: usize = 4 * 1024 * 1024;
 
-/// **Manta Streaming Download & File Save Manager (`downloads_engine.rs`)**:
-/// - Streams chunks directly to disk with rolling CRC32 without holding 1 GB files in RAM.
-/// - Never permanently retains payloads in memory once written to user's download directory.
-/// - Supports lock-free decoupling via `allocate_pending_id` + `finish_external_download`.
 pub struct MantaDownloadManager {
     download_dir: String,
     max_single_file_bytes: usize,
@@ -125,7 +120,6 @@ impl MantaDownloadManager {
         let crc = crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF;
         let disk_path = self.try_write_to_disk(&clean_name, data);
 
-        // Zero RAM footprint once persisted directly to user's download path!
         let mem_payload = if disk_path.is_some() || data.len() > MAX_IN_MEMORY_FALLBACK_BYTES {
             Vec::new()
         } else {
@@ -154,7 +148,6 @@ impl MantaDownloadManager {
         Ok(id)
     }
 
-    /// Streams a download directly to disk chunk-by-chunk (constant ~4 KB RAM usage!).
     pub fn stream_download_standalone(
         id: u32,
         download_dir: &str,
@@ -240,7 +233,7 @@ impl MantaDownloadManager {
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        let saved_disk_path = if let Some((part_path, mut f)) = disk_file {
+        let saved_disk_path = if let Some((part_path, f)) = disk_file {
             let _ = f.sync_all();
             drop(f);
             let final_path = PathBuf::from(download_dir).join(&final_name);

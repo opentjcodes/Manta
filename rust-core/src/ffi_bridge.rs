@@ -4,7 +4,7 @@ use std::slice;
 
 use crate::downloads_engine::MantaDownloadManager;
 use crate::module_bus::ModuleBus;
-use crate::net_stream::{register_host_net_transport, MantaNetFetchCallback, StreamingNetworkPipe};
+use crate::net_stream::{register_host_net_transport, MantaNetFetchCallback};
 use crate::page_compiler::PageRuntimeCompiler;
 use crate::site_isolation::SiteIsolationModule;
 use crate::MantaEngine;
@@ -354,8 +354,6 @@ pub extern "C" fn manta_abi_submit_form(tab_id: u32, form_or_control_node_id: u3
     }
 }
 
-/// Binary-safe form submission returning exact raw bytes (`method|action_url|content_type|\0<raw_bytes>`)
-/// so uploaded binary files with NUL/non-UTF8 bytes are never corrupted!
 #[no_mangle]
 pub unsafe extern "C" fn manta_abi_submit_form_bytes(
     tab_id: u32,
@@ -416,10 +414,6 @@ pub unsafe extern "C" fn manta_abi_get_form_draft(
     };
     rust_to_cstr(engine.storage.get_form_draft(&orig, &fk).as_deref().unwrap_or(""))
 }
-
-// =========================================================================
-// LOW-LATENCY ZERO-CACHE MEDIA STREAMING C-ABI
-// =========================================================================
 
 #[no_mangle]
 pub unsafe extern "C" fn manta_abi_media_open_stream(
@@ -530,10 +524,6 @@ pub extern "C" fn manta_abi_media_close_stream(stream_id: u32) -> bool {
     };
     engine.media.close_stream(stream_id)
 }
-
-// =========================================================================
-// ENCRYPTED WAL STORAGE, ZERO-TRACE MODE & DOWNLOADS
-// =========================================================================
 
 #[no_mangle]
 pub extern "C" fn manta_abi_set_ephemeral_mode(enabled: bool) -> bool {
@@ -744,8 +734,6 @@ pub extern "C" fn manta_abi_flush_storage() -> bool {
     engine.storage.save_to_backing_file().is_ok()
 }
 
-/// Lock-free network download: registers ID, drops global engine lock during socket I/O,
-/// streams directly to disk, then re-acquires lock briefly to commit metadata!
 #[no_mangle]
 pub unsafe extern "C" fn manta_abi_start_download(
     url: *const c_char,
@@ -768,7 +756,6 @@ pub unsafe extern "C" fn manta_abi_start_download(
 
     let mut standalone_modules = ModuleBus::new();
     standalone_modules.register(Box::new(SiteIsolationModule::new()));
-    let _ = StreamingNetworkPipe::stream_http;
 
     match MantaDownloadManager::stream_download_standalone(
         dl_id,

@@ -21,6 +21,19 @@ void     manta_cpp_arena_free(void* ptr, size_t bytes);
 /* SIMD-accelerated HTML/XML delimiter scanner ('<' or '&') */
 size_t   manta_cpp_scan_html_delim(const uint8_t* data, size_t len, size_t start);
 
+/* SIMD-accelerated substring & bounded ReDoS-safe RegExp engine for JS VM */
+int64_t  manta_cpp_find_substr(const uint8_t* hay, size_t hay_len,
+                               const uint8_t* needle, size_t needle_len, size_t start);
+int32_t  manta_cpp_regex_match(const char* pattern, size_t pat_len,
+                               const char* flags, size_t flags_len,
+                               const char* text, size_t text_len,
+                               size_t start_pos,
+                               size_t* out_match_start, size_t* out_match_end);
+
+/* Fast C++ Numeric Vector / TypedArray acceleration for JS loops */
+double   manta_cpp_f64_sum(const double* arr, size_t len);
+void     manta_cpp_f64_scale_add(double* dst, const double* src, size_t len, double scale, double bias);
+
 /* Fast Hash-LZ + RLE block compressor/decompressor for tab & asset snapshots */
 size_t   manta_cpp_fast_compress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap);
 size_t   manta_cpp_fast_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap);
@@ -34,7 +47,7 @@ uint32_t         manta_cpp_ring_available_read(const MantaRingBuffer* rb);
 uint32_t         manta_cpp_ring_capacity(const MantaRingBuffer* rb);
 void             manta_cpp_ring_reset(MantaRingBuffer* rb);
 
-/* SIMD-friendly ARGB rectangle alpha compositor for fast software/hybrid tile rendering */
+/* SIMD-friendly ARGB rectangle alpha compositor */
 void     manta_cpp_blend_rect_argb(uint32_t* fb, uint32_t fb_w, uint32_t fb_h,
                                    int32_t x, int32_t y, int32_t w, int32_t h, uint32_t argb);
 

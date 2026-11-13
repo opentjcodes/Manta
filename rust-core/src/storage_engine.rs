@@ -14,7 +14,6 @@ const STORAGE_MAGIC_V3: &[u8; 8] = b"MANTADB3";
 const STORAGE_MAGIC_V4: &[u8; 8] = b"MANTADB4";
 const WAL_RECORD_MAGIC: &[u8; 4] = b"MWAL";
 
-/// RFC 6265 Compliant Cookie Entry stored inside Manta's custom origin-partitioned vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCookie {
     pub name: String,
@@ -26,11 +25,9 @@ pub struct StoredCookie {
     pub same_site: String,
 }
 
-/// Per-origin isolated storage partition (`localStorage`, volatile `sessionStorage`, `cookies`, and `form_drafts`).
 #[derive(Debug, Clone, Default)]
 pub struct OriginStorageBucket {
     pub local_storage: HashMap<String, String>,
-    /// Strictly volatile in-RAM per-session storage (NEVER written to disk!).
     pub session_storage: HashMap<String, String>,
     pub cookies: HashMap<String, StoredCookie>,
     pub form_drafts: HashMap<String, String>,
@@ -87,12 +84,6 @@ impl WalOp {
     }
 }
 
-/// **Manta Encrypted Append-Only WAL + Transactional Vault Engine (`storage_engine.rs`)**:
-/// - Replaces slow per-keystroke full-DB rewrites with $O(1)$ encrypted **Append-Only WAL (`manta_vault.wal`)**.
-/// - Periodic checkpoint compaction (`MANTADB4`) protected with **RFC 8439 ChaCha20 + HMAC-SHA256**.
-/// - **`sessionStorage` is 100% volatile in RAM** and NEVER persisted to disk.
-/// - **Ephemeral Zero-Trace Mode (`ephemeral_only`)**: suppresses all disk writes for zero-footprint sessions.
-/// - Instant cryptographic shred zeroes the encryption key and removes `.db`, `.wal`, `.key`, `.tmp`.
 pub struct MantaStorageEngine {
     origins: HashMap<String, OriginStorageBucket>,
     bookmarks: Vec<BookmarkEntry>,
@@ -158,7 +149,6 @@ impl MantaStorageEngine {
         self.ephemeral_only = enabled;
     }
 
-    /// Derives the 256-bit vault encryption key from a user passphrase using PBKDF2-HMAC-SHA256.
     pub fn set_vault_passphrase(&mut self, passphrase: &str) {
         let salt = b"MantaVaultV4::PBKDF2::Salt::2026";
         self.vault_key = pbkdf2_hmac_sha256(passphrase.as_bytes(), salt, 10_000);
@@ -206,8 +196,6 @@ impl MantaStorageEngine {
         all_origins.len()
     }
 
-    /// Appends a single tiny encrypted WAL frame instead of rewriting the entire database!
-    /// Compacts into `MANTADB4` automatically every `wal_compact_threshold` operations.
     fn append_wal_op(&mut self, op: WalOp, fields: &[&[u8]]) {
         if self.ephemeral_only || !self.auto_commit_on_write || self.wal_file_path.is_none() {
             return;
@@ -241,10 +229,6 @@ impl MantaStorageEngine {
             let _ = self.save_to_backing_file();
         }
     }
-
-    // =========================================================================
-    // FULL STORAGE TRANSPARENCY MANIFEST
-    // =========================================================================
 
     pub fn inspect_storage_manifest_json(&self) -> String {
         let mut out = String::from("{");
@@ -338,10 +322,6 @@ impl MantaStorageEngine {
         out
     }
 
-    // =========================================================================
-    // ORIGIN-PARTITIONED LOCALSTORAGE, VOLATILE SESSIONSTORAGE & FORM DRAFTS
-    // =========================================================================
-
     pub fn set_local_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
         if let Some(draft_key) = key.strip_prefix("__manta_draft::") {
             return self.save_form_draft(origin_url, draft_key, value);
@@ -407,7 +387,6 @@ impl MantaStorageEngine {
         true
     }
 
-    /// `sessionStorage` stays strictly in volatile RAM and is NEVER written to disk.
     pub fn set_session_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
         self.set_kv_internal(origin_url, key, value, true)
     }
@@ -693,10 +672,6 @@ impl MantaStorageEngine {
         false
     }
 
-    // =========================================================================
-    // RFC 6265 ORIGIN-ISOLATED COOKIE JAR
-    // =========================================================================
-
     pub fn set_cookie_from_header(&mut self, origin_url: &str, raw_set_cookie: &str) -> bool {
         let ok = self.apply_set_cookie_from_header(origin_url, raw_set_cookie);
         if ok {
@@ -831,10 +806,6 @@ impl MantaStorageEngine {
         pairs.join("; ")
     }
 
-    // =========================================================================
-    // BOOKMARKS & BROWSING HISTORY
-    // =========================================================================
-
     pub fn record_history_visit(&mut self, url: &str, title: &str) {
         let clean_url = url.trim();
         if clean_url.is_empty() || clean_url.starts_with("manta://") {
@@ -925,10 +896,6 @@ impl MantaStorageEngine {
         out
     }
 
-    // =========================================================================
-    // SELECTIVE PER-ORIGIN OR INSTANT CRYPTOGRAPHIC SHRED
-    // =========================================================================
-
     pub fn clear_origin(&mut self, origin_url: &str) -> bool {
         let removed = self.apply_clear_origin(origin_url);
         if removed {
@@ -964,7 +931,6 @@ impl MantaStorageEngine {
         }
     }
 
-    /// Cryptographically shreds the vault key, erases all volatile RAM, and deletes `.db`, `.wal`, `.key`, `.tmp`.
     pub fn clear_all(&mut self) {
         self.origins.clear();
         self.origins.shrink_to_fit();
@@ -976,7 +942,6 @@ impl MantaStorageEngine {
         self.kv_cookie_used_bytes = 0;
         self.wal_pending_ops = 0;
 
-        // Zero volatile encryption key and rotate to fresh entropy
         secure_zero_slice(&mut self.vault_key);
         self.vault_key = generate_volatile_entropy_32();
 
@@ -996,10 +961,6 @@ impl MantaStorageEngine {
             let _ = fs::remove_file(kpath);
         }
     }
-
-    // =========================================================================
-    // ENCRYPTED `MANTADB4` CHECKPOINT + WAL REPLAY
-    // =========================================================================
 
     fn serialize_plain_payload(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(self.used_bytes() + 1024);
@@ -1027,7 +988,6 @@ impl MantaStorageEngine {
                 write_str(&mut payload, v);
             }
 
-            // NEVER serialize session_storage to disk! Write 0 count for format alignment.
             write_u32(&mut payload, 0);
 
             write_u32(&mut payload, bucket.form_drafts.len() as u32);
@@ -1311,16 +1271,15 @@ impl MantaStorageEngine {
         Ok(())
     }
 
-    /// Compacts encrypted checkpoint to disk atomically and truncates the WAL cleanly.
     pub fn save_to_backing_file(&mut self) -> Result<(), String> {
         if self.ephemeral_only {
             return Ok(());
         }
-        let Some(ref path) = self.backing_file_path else {
+        let Some(path) = self.backing_file_path.clone() else {
             return Ok(());
         };
         if self.used_bytes() == 0 && self.bookmarks.is_empty() && self.history.is_empty() {
-            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(&path);
             if let Some(ref wpath) = self.wal_file_path {
                 let _ = fs::remove_file(wpath);
             }
@@ -1336,9 +1295,8 @@ impl MantaStorageEngine {
             f.write_all(&data).map_err(|e| e.to_string())?;
             f.sync_all().map_err(|e| e.to_string())?;
         }
-        fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+        fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
 
-        // Checkpoint complete -> clear compacted WAL cleanly
         if let Some(ref wpath) = self.wal_file_path {
             let _ = fs::remove_file(wpath);
         }
@@ -1361,7 +1319,6 @@ impl MantaStorageEngine {
             }
         }
 
-        // Replay any uncompacted encrypted WAL frames
         if let Some(wpath) = self.wal_file_path.clone() {
             if let Ok(mut wf) = fs::File::open(&wpath) {
                 let mut wbuf = Vec::new();
@@ -1385,7 +1342,7 @@ impl MantaStorageEngine {
             };
             let len = frame_len as usize;
             if cur + len > bytes.len() {
-                break; // Safely ignore partial trailing frame from abrupt crash
+                break;
             }
             let sealed = &bytes[cur..cur + len];
             cur += len;
@@ -1644,19 +1601,16 @@ mod tests {
 
             let origin = "https://manta.dev/workspace";
             assert!(store.set_local_storage(origin, "theme", "obsidian"));
-            // sessionStorage stays in RAM only (not persisted to WAL/disk)
             assert!(store.set_session_storage(origin, "volatile_tab", "only_in_ram"));
             assert!(store.save_form_draft(origin, "/workspace::input::title", "Manta v3.0"));
             assert!(store.set_cookie_from_header(origin, "auth=token_xyz; Path=/; Secure"));
             assert!(store.put_idb_object(origin, "cache", "k1", "{\"v\":1}"));
 
-            // Verify raw WAL file does NOT contain plaintext secrets
             let wal_bytes = fs::read(format!("{}.wal", db_path)).unwrap();
             assert!(!wal_bytes.windows(9).any(|w| w == b"token_xyz"));
             assert!(!wal_bytes.windows(8).any(|w| w == b"obsidian"));
         }
 
-        // Reopen without ever calling full-DB checkpoint save!
         let mut restored = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
         restored.set_backing_file(db_path);
         restored.load_from_backing_file().unwrap();
@@ -1665,7 +1619,6 @@ mod tests {
             restored.get_local_storage("https://manta.dev", "theme"),
             Some("obsidian".to_string())
         );
-        // sessionStorage strictly NOT written to disk
         assert_eq!(
             restored.get_session_storage("https://manta.dev", "volatile_tab"),
             None

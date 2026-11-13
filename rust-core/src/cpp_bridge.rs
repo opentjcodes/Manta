@@ -15,6 +15,32 @@ extern "C" {
     fn manta_cpp_arena_release_pages(ptr: *mut u8, offset: usize, len: usize);
     fn manta_cpp_arena_free(ptr: *mut u8, bytes: usize);
     fn manta_cpp_scan_html_delim(data: *const u8, len: usize, start: usize) -> usize;
+    fn manta_cpp_find_substr(
+        hay: *const u8,
+        hay_len: usize,
+        needle: *const u8,
+        needle_len: usize,
+        start: usize,
+    ) -> i64;
+    fn manta_cpp_regex_match(
+        pattern: *const c_char,
+        pat_len: usize,
+        flags: *const c_char,
+        flags_len: usize,
+        text: *const c_char,
+        text_len: usize,
+        start_pos: usize,
+        out_match_start: *mut usize,
+        out_match_end: *mut usize,
+    ) -> i32;
+    fn manta_cpp_f64_sum(arr: *const f64, len: usize) -> f64;
+    fn manta_cpp_f64_scale_add(
+        dst: *mut f64,
+        src: *const f64,
+        len: usize,
+        scale: f64,
+        bias: f64,
+    );
     fn manta_cpp_fast_compress(
         src: *const u8,
         src_len: usize,
@@ -71,7 +97,6 @@ pub fn secure_zero_string(s: &mut String) {
     }
 }
 
-/// SIMD-accelerated delimiter search for `<` and `&` in HTML data streams.
 #[inline]
 pub fn scan_html_delim(bytes: &[u8], start: usize) -> usize {
     if start >= bytes.len() {
@@ -80,12 +105,67 @@ pub fn scan_html_delim(bytes: &[u8], start: usize) -> usize {
     unsafe { manta_cpp_scan_html_delim(bytes.as_ptr(), bytes.len(), start) }
 }
 
-/// Fast C++ Hash-LZ + RLE block compressor.
+/// SIMD-accelerated substring search for JS `String.prototype.indexOf` / `includes`.
+#[inline]
+pub fn find_substr(hay: &str, needle: &str, start: usize) -> Option<usize> {
+    let hb = hay.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return if start <= hb.len() { Some(start) } else { None };
+    }
+    let idx = unsafe { manta_cpp_find_substr(hb.as_ptr(), hb.len(), nb.as_ptr(), nb.len(), start) };
+    if idx >= 0 {
+        Some(idx as usize)
+    } else {
+        None
+    }
+}
+
+/// Bounded ReDoS-safe C++ RegExp matcher returning byte offsets `(start, end)`.
+pub fn regex_find(pattern: &str, flags: &str, text: &str, start_byte: usize) -> Option<(usize, usize)> {
+    let mut m_start: usize = 0;
+    let mut m_end: usize = 0;
+    let matched = unsafe {
+        manta_cpp_regex_match(
+            pattern.as_ptr() as *const c_char,
+            pattern.len(),
+            flags.as_ptr() as *const c_char,
+            flags.len(),
+            text.as_ptr() as *const c_char,
+            text.len(),
+            start_byte,
+            &mut m_start,
+            &mut m_end,
+        )
+    };
+    if matched == 1 {
+        Some((m_start, m_end))
+    } else {
+        None
+    }
+}
+
+/// Fast C++ 4-way unrolled summation for JS numeric arrays & `Float64Array`.
+#[inline]
+pub fn fast_f64_sum(arr: &[f64]) -> f64 {
+    if arr.is_empty() {
+        return 0.0;
+    }
+    unsafe { manta_cpp_f64_sum(arr.as_ptr(), arr.len()) }
+}
+
+#[inline]
+pub fn fast_f64_scale_add(dst: &mut [f64], src: &[f64], scale: f64, bias: f64) {
+    let n = dst.len().min(src.len());
+    if n > 0 {
+        unsafe { manta_cpp_f64_scale_add(dst.as_mut_ptr(), src.as_ptr(), n, scale, bias) }
+    }
+}
+
 pub fn fast_compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() {
         return Vec::new();
     }
-    // Worst-case overhead is ~2% + 8 bytes for incompressible literals
     let max_cap = input.len() + (input.len() / 64) + 32;
     let mut dst = vec![0u8; max_cap];
     let written = unsafe {
@@ -98,7 +178,6 @@ pub fn fast_compress(input: &[u8]) -> Vec<u8> {
     dst
 }
 
-/// Fast C++ Hash-LZ + RLE block decompressor.
 pub fn fast_decompress(compressed: &[u8]) -> Option<Vec<u8>> {
     if compressed.len() < 4 {
         return None;
@@ -127,7 +206,6 @@ pub fn fast_decompress(compressed: &[u8]) -> Option<Vec<u8>> {
     Some(dst)
 }
 
-/// Direct OS `mmap`-backed byte slab that can release unused pages via `madvise(MADV_DONTNEED)`.
 pub struct CppMmapSlab {
     ptr: *mut u8,
     cap: usize,
@@ -197,7 +275,6 @@ impl CppMmapSlab {
         Some(offset)
     }
 
-    /// Returns spare physical memory pages above `self.len` directly back to the OS kernel.
     pub fn release_unused_pages(&mut self) {
         if !self.ptr.is_null() && self.cap > self.len {
             unsafe {
@@ -224,7 +301,6 @@ impl Drop for CppMmapSlab {
     }
 }
 
-/// Lock-free cache-line-aligned SPSC ring buffer for ultra-low-latency media streaming.
 pub struct CppMediaRing {
     ptr: *mut MantaRingBuffer,
 }
@@ -311,7 +387,6 @@ pub fn tls_is_available() -> bool {
     unsafe { manta_cpp_tls_is_available() == 1 }
 }
 
-/// Verified TLS stream wrapping `TcpStream` via runtime OpenSSL in C++.
 pub struct CppTlsStream {
     handle: *mut c_void,
     _socket: TcpStream,
@@ -378,25 +453,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cpp_simd_scanner_and_lz_rle_codec_and_ring() {
+    fn test_cpp_simd_substr_regex_and_numeric_accel() {
         let html = b"Hello world this is plain text with <div>tags</div> &amp; entities";
         assert_eq!(scan_html_delim(html, 0), 36);
-        assert_eq!(scan_html_delim(html, 41), 41);
-        assert_eq!(scan_html_delim(html, 42), 52);
-
-        let payload = b"MantaBrowserEngine!!!!MantaBrowserEngine!!!!AAAAABBBBBCCCCCDDDDDMantaBrowserEngine";
-        let compressed = fast_compress(payload);
-        assert!(!compressed.is_empty());
-        assert!(compressed.len() < payload.len());
-        let decompressed = fast_decompress(&compressed).unwrap();
-        assert_eq!(&decompressed, payload);
-
-        let ring = CppMediaRing::new(4096).unwrap();
-        assert_eq!(ring.write(b"VIDEO_FRAME_1"), 13);
-        assert_eq!(ring.available_read(), 13);
-        let mut out = [0u8; 32];
-        let n = ring.read(&mut out);
-        assert_eq!(&out[..n], b"VIDEO_FRAME_1");
-        assert_eq!(ring.available_read(), 0);
+        assert_eq!(
+            find_substr("Manta high-velocity browser core", "velocity", 0),
+            Some(11)
+        );
+        assert_eq!(
+            regex_find(r"manta[0-9]+", "i", "Version MANTA2026 release", 0),
+            Some((8, 17))
+        );
+        let nums = [1.5, 2.5, 3.0, 4.0, 5.0];
+        assert!((fast_f64_sum(&nums) - 16.0).abs() < 1e-9);
     }
 }

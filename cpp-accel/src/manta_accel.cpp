@@ -49,6 +49,359 @@ inline void write_u32_le(uint8_t* p, uint32_t v) {
     p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
 }
 
+inline uint8_t ascii_lower(uint8_t c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<uint8_t>(c + 32) : c;
+}
+
+inline bool is_ascii_digit(uint8_t c) { return c >= '0' && c <= '9'; }
+inline bool is_ascii_word(uint8_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+inline bool is_ascii_space(uint8_t c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+struct RegexCtx {
+    const char* pat;
+    size_t pat_len;
+    const char* text;
+    size_t text_len;
+    bool case_insensitive;
+    bool multiline;
+    bool dot_all;
+    uint32_t steps;
+    uint32_t max_steps;
+};
+
+bool match_seq(RegexCtx& ctx, size_t p_start, size_t p_end, size_t t_pos, size_t* out_end, int depth);
+
+bool match_char_class(const char* pat, size_t& p, size_t p_end, uint8_t ch, bool ci) {
+    size_t scan = p + 1;
+    bool neg = false;
+    if (scan < p_end && pat[scan] == '^') {
+        neg = true;
+        ++scan;
+    }
+    bool matched = false;
+    bool first = true;
+    uint8_t cmp_ch = ci ? ascii_lower(ch) : ch;
+
+    while (scan < p_end) {
+        if (!first && pat[scan] == ']') {
+            p = scan + 1;
+            return neg ? !matched : matched;
+        }
+        first = false;
+        uint8_t c1 = static_cast<uint8_t>(pat[scan]);
+        if (c1 == '\\' && scan + 1 < p_end) {
+            uint8_t esc = static_cast<uint8_t>(pat[scan + 1]);
+            scan += 2;
+            switch (esc) {
+                case 'd': if (is_ascii_digit(ch)) matched = true; continue;
+                case 'D': if (!is_ascii_digit(ch)) matched = true; continue;
+                case 'w': if (is_ascii_word(ch)) matched = true; continue;
+                case 'W': if (!is_ascii_word(ch)) matched = true; continue;
+                case 's': if (is_ascii_space(ch)) matched = true; continue;
+                case 'S': if (!is_ascii_space(ch)) matched = true; continue;
+                case 'n': c1 = '\n'; break;
+                case 'r': c1 = '\r'; break;
+                case 't': c1 = '\t'; break;
+                default: c1 = esc; break;
+            }
+        } else {
+            ++scan;
+        }
+
+        if (scan + 1 < p_end && pat[scan] == '-' && pat[scan + 1] != ']') {
+            uint8_t c2 = static_cast<uint8_t>(pat[scan + 1]);
+            scan += 2;
+            uint8_t lo = ci ? ascii_lower(c1) : c1;
+            uint8_t hi = ci ? ascii_lower(c2) : c2;
+            if (cmp_ch >= lo && cmp_ch <= hi) matched = true;
+        } else {
+            uint8_t target = ci ? ascii_lower(c1) : c1;
+            if (cmp_ch == target) matched = true;
+        }
+    }
+    p = p_end;
+    return false;
+}
+
+bool match_atom(RegexCtx& ctx, size_t a_start, size_t a_end, size_t t_pos, size_t* out_end, int depth) {
+    if (a_start >= a_end) {
+        *out_end = t_pos;
+        return true;
+    }
+    char first = ctx.pat[a_start];
+    if (first == '(') {
+        size_t inner_start = a_start + 1;
+        if (inner_start + 1 < a_end && ctx.pat[inner_start] == '?' && ctx.pat[inner_start + 1] == ':') {
+            inner_start += 2;
+        }
+        size_t inner_end = (a_end > a_start && ctx.pat[a_end - 1] == ')') ? (a_end - 1) : a_end;
+        return match_seq(ctx, inner_start, inner_end, t_pos, out_end, depth + 1);
+    }
+    if (t_pos >= ctx.text_len) return false;
+    uint8_t ch = static_cast<uint8_t>(ctx.text[t_pos]);
+
+    if (first == '.') {
+        if (!ctx.dot_all && (ch == '\n' || ch == '\r')) return false;
+        *out_end = t_pos + 1;
+        return true;
+    }
+    if (first == '[') {
+        size_t p_tmp = a_start;
+        if (match_char_class(ctx.pat, p_tmp, a_end, ch, ctx.case_insensitive)) {
+            *out_end = t_pos + 1;
+            return true;
+        }
+        return false;
+    }
+    if (first == '\\' && a_start + 1 < a_end) {
+        uint8_t esc = static_cast<uint8_t>(ctx.pat[a_start + 1]);
+        bool ok = false;
+        switch (esc) {
+            case 'd': ok = is_ascii_digit(ch); break;
+            case 'D': ok = !is_ascii_digit(ch); break;
+            case 'w': ok = is_ascii_word(ch); break;
+            case 'W': ok = !is_ascii_word(ch); break;
+            case 's': ok = is_ascii_space(ch); break;
+            case 'S': ok = !is_ascii_space(ch); break;
+            case 'n': ok = (ch == '\n'); break;
+            case 'r': ok = (ch == '\r'); break;
+            case 't': ok = (ch == '\t'); break;
+            default: {
+                uint8_t a = ctx.case_insensitive ? ascii_lower(ch) : ch;
+                uint8_t b = ctx.case_insensitive ? ascii_lower(esc) : esc;
+                ok = (a == b);
+                break;
+            }
+        }
+        if (ok) {
+            *out_end = t_pos + 1;
+            return true;
+        }
+        return false;
+    }
+
+    uint8_t a = ctx.case_insensitive ? ascii_lower(ch) : ch;
+    uint8_t b = ctx.case_insensitive ? ascii_lower(static_cast<uint8_t>(first)) : static_cast<uint8_t>(first);
+    if (a == b) {
+        *out_end = t_pos + 1;
+        return true;
+    }
+    return false;
+}
+
+size_t parse_brace_quantifier(const char* pat, size_t pos, size_t p_end, size_t& min_r, size_t& max_r) {
+    size_t i = pos + 1;
+    size_t v1 = 0;
+    bool has1 = false;
+    while (i < p_end && is_ascii_digit(static_cast<uint8_t>(pat[i]))) {
+        v1 = v1 * 10u + static_cast<size_t>(pat[i] - '0');
+        has1 = true;
+        ++i;
+    }
+    if (!has1 || i >= p_end) return pos;
+    if (pat[i] == '}') {
+        min_r = v1;
+        max_r = v1;
+        return i + 1;
+    }
+    if (pat[i] == ',') {
+        ++i;
+        if (i < p_end && pat[i] == '}') {
+            min_r = v1;
+            max_r = 0xFFFFFFu;
+            return i + 1;
+        }
+        size_t v2 = 0;
+        bool has2 = false;
+        while (i < p_end && is_ascii_digit(static_cast<uint8_t>(pat[i]))) {
+            v2 = v2 * 10u + static_cast<size_t>(pat[i] - '0');
+            has2 = true;
+            ++i;
+        }
+        if (has2 && i < p_end && pat[i] == '}') {
+            min_r = v1;
+            max_r = (v2 < v1) ? v1 : v2;
+            return i + 1;
+        }
+    }
+    return pos;
+}
+
+bool match_branch(RegexCtx& ctx, size_t p_pos, size_t p_end, size_t t_pos, size_t* out_end, int depth) {
+    if (++ctx.steps > ctx.max_steps || depth > 64) return false;
+    if (p_pos >= p_end) {
+        *out_end = t_pos;
+        return true;
+    }
+
+    // Anchors & zero-width boundary assertions
+    if (ctx.pat[p_pos] == '^') {
+        bool at_start = (t_pos == 0) || (ctx.multiline && t_pos > 0 && ctx.text[t_pos - 1] == '\n');
+        return at_start ? match_branch(ctx, p_pos + 1, p_end, t_pos, out_end, depth) : false;
+    }
+    if (ctx.pat[p_pos] == '$') {
+        bool at_end = (t_pos == ctx.text_len) || (ctx.multiline && t_pos < ctx.text_len && ctx.text[t_pos] == '\n');
+        return at_end ? match_branch(ctx, p_pos + 1, p_end, t_pos, out_end, depth) : false;
+    }
+    if (ctx.pat[p_pos] == '\\' && p_pos + 1 < p_end && (ctx.pat[p_pos + 1] == 'b' || ctx.pat[p_pos + 1] == 'B')) {
+        bool prev_w = (t_pos > 0) && is_ascii_word(static_cast<uint8_t>(ctx.text[t_pos - 1]));
+        bool curr_w = (t_pos < ctx.text_len) && is_ascii_word(static_cast<uint8_t>(ctx.text[t_pos]));
+        bool is_bound = (prev_w != curr_w);
+        bool ok = (ctx.pat[p_pos + 1] == 'b') ? is_bound : !is_bound;
+        return ok ? match_branch(ctx, p_pos + 2, p_end, t_pos, out_end, depth) : false;
+    }
+
+    // Identify single atom span [a_start, a_end)
+    size_t a_start = p_pos;
+    size_t a_end = p_pos;
+    if (ctx.pat[p_pos] == '(') {
+        int paren_depth = 1;
+        size_t i = p_pos + 1;
+        while (i < p_end && paren_depth > 0) {
+            if (ctx.pat[i] == '\\' && i + 1 < p_end) {
+                i += 2;
+                continue;
+            }
+            if (ctx.pat[i] == '[') {
+                ++i;
+                while (i < p_end) {
+                    if (ctx.pat[i] == '\\' && i + 1 < p_end) i += 2;
+                    else if (ctx.pat[i] == ']') { ++i; break; }
+                    else ++i;
+                }
+                continue;
+            }
+            if (ctx.pat[i] == '(') ++paren_depth;
+            else if (ctx.pat[i] == ')') --paren_depth;
+            ++i;
+        }
+        a_end = i;
+    } else if (ctx.pat[p_pos] == '[') {
+        size_t i = p_pos + 1;
+        if (i < p_end && ctx.pat[i] == '^') ++i;
+        if (i < p_end && ctx.pat[i] == ']') ++i;
+        while (i < p_end) {
+            if (ctx.pat[i] == '\\' && i + 1 < p_end) i += 2;
+            else if (ctx.pat[i] == ']') { ++i; break; }
+            else ++i;
+        }
+        a_end = i;
+    } else if (ctx.pat[p_pos] == '\\' && p_pos + 1 < p_end) {
+        a_end = p_pos + 2;
+    } else {
+        a_end = p_pos + 1;
+    }
+
+    // Parse optional quantifier (*, +, ?, {m,n}) and lazy modifier (?)
+    size_t min_rep = 1;
+    size_t max_rep = 1;
+    size_t next_p = a_end;
+    bool has_quant = false;
+    bool lazy = false;
+
+    if (next_p < p_end) {
+        char q = ctx.pat[next_p];
+        if (q == '*') { min_rep = 0; max_rep = 0xFFFFFFu; ++next_p; has_quant = true; }
+        else if (q == '+') { min_rep = 1; max_rep = 0xFFFFFFu; ++next_p; has_quant = true; }
+        else if (q == '?') { min_rep = 0; max_rep = 1; ++next_p; has_quant = true; }
+        else if (q == '{') {
+            size_t after_q = parse_brace_quantifier(ctx.pat, next_p, p_end, min_rep, max_rep);
+            if (after_q != next_p) {
+                next_p = after_q;
+                has_quant = true;
+            }
+        }
+        if (has_quant && next_p < p_end && ctx.pat[next_p] == '?') {
+            lazy = true;
+            ++next_p;
+        }
+    }
+
+    if (!has_quant) {
+        size_t mid_t = 0;
+        if (!match_atom(ctx, a_start, a_end, t_pos, &mid_t, depth)) return false;
+        return match_branch(ctx, next_p, p_end, mid_t, out_end, depth);
+    }
+
+    // Collect greedy reachable positions (capped to text_len + 1)
+    size_t cur_t = t_pos;
+    size_t rep = 0;
+    while (rep < min_rep) {
+        size_t nxt = 0;
+        if (!match_atom(ctx, a_start, a_end, cur_t, &nxt, depth)) return false;
+        cur_t = nxt;
+        ++rep;
+    }
+
+    if (lazy) {
+        while (rep <= max_rep) {
+            if (match_branch(ctx, next_p, p_end, cur_t, out_end, depth)) return true;
+            size_t nxt = 0;
+            if (!match_atom(ctx, a_start, a_end, cur_t, &nxt, depth)) break;
+            if (nxt == cur_t) break;
+            cur_t = nxt;
+            ++rep;
+        }
+        return false;
+    }
+
+    // Greedy: stack positions in a small bounded array / heap buffer
+    static constexpr size_t STACK_POS_CAP = 256;
+    size_t stack_pos[STACK_POS_CAP];
+    size_t count = 1;
+    stack_pos[0] = cur_t;
+
+    while (rep < max_rep && count < STACK_POS_CAP) {
+        size_t nxt = 0;
+        if (!match_atom(ctx, a_start, a_end, cur_t, &nxt, depth)) break;
+        if (nxt == cur_t) break;
+        cur_t = nxt;
+        stack_pos[count++] = cur_t;
+        ++rep;
+    }
+
+    for (size_t idx = count; idx > 0; --idx) {
+        if (match_branch(ctx, next_p, p_end, stack_pos[idx - 1], out_end, depth)) return true;
+    }
+    return false;
+}
+
+bool match_seq(RegexCtx& ctx, size_t p_start, size_t p_end, size_t t_pos, size_t* out_end, int depth) {
+    if (++ctx.steps > ctx.max_steps || depth > 64) return false;
+
+    // Split top-level alternations `a|b|c`
+    int paren = 0;
+    size_t seg_start = p_start;
+    for (size_t i = p_start; i <= p_end; ++i) {
+        bool at_end = (i == p_end);
+        if (!at_end) {
+            if (ctx.pat[i] == '\\' && i + 1 < p_end) { ++i; continue; }
+            if (ctx.pat[i] == '[') {
+                ++i;
+                while (i < p_end) {
+                    if (ctx.pat[i] == '\\' && i + 1 < p_end) i += 2;
+                    else if (ctx.pat[i] == ']') break;
+                    else ++i;
+                }
+                continue;
+            }
+            if (ctx.pat[i] == '(') { ++paren; continue; }
+            if (ctx.pat[i] == ')') { if (paren > 0) --paren; continue; }
+        }
+        if (at_end || (paren == 0 && ctx.pat[i] == '|')) {
+            if (match_branch(ctx, seg_start, i, t_pos, out_end, depth)) {
+                return true;
+            }
+            seg_start = i + 1;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 extern "C" {
@@ -149,6 +502,116 @@ size_t manta_cpp_scan_html_delim(const uint8_t* data, size_t len, size_t start) 
     return len;
 }
 
+int64_t manta_cpp_find_substr(const uint8_t* hay, size_t hay_len,
+                              const uint8_t* needle, size_t needle_len, size_t start) {
+    if (needle_len == 0) {
+        return (start <= hay_len) ? static_cast<int64_t>(start) : -1;
+    }
+    if (!hay || !needle || start + needle_len > hay_len) return -1;
+
+    const uint8_t first = needle[0];
+    const size_t limit = hay_len - needle_len;
+    size_t i = start;
+
+#if defined(__SSE2__)
+    const __m128i first_vec = _mm_set1_epi8(static_cast<char>(first));
+    while (i + 16 <= limit + 1) {
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hay + i));
+        int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, first_vec));
+        while (mask != 0) {
+            int bit = __builtin_ctz(static_cast<unsigned>(mask));
+            size_t pos = i + static_cast<size_t>(bit);
+            if (pos <= limit && ::memcmp(hay + pos, needle, needle_len) == 0) {
+                return static_cast<int64_t>(pos);
+            }
+            mask &= (mask - 1);
+        }
+        i += 16;
+    }
+#elif defined(__aarch64__)
+    const uint8x16_t first_vec = vdupq_n_u8(first);
+    while (i + 16 <= limit + 1) {
+        uint8x16_t chunk = vld1q_u8(hay + i);
+        uint8x16_t eq = vceqq_u8(chunk, first_vec);
+        if (vmaxvq_u8(eq) != 0) {
+            for (size_t k = 0; k < 16; ++k) {
+                size_t pos = i + k;
+                if (pos <= limit && hay[pos] == first && ::memcmp(hay + pos, needle, needle_len) == 0) {
+                    return static_cast<int64_t>(pos);
+                }
+            }
+        }
+        i += 16;
+    }
+#endif
+
+    while (i <= limit) {
+        if (hay[i] == first && ::memcmp(hay + i, needle, needle_len) == 0) {
+            return static_cast<int64_t>(i);
+        }
+        ++i;
+    }
+    return -1;
+}
+
+int32_t manta_cpp_regex_match(const char* pattern, size_t pat_len,
+                              const char* flags, size_t flags_len,
+                              const char* text, size_t text_len,
+                              size_t start_pos,
+                              size_t* out_match_start, size_t* out_match_end) {
+    if (!pattern || !text || pat_len > 2048 || start_pos > text_len) return 0;
+
+    RegexCtx ctx = {};
+    ctx.pat = pattern;
+    ctx.pat_len = pat_len;
+    ctx.text = text;
+    ctx.text_len = text_len;
+    ctx.max_steps = 250000u;
+
+    if (flags) {
+        for (size_t i = 0; i < flags_len; ++i) {
+            if (flags[i] == 'i') ctx.case_insensitive = true;
+            else if (flags[i] == 'm') ctx.multiline = true;
+            else if (flags[i] == 's') ctx.dot_all = true;
+        }
+    }
+
+    for (size_t pos = start_pos; pos <= text_len; ++pos) {
+        ctx.steps = 0;
+        size_t end_pos = pos;
+        if (match_seq(ctx, 0, pat_len, pos, &end_pos, 0)) {
+            if (out_match_start) *out_match_start = pos;
+            if (out_match_end) *out_match_end = end_pos;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+double manta_cpp_f64_sum(const double* arr, size_t len) {
+    if (!arr || len == 0) return 0.0;
+    double acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    size_t i = 0;
+    for (; i + 4 <= len; i += 4) {
+        acc0 += arr[i];
+        acc1 += arr[i + 1];
+        acc2 += arr[i + 2];
+        acc3 += arr[i + 3];
+    }
+    double total = (acc0 + acc1) + (acc2 + acc3);
+    for (; i < len; ++i) {
+        total += arr[i];
+    }
+    return total;
+}
+
+void manta_cpp_f64_scale_add(double* dst, const double* src, size_t len, double scale, double bias) {
+    if (!dst || !src || len == 0) return;
+    for (size_t i = 0; i < len; ++i) {
+        dst[i] = src[i] * scale + bias;
+    }
+}
+
 size_t manta_cpp_fast_compress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap) {
     if (!src || !dst || src_len == 0 || dst_cap < 5) return 0;
 
@@ -178,7 +641,6 @@ size_t manta_cpp_fast_compress(const uint8_t* src, size_t src_len, uint8_t* dst,
     };
 
     while (in_pos < src_len) {
-        // 1. Check RLE run (minimum 4 identical bytes)
         size_t run = 1;
         while (in_pos + run < src_len && src[in_pos + run] == src[in_pos] && run < 66) {
             ++run;
@@ -193,7 +655,6 @@ size_t manta_cpp_fast_compress(const uint8_t* src, size_t src_len, uint8_t* dst,
             continue;
         }
 
-        // 2. Check LZ back-reference (4+ byte match within 64 KB window)
         if (in_pos + 4 <= src_len) {
             uint32_t v = read_u32_le(src + in_pos);
             uint32_t h = ((v * 2654435761u) >> (32 - HASH_BITS)) & (HASH_SIZE - 1u);
@@ -409,9 +870,6 @@ void manta_cpp_blend_rect_argb(uint32_t* fb, uint32_t fb_w, uint32_t fb_h,
     }
 }
 
-/* =========================================================================
- * Runtime OpenSSL TLS Transport (Zero Compile-Time Crate Dependencies)
- * ========================================================================= */
 struct MantaTlsHandle {
     void* ssl;
     void* ctx;
@@ -519,12 +977,9 @@ void* manta_cpp_tls_connect(int32_t sock_fd, const char* hostname) {
         return nullptr;
     }
 
-    // Enforce TLS 1.2 minimum (SSL_CTX_ctrl SSL_CTRL_SET_MIN_PROTO_VERSION = 123, TLS1_2_VERSION = 0x0303)
     if (g_ssl.ssl_ctx_ctrl) {
         g_ssl.ssl_ctx_ctrl(ctx, 123, 0x0303L, nullptr);
     }
-
-    // Strict peer certificate verification (SSL_VERIFY_PEER = 1)
     g_ssl.ssl_ctx_set_verify(ctx, 1, nullptr);
 
     void* ssl = g_ssl.ssl_new(ctx);
@@ -533,7 +988,6 @@ void* manta_cpp_tls_connect(int32_t sock_fd, const char* hostname) {
         return nullptr;
     }
 
-    // Hostname verification + SNI (SSL_CTRL_SET_TLSEXT_HOSTNAME = 55, TLSEXT_NAMETYPE_host_name = 0)
     if (g_ssl.ssl_set1_host(ssl, hostname) != 1) {
         g_ssl.ssl_free(ssl);
         g_ssl.ssl_ctx_free(ctx);
@@ -547,7 +1001,6 @@ void* manta_cpp_tls_connect(int32_t sock_fd, const char* hostname) {
         return nullptr;
     }
 
-    // X509_V_OK = 0
     if (g_ssl.ssl_get_verify_result(ssl) != 0L) {
         g_ssl.ssl_shutdown(ssl);
         g_ssl.ssl_free(ssl);

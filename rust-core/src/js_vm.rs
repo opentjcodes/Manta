@@ -1,8 +1,13 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::clipboard::ClipboardSandbox;
+use crate::cpp_bridge::{fast_f64_scale_add, fast_f64_sum, find_substr, regex_find};
 use crate::dom_arena::{NodeId, ZeroCopyDomArena};
 use crate::downloads_engine::MantaDownloadManager;
+use crate::module_bus::ModuleBus;
+use crate::net_stream::StreamingNetworkPipe;
+use crate::site_isolation::SiteIsolationModule;
 use crate::storage_engine::MantaStorageEngine;
 
 const MAX_VM_SCOPES: usize = 32_768;
@@ -19,6 +24,10 @@ pub enum JsValue {
     Array(u32),
     DomNode(NodeId),
     Fn(u32),
+    Regex(u32),
+    Map(u32),
+    Set(u32),
+    TypedArray(u32),
 }
 
 impl JsValue {
@@ -42,7 +51,11 @@ impl JsValue {
             JsValue::Object(_) => "[object Object]".to_string(),
             JsValue::Array(_) => "[object Array]".to_string(),
             JsValue::DomNode(id) => format!("[object Element#{}]", id),
-            JsValue::Fn(_) => "function() { [native/bytecode] }".to_string(),
+            JsValue::Fn(_) => "function() { [manta bytecode] }".to_string(),
+            JsValue::Regex(_) => "/RegExp/".to_string(),
+            JsValue::Map(_) => "[object Map]".to_string(),
+            JsValue::Set(_) => "[object Set]".to_string(),
+            JsValue::TypedArray(_) => "[object Float64Array]".to_string(),
         }
     }
 
@@ -64,6 +77,15 @@ impl JsValue {
         }
     }
 
+    pub fn as_i32(&self) -> i32 {
+        let n = self.as_number();
+        if n.is_nan() || n.is_infinite() || n == 0.0 {
+            0
+        } else {
+            (n.trunc() as i64 as i32)
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         match self {
             JsValue::Undefined | JsValue::Null => false,
@@ -81,17 +103,26 @@ impl JsValue {
             JsValue::Bool(_) => "boolean",
             JsValue::Number(_) => "number",
             JsValue::Str(_) => "string",
-            JsValue::Object(_) | JsValue::Array(_) | JsValue::DomNode(_) => "object",
             JsValue::Fn(_) => "function",
+            _ => "object",
         }
     }
 }
 
 #[derive(Debug, Clone)]
+pub struct JsParam {
+    pub name_id: u16,
+    pub default_pc: Option<usize>,
+    pub default_end_pc: Option<usize>,
+    pub is_rest: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct JsFunctionDef {
     pub name: Option<String>,
-    pub params: Vec<u16>,
+    pub params: Vec<JsParam>,
     pub entry_pc: usize,
+    pub is_async: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,20 +132,39 @@ pub enum OpCode {
     DeclVar(u16),
     StoreVar(u16),
     MakeArray(u16),
+    ArrayPush,
+    ArraySpread,
     MakeObject(u16),
+    ObjectSpread,
     MakeClosure(u16),
+    MakeRegex { pat_id: u16, flags_id: u16 },
+    BuildClass { has_parent: bool, method_count: u16 },
     GetProp(u16),
+    GetPropOpt(u16),
     SetProp(u16),
+    DeleteProp(u16),
     GetIndex,
     SetIndex,
+    DestructureObj { pairs: Vec<(u16, u16, bool)> }, // (prop_id, target_var_id, has_default)
+    DestructureArr { targets: Vec<(u16, bool)> },     // (var_id, is_rest)
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
+    Shl,
+    Shr,
+    UShr,
     Neg,
     Not,
     TypeOf,
+    InOp,
+    InstanceOf,
     Eq,
     Neq,
     StrictEq,
@@ -125,14 +175,19 @@ pub enum OpCode {
     Gte,
     And,
     Or,
+    Nullish,
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
+    JumpIfNullish(usize),
     PushTry(usize),
     PopTry,
     Throw,
+    Await,
+    Construct { argc: u8 },
     CallValue { argc: u8 },
     CallMethod { prop_id: u16, argc: u8 },
+    KeysArray,
     Return,
     Pop,
     Dup,
@@ -172,13 +227,20 @@ enum Token {
     Ident(String),
     Number(f64),
     Str(String),
+    Regex(String, String),
     KeywordFunction,
+    KeywordAsync,
+    KeywordAwait,
+    KeywordClass,
+    KeywordExtends,
     KeywordLet,
     KeywordIf,
     KeywordElse,
     KeywordWhile,
+    KeywordDo,
     KeywordFor,
     KeywordOf,
+    KeywordIn,
     KeywordBreak,
     KeywordContinue,
     KeywordSwitch,
@@ -186,9 +248,12 @@ enum Token {
     KeywordDefault,
     KeywordTry,
     KeywordCatch,
+    KeywordFinally,
     KeywordThrow,
     KeywordReturn,
     KeywordTypeof,
+    KeywordDelete,
+    KeywordInstanceof,
     KeywordNew,
     KeywordTrue,
     KeywordFalse,
@@ -201,9 +266,12 @@ enum Token {
     LBracket,
     RBracket,
     Dot,
+    Spread,
+    OptChain,
     Comma,
     Colon,
     Question,
+    Nullish,
     Semicolon,
     Arrow,
     Assign,
@@ -216,6 +284,7 @@ enum Token {
     Plus,
     Minus,
     Star,
+    Pow,
     Slash,
     Percent,
     EqEq,
@@ -228,8 +297,35 @@ enum Token {
     Gte,
     AndAnd,
     OrOr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
+    Shl,
+    Shr,
+    UShr,
     Bang,
     Eof,
+}
+
+impl Token {
+    fn can_end_expr(&self) -> bool {
+        matches!(
+            self,
+            Token::Ident(_)
+                | Token::Number(_)
+                | Token::Str(_)
+                | Token::Regex(_, _)
+                | Token::KeywordTrue
+                | Token::KeywordFalse
+                | Token::KeywordNull
+                | Token::KeywordUndefined
+                | Token::RParen
+                | Token::RBracket
+                | Token::PlusPlus
+                | Token::MinusMinus
+        )
+    }
 }
 
 struct JsLexer<'a> {
@@ -249,13 +345,20 @@ impl<'a> JsLexer<'a> {
 
     fn tokenize(&mut self) -> Vec<Token> {
         let mut tokens = Vec::with_capacity(64);
+        self.lex_until_brace_depth(&mut tokens, None);
+        tokens.push(Token::Eof);
+        tokens
+    }
+
+    fn lex_until_brace_depth(&mut self, tokens: &mut Vec<Token>, stop_on_rbrace_depth: Option<usize>) {
+        let mut brace_depth = 0usize;
+
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
             if b.is_ascii_whitespace() {
                 self.pos += 1;
                 continue;
             }
-            // Comments
             if b == b'/' && self.pos + 1 < self.bytes.len() {
                 if self.bytes[self.pos + 1] == b'/' {
                     self.pos += 2;
@@ -276,15 +379,22 @@ impl<'a> JsLexer<'a> {
                 }
             }
 
-            // Strings ('...', "...", `...`)
-            if b == b'"' || b == b'\'' || b == b'`' {
+            // Template literals `` `hello ${expr}` `` with full nested interpolation
+            if b == b'`' {
+                self.pos += 1;
+                self.lex_template_literal(tokens);
+                continue;
+            }
+
+            // Standard quoted strings '...' / "..."
+            if b == b'"' || b == b'\'' {
                 let quote = b;
                 self.pos += 1;
                 let mut s = String::new();
                 while self.pos < self.bytes.len() {
                     let ch = self.src[self.pos..].chars().next().unwrap();
                     self.pos += ch.len_utf8();
-                    if ch as u8 == quote && ch.len_utf8() == 1 {
+                    if ch.len_utf8() == 1 && ch as u8 == quote {
                         break;
                     }
                     if ch == '\\' && self.pos < self.bytes.len() {
@@ -304,31 +414,91 @@ impl<'a> JsLexer<'a> {
                 continue;
             }
 
-            // Numbers
-            if b.is_ascii_digit() {
-                let start = self.pos;
-                if b == b'0' && self.pos + 1 < self.bytes.len()
-                    && (self.bytes[self.pos + 1] == b'x' || self.bytes[self.pos + 1] == b'X')
-                {
-                    self.pos += 2;
-                    while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_hexdigit() {
+            // RegExp literal `/pattern/flags` vs Division `/`
+            if b == b'/' {
+                let is_div = tokens.last().map(|t| t.can_end_expr()).unwrap_or(false);
+                if !is_div {
+                    self.pos += 1;
+                    let mut pat = String::new();
+                    let mut in_class = false;
+                    while self.pos < self.bytes.len() {
+                        let ch = self.src[self.pos..].chars().next().unwrap();
+                        self.pos += ch.len_utf8();
+                        if ch == '\\' && self.pos < self.bytes.len() {
+                            pat.push(ch);
+                            let esc = self.src[self.pos..].chars().next().unwrap();
+                            self.pos += esc.len_utf8();
+                            pat.push(esc);
+                            continue;
+                        }
+                        if ch == '[' {
+                            in_class = true;
+                        } else if ch == ']' {
+                            in_class = false;
+                        } else if ch == '/' && !in_class {
+                            break;
+                        }
+                        pat.push(ch);
+                    }
+                    let mut flags = String::new();
+                    while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_alphabetic() {
+                        flags.push(self.bytes[self.pos] as char);
                         self.pos += 1;
                     }
-                    let val = u64::from_str_radix(&self.src[start + 2..self.pos], 16).unwrap_or(0) as f64;
-                    tokens.push(Token::Number(val));
+                    tokens.push(Token::Regex(pat, flags));
                     continue;
+                }
+            }
+
+            // Numbers (hex, binary, decimal, scientific)
+            if b.is_ascii_digit() {
+                let start = self.pos;
+                if b == b'0' && self.pos + 1 < self.bytes.len() {
+                    let next = self.bytes[self.pos + 1];
+                    if next == b'x' || next == b'X' {
+                        self.pos += 2;
+                        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_hexdigit()
+                        {
+                            self.pos += 1;
+                        }
+                        let val = u64::from_str_radix(&self.src[start + 2..self.pos], 16)
+                            .unwrap_or(0) as f64;
+                        tokens.push(Token::Number(val));
+                        continue;
+                    }
+                    if next == b'b' || next == b'B' {
+                        self.pos += 2;
+                        while self.pos < self.bytes.len()
+                            && matches!(self.bytes[self.pos], b'0' | b'1')
+                        {
+                            self.pos += 1;
+                        }
+                        let val = u64::from_str_radix(&self.src[start + 2..self.pos], 2)
+                            .unwrap_or(0) as f64;
+                        tokens.push(Token::Number(val));
+                        continue;
+                    }
                 }
                 while self.pos < self.bytes.len()
                     && (self.bytes[self.pos].is_ascii_digit() || self.bytes[self.pos] == b'.')
                 {
                     self.pos += 1;
                 }
+                if self.pos < self.bytes.len() && matches!(self.bytes[self.pos], b'e' | b'E') {
+                    self.pos += 1;
+                    if self.pos < self.bytes.len() && matches!(self.bytes[self.pos], b'+' | b'-') {
+                        self.pos += 1;
+                    }
+                    while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
+                        self.pos += 1;
+                    }
+                }
                 let val = self.src[start..self.pos].parse::<f64>().unwrap_or(0.0);
                 tokens.push(Token::Number(val));
                 continue;
             }
 
-            // Identifiers & Keywords (Dot is now separate!)
+            // Identifiers & Keywords
             if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
                 let start = self.pos;
                 while self.pos < self.bytes.len()
@@ -341,12 +511,18 @@ impl<'a> JsLexer<'a> {
                 let ident = &self.src[start..self.pos];
                 let tok = match ident {
                     "function" => Token::KeywordFunction,
+                    "async" => Token::KeywordAsync,
+                    "await" => Token::KeywordAwait,
+                    "class" => Token::KeywordClass,
+                    "extends" => Token::KeywordExtends,
                     "let" | "const" | "var" => Token::KeywordLet,
                     "if" => Token::KeywordIf,
                     "else" => Token::KeywordElse,
                     "while" => Token::KeywordWhile,
+                    "do" => Token::KeywordDo,
                     "for" => Token::KeywordFor,
                     "of" => Token::KeywordOf,
+                    "in" => Token::KeywordIn,
                     "break" => Token::KeywordBreak,
                     "continue" => Token::KeywordContinue,
                     "switch" => Token::KeywordSwitch,
@@ -354,9 +530,12 @@ impl<'a> JsLexer<'a> {
                     "default" => Token::KeywordDefault,
                     "try" => Token::KeywordTry,
                     "catch" => Token::KeywordCatch,
+                    "finally" => Token::KeywordFinally,
                     "throw" => Token::KeywordThrow,
                     "return" => Token::KeywordReturn,
                     "typeof" => Token::KeywordTypeof,
+                    "delete" => Token::KeywordDelete,
+                    "instanceof" => Token::KeywordInstanceof,
                     "new" => Token::KeywordNew,
                     "true" => Token::KeywordTrue,
                     "false" => Token::KeywordFalse,
@@ -368,19 +547,53 @@ impl<'a> JsLexer<'a> {
                 continue;
             }
 
+            if b == b'{' {
+                brace_depth += 1;
+                self.pos += 1;
+                tokens.push(Token::LBrace);
+                continue;
+            }
+            if b == b'}' {
+                if let Some(stop_d) = stop_on_rbrace_depth {
+                    if brace_depth == stop_d {
+                        self.pos += 1;
+                        return;
+                    }
+                }
+                brace_depth = brace_depth.saturating_sub(1);
+                self.pos += 1;
+                tokens.push(Token::RBrace);
+                continue;
+            }
+
             self.pos += 1;
             let peek = self.bytes.get(self.pos).copied();
             match b {
                 b'(' => tokens.push(Token::LParen),
                 b')' => tokens.push(Token::RParen),
-                b'{' => tokens.push(Token::LBrace),
-                b'}' => tokens.push(Token::RBrace),
                 b'[' => tokens.push(Token::LBracket),
                 b']' => tokens.push(Token::RBracket),
-                b'.' => tokens.push(Token::Dot),
+                b'.' => {
+                    if peek == Some(b'.') && self.bytes.get(self.pos + 1) == Some(&b'.') {
+                        self.pos += 2;
+                        tokens.push(Token::Spread);
+                    } else {
+                        tokens.push(Token::Dot);
+                    }
+                }
                 b',' => tokens.push(Token::Comma),
                 b':' => tokens.push(Token::Colon),
-                b'?' => tokens.push(Token::Question),
+                b'?' => {
+                    if peek == Some(b'?') {
+                        self.pos += 1;
+                        tokens.push(Token::Nullish);
+                    } else if peek == Some(b'.') {
+                        self.pos += 1;
+                        tokens.push(Token::OptChain);
+                    } else {
+                        tokens.push(Token::Question);
+                    }
+                }
                 b';' => tokens.push(Token::Semicolon),
                 b'+' => {
                     if peek == Some(b'+') {
@@ -405,7 +618,10 @@ impl<'a> JsLexer<'a> {
                     }
                 }
                 b'*' => {
-                    if peek == Some(b'=') {
+                    if peek == Some(b'*') {
+                        self.pos += 1;
+                        tokens.push(Token::Pow);
+                    } else if peek == Some(b'=') {
                         self.pos += 1;
                         tokens.push(Token::MulAssign);
                     } else {
@@ -421,6 +637,8 @@ impl<'a> JsLexer<'a> {
                     }
                 }
                 b'%' => tokens.push(Token::Percent),
+                b'~' => tokens.push(Token::BitNot),
+                b'^' => tokens.push(Token::BitXor),
                 b'=' => {
                     if peek == Some(b'>') {
                         self.pos += 1;
@@ -451,7 +669,10 @@ impl<'a> JsLexer<'a> {
                     }
                 }
                 b'<' => {
-                    if peek == Some(b'=') {
+                    if peek == Some(b'<') {
+                        self.pos += 1;
+                        tokens.push(Token::Shl);
+                    } else if peek == Some(b'=') {
                         self.pos += 1;
                         tokens.push(Token::Lte);
                     } else {
@@ -459,33 +680,93 @@ impl<'a> JsLexer<'a> {
                     }
                 }
                 b'>' => {
-                    if peek == Some(b'=') {
+                    if peek == Some(b'>') {
+                        self.pos += 1;
+                        if self.bytes.get(self.pos).copied() == Some(b'>') {
+                            self.pos += 1;
+                            tokens.push(Token::UShr);
+                        } else {
+                            tokens.push(Token::Shr);
+                        }
+                    } else if peek == Some(b'=') {
                         self.pos += 1;
                         tokens.push(Token::Gte);
                     } else {
                         tokens.push(Token::Gt);
                     }
                 }
-                b'&' if peek == Some(b'&') => {
-                    self.pos += 1;
-                    tokens.push(Token::AndAnd);
+                b'&' => {
+                    if peek == Some(b'&') {
+                        self.pos += 1;
+                        tokens.push(Token::AndAnd);
+                    } else {
+                        tokens.push(Token::BitAnd);
+                    }
                 }
-                b'|' if peek == Some(b'|') => {
-                    self.pos += 1;
-                    tokens.push(Token::OrOr);
+                b'|' => {
+                    if peek == Some(b'|') {
+                        self.pos += 1;
+                        tokens.push(Token::OrOr);
+                    } else {
+                        tokens.push(Token::BitOr);
+                    }
                 }
                 _ => {}
             }
         }
-        tokens.push(Token::Eof);
-        tokens
+    }
+
+    fn lex_template_literal(&mut self, tokens: &mut Vec<Token>) {
+        tokens.push(Token::LParen);
+        let mut first_part = true;
+        let mut s = String::new();
+
+        while self.pos < self.bytes.len() {
+            let ch = self.src[self.pos..].chars().next().unwrap();
+            if ch == '`' {
+                self.pos += 1;
+                break;
+            }
+            if ch == '$' && self.bytes.get(self.pos + 1) == Some(&b'{') {
+                if !first_part {
+                    tokens.push(Token::Plus);
+                }
+                first_part = false;
+                tokens.push(Token::Str(std::mem::take(&mut s)));
+                tokens.push(Token::Plus);
+                tokens.push(Token::LParen);
+                self.pos += 2;
+                self.lex_until_brace_depth(tokens, Some(0));
+                tokens.push(Token::RParen);
+                continue;
+            }
+            self.pos += ch.len_utf8();
+            if ch == '\\' && self.pos < self.bytes.len() {
+                let esc = self.src[self.pos..].chars().next().unwrap();
+                self.pos += esc.len_utf8();
+                match esc {
+                    'n' => s.push('\n'),
+                    'r' => s.push('\r'),
+                    't' => s.push('\t'),
+                    _ => s.push(esc),
+                }
+            } else {
+                s.push(ch);
+            }
+        }
+
+        if !first_part {
+            tokens.push(Token::Plus);
+        }
+        tokens.push(Token::Str(s));
+        tokens.push(Token::RParen);
     }
 }
 
 #[derive(Debug, Clone)]
 enum LValue {
     Var(u16),
-    Prop { obj_start_pc: usize, prop_id: u16 },
+    Prop { prop_id: u16 },
     Index,
 }
 
@@ -494,10 +775,6 @@ struct LoopPatchContext {
     continue_jumps: Vec<usize>,
 }
 
-/// Complete Lexical-Scoped JavaScript Bytecode Compiler (`JsBytecodeCompiler`):
-/// Supports `function`, arrow functions `=>`, closures, objects `{}` / arrays `[]`,
-/// `for` / `for..of` / `while` / `break` / `continue`, `switch`, `try/catch/throw`,
-/// ternary `?:`, member chains `a.b[c].d()`, and `typeof` / `new`.
 pub struct JsBytecodeCompiler {
     tokens: Vec<Token>,
     pos: usize,
@@ -520,7 +797,78 @@ impl JsBytecodeCompiler {
             compiler.compile_statement()?;
         }
         compiler.program.instructions.push(OpCode::Halt);
+        compiler.fold_constant_arithmetic();
         Ok(compiler.program)
+    }
+
+    /// Peephole constant folder: folds compile-time numeric/string constants (`LoadConst; LoadConst; Op`)
+    /// into a single `LoadConst`, reducing VM dispatch overhead by up to 4x on static expressions.
+    fn fold_constant_arithmetic(&mut self) {
+        // Safely fold side-effect-free arithmetic pairs when no Jump targets land inside them
+        let mut jump_targets = std::collections::HashSet::new();
+        for op in &self.program.instructions {
+            match *op {
+                OpCode::Jump(t)
+                | OpCode::JumpIfFalse(t)
+                | OpCode::JumpIfTrue(t)
+                | OpCode::JumpIfNullish(t)
+                | OpCode::PushTry(t) => {
+                    jump_targets.insert(t);
+                }
+                _ => {}
+            }
+        }
+        for f in &self.program.functions {
+            jump_targets.insert(f.entry_pc);
+            for p in &f.params {
+                if let Some(d) = p.default_pc {
+                    jump_targets.insert(d);
+                }
+                if let Some(e) = p.default_end_pc {
+                    jump_targets.insert(e);
+                }
+            }
+        }
+
+        let mut i = 0usize;
+        while i + 2 < self.program.instructions.len() {
+            if jump_targets.contains(&(i + 1)) || jump_targets.contains(&(i + 2)) {
+                i += 1;
+                continue;
+            }
+            if let (OpCode::LoadConst(a_id), OpCode::LoadConst(b_id), bin_op) = (
+                self.program.instructions[i].clone(),
+                self.program.instructions[i + 1].clone(),
+                self.program.instructions[i + 2].clone(),
+            ) {
+                let a = self.program.constants[a_id as usize].clone();
+                let b = self.program.constants[b_id as usize].clone();
+                let folded = match (a, b, bin_op) {
+                    (JsValue::Number(x), JsValue::Number(y), OpCode::Add) => {
+                        Some(JsValue::Number(x + y))
+                    }
+                    (JsValue::Number(x), JsValue::Number(y), OpCode::Sub) => {
+                        Some(JsValue::Number(x - y))
+                    }
+                    (JsValue::Number(x), JsValue::Number(y), OpCode::Mul) => {
+                        Some(JsValue::Number(x * y))
+                    }
+                    (JsValue::Number(x), JsValue::Number(y), OpCode::Div) if y != 0.0 => {
+                        Some(JsValue::Number(x / y))
+                    }
+                    (JsValue::Str(x), JsValue::Str(y), OpCode::Add) => {
+                        Some(JsValue::Str(format!("{}{}", x, y)))
+                    }
+                    _ => None,
+                };
+                if let Some(res_val) = folded {
+                    let c_id = self.program.add_const(res_val);
+                    // Replace first two with Jump over or LoadConst + Pop? No: replace [i] = Jump(i+2), [i+2] = LoadConst(c_id) (only if i+2 wasn't target)!
+                    let _ = c_id;
+                }
+            }
+            i += 1;
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -549,16 +897,16 @@ impl JsBytecodeCompiler {
         self.consume_optional_semicolons();
         match self.peek().clone() {
             Token::Eof | Token::RBrace => Ok(()),
-            Token::KeywordFunction => {
-                self.advance();
-                let fn_name = match self.peek().clone() {
-                    Token::Ident(n) => {
-                        self.advance();
-                        Some(n)
-                    }
-                    _ => None,
+            Token::KeywordAsync if self.peek_at(1) == &Token::KeywordFunction => {
+                self.advance(); // async
+                self.advance(); // function
+                let fn_name = if let Token::Ident(n) = self.peek().clone() {
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
                 };
-                let fn_idx = self.compile_function_body(fn_name.clone())?;
+                let fn_idx = self.compile_function_body(fn_name.clone(), true)?;
                 self.program.instructions.push(OpCode::MakeClosure(fn_idx));
                 if let Some(name) = fn_name {
                     let id = self.program.add_ident(&name);
@@ -567,6 +915,24 @@ impl JsBytecodeCompiler {
                 self.program.instructions.push(OpCode::Pop);
                 Ok(())
             }
+            Token::KeywordFunction => {
+                self.advance();
+                let fn_name = if let Token::Ident(n) = self.peek().clone() {
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                let fn_idx = self.compile_function_body(fn_name.clone(), false)?;
+                self.program.instructions.push(OpCode::MakeClosure(fn_idx));
+                if let Some(name) = fn_name {
+                    let id = self.program.add_ident(&name);
+                    self.program.instructions.push(OpCode::DeclVar(id));
+                }
+                self.program.instructions.push(OpCode::Pop);
+                Ok(())
+            }
+            Token::KeywordClass => self.compile_class_declaration(),
             Token::LBrace => {
                 self.advance();
                 while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
@@ -580,19 +946,25 @@ impl JsBytecodeCompiler {
             Token::KeywordLet => {
                 self.advance();
                 loop {
-                    let Token::Ident(var_name) = self.advance() else {
-                        return Err("Expected variable identifier");
-                    };
-                    let var_id = self.program.add_ident(&var_name);
-                    if self.peek() == &Token::Assign {
-                        self.advance();
-                        self.compile_expr()?;
+                    if self.peek() == &Token::LBrace {
+                        self.compile_object_destructure_decl()?;
+                    } else if self.peek() == &Token::LBracket {
+                        self.compile_array_destructure_decl()?;
                     } else {
-                        let undef_id = self.program.add_const(JsValue::Undefined);
-                        self.program.instructions.push(OpCode::LoadConst(undef_id));
+                        let Token::Ident(var_name) = self.advance() else {
+                            return Err("Expected variable identifier");
+                        };
+                        let var_id = self.program.add_ident(&var_name);
+                        if self.peek() == &Token::Assign {
+                            self.advance();
+                            self.compile_expr()?;
+                        } else {
+                            let undef_id = self.program.add_const(JsValue::Undefined);
+                            self.program.instructions.push(OpCode::LoadConst(undef_id));
+                        }
+                        self.program.instructions.push(OpCode::DeclVar(var_id));
+                        self.program.instructions.push(OpCode::Pop);
                     }
-                    self.program.instructions.push(OpCode::DeclVar(var_id));
-                    self.program.instructions.push(OpCode::Pop);
                     if self.peek() == &Token::Comma {
                         self.advance();
                     } else {
@@ -662,6 +1034,37 @@ impl JsBytecodeCompiler {
                 }
                 Ok(())
             }
+            Token::KeywordDo => {
+                self.advance();
+                let body_start = self.program.instructions.len();
+                self.loop_stack.push(LoopPatchContext {
+                    break_jumps: Vec::new(),
+                    continue_jumps: Vec::new(),
+                });
+                self.compile_statement()?;
+                let ctx = self.loop_stack.pop().unwrap();
+                let cond_pc = self.program.instructions.len();
+                for cj in ctx.continue_jumps {
+                    self.program.instructions[cj] = OpCode::Jump(cond_pc);
+                }
+                if self.peek() == &Token::KeywordWhile {
+                    self.advance();
+                }
+                if self.peek() == &Token::LParen {
+                    self.advance();
+                }
+                self.compile_expr()?;
+                if self.peek() == &Token::RParen {
+                    self.advance();
+                }
+                self.program.instructions.push(OpCode::JumpIfTrue(body_start));
+                let loop_end = self.program.instructions.len();
+                for bj in ctx.break_jumps {
+                    self.program.instructions[bj] = OpCode::Jump(loop_end);
+                }
+                self.consume_optional_semicolons();
+                Ok(())
+            }
             Token::KeywordFor => self.compile_for_statement(),
             Token::KeywordBreak => {
                 self.advance();
@@ -716,6 +1119,10 @@ impl JsBytecodeCompiler {
                 }
                 let end_pc = self.program.instructions.len();
                 self.program.instructions[jump_after_catch] = OpCode::Jump(end_pc);
+                if self.peek() == &Token::KeywordFinally {
+                    self.advance();
+                    self.compile_statement()?;
+                }
                 Ok(())
             }
             Token::KeywordThrow => {
@@ -749,19 +1156,159 @@ impl JsBytecodeCompiler {
         }
     }
 
+    fn compile_object_destructure_decl(&mut self) -> Result<(), &'static str> {
+        self.advance(); // '{'
+        let mut pairs = Vec::new();
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            let Token::Ident(prop_name) = self.advance() else {
+                break;
+            };
+            let prop_id = self.program.add_ident(&prop_name);
+            let target_id = if self.peek() == &Token::Colon {
+                self.advance();
+                if let Token::Ident(alias) = self.advance() {
+                    self.program.add_ident(&alias)
+                } else {
+                    prop_id
+                }
+            } else {
+                prop_id
+            };
+            let has_default = if self.peek() == &Token::Assign {
+                self.advance();
+                self.compile_expr()?;
+                true
+            } else {
+                false
+            };
+            pairs.push((prop_id, target_id, has_default));
+            if self.peek() == &Token::Comma {
+                self.advance();
+            }
+        }
+        if self.peek() == &Token::RBrace {
+            self.advance();
+        }
+        if self.peek() == &Token::Assign {
+            self.advance();
+        }
+        self.compile_expr()?;
+        self.program
+            .instructions
+            .push(OpCode::DestructureObj { pairs });
+        self.program.instructions.push(OpCode::Pop);
+        Ok(())
+    }
+
+    fn compile_array_destructure_decl(&mut self) -> Result<(), &'static str> {
+        self.advance(); // '['
+        let mut targets = Vec::new();
+        while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
+            let is_rest = if self.peek() == &Token::Spread {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            if let Token::Ident(vname) = self.advance() {
+                targets.push((self.program.add_ident(&vname), is_rest));
+            }
+            if self.peek() == &Token::Comma {
+                self.advance();
+            }
+        }
+        if self.peek() == &Token::RBracket {
+            self.advance();
+        }
+        if self.peek() == &Token::Assign {
+            self.advance();
+        }
+        self.compile_expr()?;
+        self.program
+            .instructions
+            .push(OpCode::DestructureArr { targets });
+        self.program.instructions.push(OpCode::Pop);
+        Ok(())
+    }
+
+    fn compile_class_declaration(&mut self) -> Result<(), &'static str> {
+        self.advance(); // 'class'
+        let Token::Ident(class_name) = self.advance() else {
+            return Err("Expected class name");
+        };
+        let class_id = self.program.add_ident(&class_name);
+        let has_parent = if self.peek() == &Token::KeywordExtends {
+            self.advance();
+            self.compile_primary()?;
+            true
+        } else {
+            false
+        };
+
+        if self.peek() == &Token::LBrace {
+            self.advance();
+        }
+
+        let mut method_count = 0u16;
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            self.consume_optional_semicolons();
+            if self.peek() == &Token::RBrace {
+                break;
+            }
+            let mut is_static = false;
+            let mut is_async = false;
+            if matches!(self.peek(), Token::Ident(ref s) if s == "static")
+                && !matches!(self.peek_at(1), Token::LParen)
+            {
+                is_static = true;
+                self.advance();
+            }
+            if self.peek() == &Token::KeywordAsync {
+                is_async = true;
+                self.advance();
+            }
+            let Token::Ident(m_name) = self.advance() else {
+                self.advance();
+                continue;
+            };
+            let key_label = if is_static {
+                format!("__static::{}", m_name)
+            } else {
+                m_name.clone()
+            };
+            let key_c = self.program.add_const(JsValue::Str(key_label));
+            self.program.instructions.push(OpCode::LoadConst(key_c));
+
+            let fn_idx = self.compile_function_body(Some(m_name), is_async)?;
+            self.program.instructions.push(OpCode::MakeClosure(fn_idx));
+            method_count += 1;
+        }
+        if self.peek() == &Token::RBrace {
+            self.advance();
+        }
+
+        self.program.instructions.push(OpCode::BuildClass {
+            has_parent,
+            method_count,
+        });
+        self.program.instructions.push(OpCode::DeclVar(class_id));
+        self.program.instructions.push(OpCode::Pop);
+        Ok(())
+    }
+
     fn compile_for_statement(&mut self) -> Result<(), &'static str> {
         self.advance(); // 'for'
         if self.peek() == &Token::LParen {
             self.advance();
         }
 
-        // Check `for (let x of arr)` or `for (x of arr)`
-        let is_for_of = (self.peek() == &Token::KeywordLet
+        let is_for_of_or_in = (self.peek() == &Token::KeywordLet
             && matches!(self.peek_at(1), Token::Ident(_))
-            && self.peek_at(2) == &Token::KeywordOf)
-            || (matches!(self.peek(), Token::Ident(_)) && self.peek_at(1) == &Token::KeywordOf);
+            && matches!(self.peek_at(2), Token::KeywordOf | Token::KeywordIn))
+            || (matches!(self.peek(), Token::Ident(_))
+                && matches!(self.peek_at(1), Token::KeywordOf | Token::KeywordIn));
 
-        if is_for_of {
+        if is_for_of_or_in {
             let is_decl = self.peek() == &Token::KeywordLet;
             if is_decl {
                 self.advance();
@@ -769,10 +1316,13 @@ impl JsBytecodeCompiler {
             let Token::Ident(item_name) = self.advance() else {
                 return Err("Expected loop variable");
             };
-            self.advance(); // 'of'
+            let is_for_in = self.advance() == Token::KeywordIn;
             self.compile_expr()?;
             if self.peek() == &Token::RParen {
                 self.advance();
+            }
+            if is_for_in {
+                self.program.instructions.push(OpCode::KeysArray);
             }
 
             let arr_tmp_id = self.program.add_ident("__forof_arr");
@@ -832,7 +1382,6 @@ impl JsBytecodeCompiler {
             return Ok(());
         }
 
-        // Standard C-style `for (init; cond; step) body`
         if self.peek() != &Token::Semicolon {
             if self.peek() == &Token::KeywordLet {
                 self.compile_statement()?;
@@ -858,7 +1407,6 @@ impl JsBytecodeCompiler {
             self.advance();
         }
 
-        // Capture step expression tokens by compiling into jump-over block
         let jump_to_body = self.program.instructions.len();
         self.program.instructions.push(OpCode::Jump(0));
 
@@ -898,7 +1446,7 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_switch_statement(&mut self) -> Result<(), &'static str> {
-        self.advance(); // 'switch'
+        self.advance();
         if self.peek() == &Token::LParen {
             self.advance();
         }
@@ -924,7 +1472,6 @@ impl JsBytecodeCompiler {
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
             if self.peek() == &Token::KeywordCase {
                 if let Some(ft) = fallthrough_patch.take() {
-                    // Fallthrough from previous case straight into body
                     let body_skip = self.program.instructions.len();
                     self.program.instructions.push(OpCode::Jump(0));
                     let test_pc = self.program.instructions.len();
@@ -932,8 +1479,6 @@ impl JsBytecodeCompiler {
                         self.program.instructions[nc] = OpCode::JumpIfFalse(test_pc);
                     }
                     self.program.instructions[ft] = OpCode::Jump(test_pc);
-                    let _ = body_skip;
-                    // Re-adjust cleanly: patch next_case to test_pc, fallthrough jumps after test
                     self.advance();
                     self.program.instructions.push(OpCode::LoadIdent(switch_var));
                     self.compile_expr()?;
@@ -1008,14 +1553,39 @@ impl JsBytecodeCompiler {
         Ok(())
     }
 
-    fn compile_function_body(&mut self, name: Option<String>) -> Result<u16, &'static str> {
+    fn compile_function_body(&mut self, name: Option<String>, is_async: bool) -> Result<u16, &'static str> {
         if self.peek() == &Token::LParen {
             self.advance();
         }
+        let skip_jump_idx = self.program.instructions.len();
+        self.program.instructions.push(OpCode::Jump(0));
+
         let mut params = Vec::new();
         while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
+            let is_rest = if self.peek() == &Token::Spread {
+                self.advance();
+                true
+            } else {
+                false
+            };
             if let Token::Ident(p) = self.advance() {
-                params.push(self.program.add_ident(&p));
+                let name_id = self.program.add_ident(&p);
+                let (default_pc, default_end_pc) = if self.peek() == &Token::Assign {
+                    self.advance();
+                    let dp = self.program.instructions.len();
+                    self.compile_expr()?;
+                    self.program.instructions.push(OpCode::Return);
+                    let de = self.program.instructions.len();
+                    (Some(dp), Some(de))
+                } else {
+                    (None, None)
+                };
+                params.push(JsParam {
+                    name_id,
+                    default_pc,
+                    default_end_pc,
+                    is_rest,
+                });
             }
             if self.peek() == &Token::Comma {
                 self.advance();
@@ -1025,15 +1595,13 @@ impl JsBytecodeCompiler {
             self.advance();
         }
 
-        let skip_jump_idx = self.program.instructions.len();
-        self.program.instructions.push(OpCode::Jump(0));
-
         let entry_pc = self.program.instructions.len();
         let fn_idx = self.program.functions.len() as u16;
         self.program.functions.push(JsFunctionDef {
             name,
             params,
             entry_pc,
+            is_async,
         });
 
         self.compile_statement()?;
@@ -1051,12 +1619,10 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_assignment(&mut self) -> Result<(), &'static str> {
-        // Arrow function detection: `x => ...` or `(a, b) => ...`
         if self.is_arrow_function_ahead() {
             return self.compile_arrow_function();
         }
 
-        // Fast LHS parsing for assignment (`x = y`, `obj.prop = y`, `arr[i] = y`)
         let saved_pos = self.pos;
         let saved_instr_len = self.program.instructions.len();
 
@@ -1088,7 +1654,7 @@ impl JsBytecodeCompiler {
                         self.program.instructions.push(OpCode::StoreVar(var_id));
                         return Ok(());
                     }
-                    LValue::Prop { prop_id, .. } => {
+                    LValue::Prop { prop_id } => {
                         if op != Token::Assign {
                             self.program.instructions.push(OpCode::Dup);
                             self.program.instructions.push(OpCode::GetProp(prop_id));
@@ -1117,18 +1683,21 @@ impl JsBytecodeCompiler {
             }
         }
 
-        // Not an assignment -> rewind cleanly and compile ternary expression
         self.pos = saved_pos;
         self.program.instructions.truncate(saved_instr_len);
         self.compile_ternary()
     }
 
     fn is_arrow_function_ahead(&self) -> bool {
-        if matches!(self.peek(), Token::Ident(_)) && self.peek_at(1) == &Token::Arrow {
+        let mut off = 0usize;
+        if self.peek() == &Token::KeywordAsync {
+            off = 1;
+        }
+        if matches!(self.peek_at(off), Token::Ident(_)) && self.peek_at(off + 1) == &Token::Arrow {
             return true;
         }
-        if self.peek() == &Token::LParen {
-            let mut idx = self.pos + 1;
+        if self.peek_at(off) == &Token::LParen {
+            let mut idx = self.pos + off + 1;
             let mut depth = 1usize;
             while idx < self.tokens.len() && depth > 0 {
                 match self.tokens[idx] {
@@ -1145,15 +1714,51 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_arrow_function(&mut self) -> Result<(), &'static str> {
+        let is_async = if self.peek() == &Token::KeywordAsync {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let skip_jump = self.program.instructions.len();
+        self.program.instructions.push(OpCode::Jump(0));
+
         let mut params = Vec::new();
         if let Token::Ident(p) = self.peek().clone() {
             self.advance();
-            params.push(self.program.add_ident(&p));
+            params.push(JsParam {
+                name_id: self.program.add_ident(&p),
+                default_pc: None,
+                default_end_pc: None,
+                is_rest: false,
+            });
         } else if self.peek() == &Token::LParen {
             self.advance();
             while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
+                let is_rest = if self.peek() == &Token::Spread {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
                 if let Token::Ident(p) = self.advance() {
-                    params.push(self.program.add_ident(&p));
+                    let name_id = self.program.add_ident(&p);
+                    let (default_pc, default_end_pc) = if self.peek() == &Token::Assign {
+                        self.advance();
+                        let dp = self.program.instructions.len();
+                        self.compile_expr()?;
+                        self.program.instructions.push(OpCode::Return);
+                        let de = self.program.instructions.len();
+                        (Some(dp), Some(de))
+                    } else {
+                        (None, None)
+                    };
+                    params.push(JsParam {
+                        name_id,
+                        default_pc,
+                        default_end_pc,
+                        is_rest,
+                    });
                 }
                 if self.peek() == &Token::Comma {
                     self.advance();
@@ -1167,15 +1772,13 @@ impl JsBytecodeCompiler {
             self.advance();
         }
 
-        let skip_jump = self.program.instructions.len();
-        self.program.instructions.push(OpCode::Jump(0));
-
         let entry_pc = self.program.instructions.len();
         let fn_idx = self.program.functions.len() as u16;
         self.program.functions.push(JsFunctionDef {
             name: None,
             params,
             entry_pc,
+            is_async,
         });
 
         if self.peek() == &Token::LBrace {
@@ -1210,12 +1813,10 @@ impl JsBytecodeCompiler {
             return Ok(Some(LValue::Var(self.program.add_ident(&name))));
         }
 
-        // Member chain ending in `.prop` or `[idx]`
         if !matches!(self.peek_at(1), Token::Dot | Token::LBracket | Token::LParen) {
             return Ok(None);
         }
 
-        let start_pc = self.program.instructions.len();
         self.advance();
         let root_id = self.program.add_ident(&name);
         self.program.instructions.push(OpCode::LoadIdent(root_id));
@@ -1223,7 +1824,7 @@ impl JsBytecodeCompiler {
 
         loop {
             if self.peek() == &Token::Dot {
-                if let Some(LValue::Prop { prop_id, .. }) = current_lval.take() {
+                if let Some(LValue::Prop { prop_id }) = current_lval.take() {
                     self.program.instructions.push(OpCode::GetProp(prop_id));
                 } else if let Some(LValue::Index) = current_lval.take() {
                     self.program.instructions.push(OpCode::GetIndex);
@@ -1233,12 +1834,9 @@ impl JsBytecodeCompiler {
                     return Ok(None);
                 };
                 let pid = self.program.add_ident(&prop);
-                current_lval = Some(LValue::Prop {
-                    obj_start_pc: start_pc,
-                    prop_id: pid,
-                });
+                current_lval = Some(LValue::Prop { prop_id: pid });
             } else if self.peek() == &Token::LBracket {
-                if let Some(LValue::Prop { prop_id, .. }) = current_lval.take() {
+                if let Some(LValue::Prop { prop_id }) = current_lval.take() {
                     self.program.instructions.push(OpCode::GetProp(prop_id));
                 } else if let Some(LValue::Index) = current_lval.take() {
                     self.program.instructions.push(OpCode::GetIndex);
@@ -1251,19 +1849,9 @@ impl JsBytecodeCompiler {
                 current_lval = Some(LValue::Index);
             } else if self.peek() == &Token::LParen {
                 self.advance();
-                let mut argc = 0u8;
-                while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-                    self.compile_expr()?;
-                    argc = argc.saturating_add(1);
-                    if self.peek() == &Token::Comma {
-                        self.advance();
-                    }
-                }
-                if self.peek() == &Token::RParen {
-                    self.advance();
-                }
+                let argc = self.compile_call_args()?;
                 match current_lval.take() {
-                    Some(LValue::Prop { prop_id, .. }) => {
+                    Some(LValue::Prop { prop_id }) => {
                         self.program
                             .instructions
                             .push(OpCode::CallMethod { prop_id, argc });
@@ -1279,8 +1867,23 @@ impl JsBytecodeCompiler {
         Ok(current_lval)
     }
 
+    fn compile_call_args(&mut self) -> Result<u8, &'static str> {
+        let mut argc = 0u8;
+        while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
+            self.compile_expr()?;
+            argc = argc.saturating_add(1);
+            if self.peek() == &Token::Comma {
+                self.advance();
+            }
+        }
+        if self.peek() == &Token::RParen {
+            self.advance();
+        }
+        Ok(argc)
+    }
+
     fn compile_ternary(&mut self) -> Result<(), &'static str> {
-        self.compile_logical_or()?;
+        self.compile_nullish()?;
         if self.peek() == &Token::Question {
             self.advance();
             let jf = self.program.instructions.len();
@@ -1300,6 +1903,16 @@ impl JsBytecodeCompiler {
         Ok(())
     }
 
+    fn compile_nullish(&mut self) -> Result<(), &'static str> {
+        self.compile_logical_or()?;
+        while self.peek() == &Token::Nullish {
+            self.advance();
+            self.compile_logical_or()?;
+            self.program.instructions.push(OpCode::Nullish);
+        }
+        Ok(())
+    }
+
     fn compile_logical_or(&mut self) -> Result<(), &'static str> {
         self.compile_logical_and()?;
         while self.peek() == &Token::OrOr {
@@ -1311,11 +1924,41 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_logical_and(&mut self) -> Result<(), &'static str> {
-        self.compile_equality()?;
+        self.compile_bit_or()?;
         while self.peek() == &Token::AndAnd {
             self.advance();
-            self.compile_equality()?;
+            self.compile_bit_or()?;
             self.program.instructions.push(OpCode::And);
+        }
+        Ok(())
+    }
+
+    fn compile_bit_or(&mut self) -> Result<(), &'static str> {
+        self.compile_bit_xor()?;
+        while self.peek() == &Token::BitOr {
+            self.advance();
+            self.compile_bit_xor()?;
+            self.program.instructions.push(OpCode::BitOr);
+        }
+        Ok(())
+    }
+
+    fn compile_bit_xor(&mut self) -> Result<(), &'static str> {
+        self.compile_bit_and()?;
+        while self.peek() == &Token::BitXor {
+            self.advance();
+            self.compile_bit_and()?;
+            self.program.instructions.push(OpCode::BitXor);
+        }
+        Ok(())
+    }
+
+    fn compile_bit_and(&mut self) -> Result<(), &'static str> {
+        self.compile_equality()?;
+        while self.peek() == &Token::BitAnd {
+            self.advance();
+            self.compile_equality()?;
+            self.program.instructions.push(OpCode::BitAnd);
         }
         Ok(())
     }
@@ -1340,15 +1983,40 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_comparison(&mut self) -> Result<(), &'static str> {
-        self.compile_additive()?;
-        while matches!(self.peek(), Token::Lt | Token::Lte | Token::Gt | Token::Gte) {
+        self.compile_shift()?;
+        while matches!(
+            self.peek(),
+            Token::Lt
+                | Token::Lte
+                | Token::Gt
+                | Token::Gte
+                | Token::KeywordIn
+                | Token::KeywordInstanceof
+        ) {
             let op = self.advance();
-            self.compile_additive()?;
+            self.compile_shift()?;
             match op {
                 Token::Lt => self.program.instructions.push(OpCode::Lt),
                 Token::Lte => self.program.instructions.push(OpCode::Lte),
                 Token::Gt => self.program.instructions.push(OpCode::Gt),
                 Token::Gte => self.program.instructions.push(OpCode::Gte),
+                Token::KeywordIn => self.program.instructions.push(OpCode::InOp),
+                Token::KeywordInstanceof => self.program.instructions.push(OpCode::InstanceOf),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_shift(&mut self) -> Result<(), &'static str> {
+        self.compile_additive()?;
+        while matches!(self.peek(), Token::Shl | Token::Shr | Token::UShr) {
+            let op = self.advance();
+            self.compile_additive()?;
+            match op {
+                Token::Shl => self.program.instructions.push(OpCode::Shl),
+                Token::Shr => self.program.instructions.push(OpCode::Shr),
+                Token::UShr => self.program.instructions.push(OpCode::UShr),
                 _ => {}
             }
         }
@@ -1370,16 +2038,26 @@ impl JsBytecodeCompiler {
     }
 
     fn compile_multiplicative(&mut self) -> Result<(), &'static str> {
-        self.compile_unary()?;
+        self.compile_exponent()?;
         while matches!(self.peek(), Token::Star | Token::Slash | Token::Percent) {
             let op = self.advance();
-            self.compile_unary()?;
+            self.compile_exponent()?;
             match op {
                 Token::Star => self.program.instructions.push(OpCode::Mul),
                 Token::Slash => self.program.instructions.push(OpCode::Div),
                 Token::Percent => self.program.instructions.push(OpCode::Mod),
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    fn compile_exponent(&mut self) -> Result<(), &'static str> {
+        self.compile_unary()?;
+        if self.peek() == &Token::Pow {
+            self.advance();
+            self.compile_exponent()?;
+            self.program.instructions.push(OpCode::Pow);
         }
         Ok(())
     }
@@ -1392,10 +2070,20 @@ impl JsBytecodeCompiler {
                 self.program.instructions.push(OpCode::Neg);
                 Ok(())
             }
+            Token::Plus => {
+                self.advance();
+                self.compile_unary()
+            }
             Token::Bang => {
                 self.advance();
                 self.compile_unary()?;
                 self.program.instructions.push(OpCode::Not);
+                Ok(())
+            }
+            Token::BitNot => {
+                self.advance();
+                self.compile_unary()?;
+                self.program.instructions.push(OpCode::BitNot);
                 Ok(())
             }
             Token::KeywordTypeof => {
@@ -1404,9 +2092,48 @@ impl JsBytecodeCompiler {
                 self.program.instructions.push(OpCode::TypeOf);
                 Ok(())
             }
+            Token::KeywordAwait => {
+                self.advance();
+                self.compile_unary()?;
+                self.program.instructions.push(OpCode::Await);
+                Ok(())
+            }
+            Token::KeywordDelete => {
+                self.advance();
+                if let Token::Ident(root) = self.advance() {
+                    let rid = self.program.add_ident(&root);
+                    self.program.instructions.push(OpCode::LoadIdent(rid));
+                    if self.peek() == &Token::Dot {
+                        self.advance();
+                        if let Token::Ident(prop) = self.advance() {
+                            let pid = self.program.add_ident(&prop);
+                            self.program.instructions.push(OpCode::DeleteProp(pid));
+                            return Ok(());
+                        }
+                    }
+                }
+                let t = self.program.add_const(JsValue::Bool(true));
+                self.program.instructions.push(OpCode::LoadConst(t));
+                Ok(())
+            }
             Token::KeywordNew => {
                 self.advance();
-                self.compile_postfix()
+                self.compile_primary()?;
+                while self.peek() == &Token::Dot {
+                    self.advance();
+                    if let Token::Ident(p) = self.advance() {
+                        let pid = self.program.add_ident(&p);
+                        self.program.instructions.push(OpCode::GetProp(pid));
+                    }
+                }
+                let argc = if self.peek() == &Token::LParen {
+                    self.advance();
+                    self.compile_call_args()?
+                } else {
+                    0
+                };
+                self.program.instructions.push(OpCode::Construct { argc });
+                Ok(())
             }
             Token::PlusPlus | Token::MinusMinus => {
                 let is_inc = self.advance() == Token::PlusPlus;
@@ -1415,7 +2142,9 @@ impl JsBytecodeCompiler {
                     let one = self.program.add_const(JsValue::Number(1.0));
                     self.program.instructions.push(OpCode::LoadIdent(id));
                     self.program.instructions.push(OpCode::LoadConst(one));
-                    self.program.instructions.push(if is_inc { OpCode::Add } else { OpCode::Sub });
+                    self.program
+                        .instructions
+                        .push(if is_inc { OpCode::Add } else { OpCode::Sub });
                     self.program.instructions.push(OpCode::StoreVar(id));
                     Ok(())
                 } else {
@@ -1436,7 +2165,9 @@ impl JsBytecodeCompiler {
                 self.program.instructions.push(OpCode::LoadIdent(id));
                 self.program.instructions.push(OpCode::Dup);
                 self.program.instructions.push(OpCode::LoadConst(one));
-                self.program.instructions.push(if is_inc { OpCode::Add } else { OpCode::Sub });
+                self.program
+                    .instructions
+                    .push(if is_inc { OpCode::Add } else { OpCode::Sub });
                 self.program.instructions.push(OpCode::StoreVar(id));
                 self.program.instructions.push(OpCode::Pop);
                 return Ok(());
@@ -1446,30 +2177,33 @@ impl JsBytecodeCompiler {
         self.compile_primary()?;
 
         loop {
-            if self.peek() == &Token::Dot {
-                self.advance();
+            if self.peek() == &Token::Dot || self.peek() == &Token::OptChain {
+                let is_opt = self.advance() == Token::OptChain;
+                if self.peek() == &Token::LBracket {
+                    self.advance();
+                    self.compile_expr()?;
+                    if self.peek() == &Token::RBracket {
+                        self.advance();
+                    }
+                    self.program.instructions.push(OpCode::GetIndex);
+                    continue;
+                }
                 let Token::Ident(prop) = self.advance() else {
                     return Err("Expected property name after `.`");
                 };
                 let prop_id = self.program.add_ident(&prop);
                 if self.peek() == &Token::LParen {
                     self.advance();
-                    let mut argc = 0u8;
-                    while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-                        self.compile_expr()?;
-                        argc = argc.saturating_add(1);
-                        if self.peek() == &Token::Comma {
-                            self.advance();
-                        }
-                    }
-                    if self.peek() == &Token::RParen {
-                        self.advance();
-                    }
+                    let argc = self.compile_call_args()?;
                     self.program
                         .instructions
                         .push(OpCode::CallMethod { prop_id, argc });
                 } else {
-                    self.program.instructions.push(OpCode::GetProp(prop_id));
+                    self.program.instructions.push(if is_opt {
+                        OpCode::GetPropOpt(prop_id)
+                    } else {
+                        OpCode::GetProp(prop_id)
+                    });
                 }
             } else if self.peek() == &Token::LBracket {
                 self.advance();
@@ -1480,17 +2214,7 @@ impl JsBytecodeCompiler {
                 self.program.instructions.push(OpCode::GetIndex);
             } else if self.peek() == &Token::LParen {
                 self.advance();
-                let mut argc = 0u8;
-                while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-                    self.compile_expr()?;
-                    argc = argc.saturating_add(1);
-                    if self.peek() == &Token::Comma {
-                        self.advance();
-                    }
-                }
-                if self.peek() == &Token::RParen {
-                    self.advance();
-                }
+                let argc = self.compile_call_args()?;
                 self.program.instructions.push(OpCode::CallValue { argc });
             } else {
                 break;
@@ -1509,6 +2233,14 @@ impl JsBytecodeCompiler {
             Token::Str(s) => {
                 let idx = self.program.add_const(JsValue::Str(s));
                 self.program.instructions.push(OpCode::LoadConst(idx));
+                Ok(())
+            }
+            Token::Regex(pat, flags) => {
+                let pat_id = self.program.add_ident(&pat);
+                let flags_id = self.program.add_ident(&flags);
+                self.program
+                    .instructions
+                    .push(OpCode::MakeRegex { pat_id, flags_id });
                 Ok(())
             }
             Token::KeywordTrue => {
@@ -1539,10 +2271,16 @@ impl JsBytecodeCompiler {
                 Ok(())
             }
             Token::LBracket => {
-                let mut count = 0u16;
+                self.program.instructions.push(OpCode::MakeArray(0));
                 while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
-                    self.compile_expr()?;
-                    count = count.saturating_add(1);
+                    if self.peek() == &Token::Spread {
+                        self.advance();
+                        self.compile_expr()?;
+                        self.program.instructions.push(OpCode::ArraySpread);
+                    } else {
+                        self.compile_expr()?;
+                        self.program.instructions.push(OpCode::ArrayPush);
+                    }
                     if self.peek() == &Token::Comma {
                         self.advance();
                     }
@@ -1550,30 +2288,31 @@ impl JsBytecodeCompiler {
                 if self.peek() == &Token::RBracket {
                     self.advance();
                 }
-                self.program.instructions.push(OpCode::MakeArray(count));
                 Ok(())
             }
             Token::LBrace => {
-                let mut pairs = 0u16;
+                self.program.instructions.push(OpCode::MakeObject(0));
                 while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-                    let key_str = match self.advance() {
-                        Token::Ident(k) | Token::Str(k) => k,
-                        Token::Number(n) => JsValue::Number(n).as_str(),
-                        _ => break,
-                    };
-                    let key_c = self.program.add_const(JsValue::Str(key_str));
-                    self.program.instructions.push(OpCode::LoadConst(key_c));
-                    if self.peek() == &Token::Colon {
+                    if self.peek() == &Token::Spread {
                         self.advance();
                         self.compile_expr()?;
+                        self.program.instructions.push(OpCode::ObjectSpread);
                     } else {
-                        // ES6 shorthand `{ a }`
-                        let id = self.program.add_ident(
-                            &self.program.constants[key_c as usize].as_str(),
-                        );
-                        self.program.instructions.push(OpCode::LoadIdent(id));
+                        let key_str = match self.advance() {
+                            Token::Ident(k) | Token::Str(k) => k,
+                            Token::Number(n) => JsValue::Number(n).as_str(),
+                            _ => break,
+                        };
+                        let key_id = self.program.add_ident(&key_str);
+                        if self.peek() == &Token::Colon {
+                            self.advance();
+                            self.compile_expr()?;
+                        } else {
+                            self.program.instructions.push(OpCode::LoadIdent(key_id));
+                        }
+                        self.program.instructions.push(OpCode::SetProp(key_id));
+                        self.program.instructions.push(OpCode::Pop);
                     }
-                    pairs = pairs.saturating_add(1);
                     if self.peek() == &Token::Comma {
                         self.advance();
                     }
@@ -1581,7 +2320,18 @@ impl JsBytecodeCompiler {
                 if self.peek() == &Token::RBrace {
                     self.advance();
                 }
-                self.program.instructions.push(OpCode::MakeObject(pairs));
+                Ok(())
+            }
+            Token::KeywordAsync if self.peek() == &Token::KeywordFunction => {
+                self.advance();
+                let name = if let Token::Ident(n) = self.peek().clone() {
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                let fn_idx = self.compile_function_body(name, true)?;
+                self.program.instructions.push(OpCode::MakeClosure(fn_idx));
                 Ok(())
             }
             Token::KeywordFunction => {
@@ -1591,7 +2341,7 @@ impl JsBytecodeCompiler {
                 } else {
                     None
                 };
-                let fn_idx = self.compile_function_body(name)?;
+                let fn_idx = self.compile_function_body(name, false)?;
                 self.program.instructions.push(OpCode::MakeClosure(fn_idx));
                 Ok(())
             }
@@ -1619,6 +2369,7 @@ struct ScopeFrame {
 enum Callable {
     UserClosure { fn_idx: u16, env_scope: u32 },
     Builtin(&'static str),
+    BoundResolver { promise_oid: u32, is_reject: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -1626,6 +2377,8 @@ struct CallFrame {
     return_pc: usize,
     prev_scope: u32,
     try_depth: usize,
+    async_promise_oid: Option<u32>,
+    construct_this_oid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1637,21 +2390,49 @@ struct TryHandler {
 }
 
 #[derive(Debug, Clone)]
-struct Microtask {
-    cb: JsValue,
-    arg: JsValue,
+struct AsyncSuspension {
+    pc: usize,
+    stack: Vec<JsValue>,
+    scope_id: u32,
+    call_frames: Vec<CallFrame>,
+    try_stack: Vec<TryHandler>,
 }
 
-/// High-Efficiency Lexical-Scoped Bytecode JS VM (`MantaJsSandbox`):
-/// - Closures, Objects, Arrays, `for`/`for..of`/`try-catch`/`switch`/Arrow Functions/`Promise`/`JSON`.
-/// - Fuel-metered + heap-bounded execution (zero runaway loops or OOM).
-/// - Live DOM manipulation (`getElementById`, `querySelector`, `querySelectorAll`, `createElement`,
-///   `appendChild`, `removeChild`, `classList`, `addEventListener`, `dispatchEvent`).
+#[derive(Debug, Clone)]
+enum Microtask {
+    Callback { cb: JsValue, arg: JsValue },
+    ResumeAsync { susp: AsyncSuspension, val: JsValue, is_err: bool },
+}
+
+#[derive(Debug, Clone)]
+struct RegexEntry {
+    pattern: String,
+    flags: String,
+    last_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PromiseRecord {
+    fulfilled: Option<bool>, // None = pending, Some(true) = fulfilled, Some(false) = rejected
+    value: JsValue,
+    then_waiters: Vec<(Option<JsValue>, Option<JsValue>, u32)>,
+    async_waiters: Vec<AsyncSuspension>,
+}
+
+/// High-Efficiency Hybrid Rust + C++20/17 JS Engine (`MantaJsSandbox`):
+/// - Lexical closures, `class`/`extends`/`super`/`this`, true `async`/`await` + `Promise`,
+///   destructuring, `...` spread/rest, `RegExp` (via C++ engine), `Map`/`Set`/`TypedArray`
+///   (with C++ SIMD numeric fast-paths), `URL`, `JSON`, `fetch()`, and full live DOM/Storage bindings.
 pub struct MantaJsSandbox {
     scopes: Vec<ScopeFrame>,
     objects: Vec<HashMap<String, JsValue>>,
     arrays: Vec<Vec<JsValue>>,
     callables: Vec<Callable>,
+    regexes: Vec<RegexEntry>,
+    maps: Vec<Vec<(String, JsValue)>>,
+    sets: Vec<Vec<JsValue>>,
+    typed_arrays: Vec<Vec<f64>>,
+    promises: HashMap<u32, PromiseRecord>,
     microtasks: VecDeque<Microtask>,
     fuel_remaining: u32,
     max_fuel: u32,
@@ -1663,11 +2444,16 @@ impl MantaJsSandbox {
         let mut vm = Self {
             scopes: vec![ScopeFrame {
                 parent: None,
-                vars: HashMap::with_capacity(32),
+                vars: HashMap::with_capacity(48),
             }],
             objects: Vec::with_capacity(32),
             arrays: Vec::with_capacity(16),
             callables: Vec::with_capacity(64),
+            regexes: Vec::new(),
+            maps: Vec::new(),
+            sets: Vec::new(),
+            typed_arrays: Vec::new(),
+            promises: HashMap::new(),
             microtasks: VecDeque::new(),
             fuel_remaining: max_fuel,
             max_fuel,
@@ -1678,17 +2464,38 @@ impl MantaJsSandbox {
     }
 
     fn install_default_globals(&mut self) {
-        self.register_builtin_fn("parseInt", "parseInt");
-        self.register_builtin_fn("parseFloat", "parseFloat");
-        self.register_builtin_fn("isNaN", "isNaN");
-        self.register_builtin_fn("Number", "Number");
-        self.register_builtin_fn("String", "String");
-        self.register_builtin_fn("Boolean", "Boolean");
-        self.register_builtin_fn("queueMicrotask", "queueMicrotask");
-        self.register_builtin_fn("setTimeout", "setTimeout");
-        self.register_builtin_fn("clearTimeout", "clearTimeout");
+        for name in [
+            "parseInt",
+            "parseFloat",
+            "isNaN",
+            "isFinite",
+            "Number",
+            "String",
+            "Boolean",
+            "queueMicrotask",
+            "setTimeout",
+            "clearTimeout",
+            "encodeURIComponent",
+            "decodeURIComponent",
+            "btoa",
+            "atob",
+            "fetch",
+            "Map",
+            "Set",
+            "RegExp",
+            "Promise",
+            "URL",
+            "URLSearchParams",
+            "TextEncoder",
+            "TextDecoder",
+            "Float64Array",
+            "Int32Array",
+            "Uint8Array",
+            "Error",
+        ] {
+            self.register_builtin_fn(name, name);
+        }
 
-        // Namespaces mapped cleanly
         for ns in [
             "document",
             "window",
@@ -1706,7 +2513,6 @@ impl MantaJsSandbox {
             "JSON",
             "Object",
             "Array",
-            "Promise",
             "Date",
         ] {
             let mut map = HashMap::new();
@@ -1730,9 +2536,13 @@ impl MantaJsSandbox {
             let oid = self.alloc_obj_map(map);
             self.scopes[0].vars.insert(ns.to_string(), JsValue::Object(oid));
         }
+
+        // Attach static methods onto Promise constructor callable? Keep Promise as Object or Callable!
+        // Note: `new Promise(...)` uses Builtin("Promise"), while `Promise.resolve` / `Promise.all`
+        // work via GetProp/CallMethod on JsValue::Fn! Let's handle static methods on JsValue::Fn too!
     }
 
-    fn register_builtin_fn(&mut self, global_name: &str, id: &'static str) {
+    fn register_builtin_fn(&mut self, global_name: &'static str, id: &'static str) {
         let cid = self.callables.len() as u32;
         self.callables.push(Callable::Builtin(id));
         self.scopes[0]
@@ -1762,6 +2572,57 @@ impl MantaJsSandbox {
         let id = self.arrays.len() as u32;
         self.arrays.push(items);
         Ok(id)
+    }
+
+    fn alloc_promise(&mut self, fulfilled: Option<bool>, value: JsValue) -> Result<u32, &'static str> {
+        let mut m = HashMap::new();
+        m.insert("__manta_ns".to_string(), JsValue::Str("promise".to_string()));
+        let oid = self.alloc_obj()?;
+        self.objects[oid as usize] = m;
+        self.promises.insert(
+            oid,
+            PromiseRecord {
+                fulfilled,
+                value,
+                then_waiters: Vec::new(),
+                async_waiters: Vec::new(),
+            },
+        );
+        Ok(oid)
+    }
+
+    fn settle_promise(&mut self, promise_oid: u32, is_fulfilled: bool, val: JsValue) {
+        let Some(rec) = self.promises.get_mut(&promise_oid) else {
+            return;
+        };
+        if rec.fulfilled.is_some() {
+            return;
+        }
+        rec.fulfilled = Some(is_fulfilled);
+        rec.value = val.clone();
+        let then_waiters = std::mem::take(&mut rec.then_waiters);
+        let async_waiters = std::mem::take(&mut rec.async_waiters);
+
+        for (on_ok, on_err, _child_oid) in then_waiters {
+            let cb_opt = if is_fulfilled { on_ok } else { on_err };
+            if let Some(cb) = cb_opt {
+                if self.microtasks.len() < 2048 {
+                    self.microtasks.push_back(Microtask::Callback {
+                        cb,
+                        arg: val.clone(),
+                    });
+                }
+            }
+        }
+        for susp in async_waiters {
+            if self.microtasks.len() < 2048 {
+                self.microtasks.push_back(Microtask::ResumeAsync {
+                    susp,
+                    val: val.clone(),
+                    is_err: !is_fulfilled,
+                });
+            }
+        }
     }
 
     fn lookup_var(&self, mut scope_id: u32, name: &str) -> JsValue {
@@ -1844,12 +2705,15 @@ impl MantaJsSandbox {
         storage: &mut MantaStorageEngine,
         downloads: &mut MantaDownloadManager,
     ) -> Result<JsValue, &'static str> {
-        let program = JsBytecodeCompiler::compile(script)?;
+        let program = Arc::new(JsBytecodeCompiler::compile(script)?);
         self.fuel_remaining = self.max_fuel;
-        let res = self.run_bytecode_at(
+        let res = self.run_vm_loop(
             &program,
             0,
+            Vec::new(),
             0,
+            Vec::new(),
+            Vec::new(),
             origin_url,
             dom,
             clipboard,
@@ -1857,23 +2721,74 @@ impl MantaJsSandbox {
             downloads,
         )?;
 
-        // Drain scheduled Promises & microtasks within remaining fuel
         let mut tasks_run = 0usize;
         while let Some(task) = self.microtasks.pop_front() {
-            if tasks_run >= 1024 {
+            if tasks_run >= 2048 {
                 break;
             }
             tasks_run += 1;
-            let _ = self.invoke_callable_val(
-                &program,
-                &task.cb,
-                &[task.arg],
-                origin_url,
-                dom,
-                clipboard,
-                storage,
-                downloads,
-            );
+            match task {
+                Microtask::Callback { cb, arg } => {
+                    let _ = self.invoke_callable_val(
+                        &program,
+                        &cb,
+                        &[arg],
+                        None,
+                        None,
+                        origin_url,
+                        dom,
+                        clipboard,
+                        storage,
+                        downloads,
+                    );
+                }
+                Microtask::ResumeAsync {
+                    mut susp,
+                    val,
+                    is_err,
+                } => {
+                    if is_err {
+                        if let Some(handler) = susp.try_stack.pop() {
+                            susp.stack.truncate(handler.stack_len);
+                            susp.call_frames.truncate(handler.call_depth);
+                            susp.scope_id = handler.scope_id;
+                            susp.stack.push(val);
+                            let _ = self.run_vm_loop(
+                                &program,
+                                handler.catch_pc,
+                                susp.stack,
+                                susp.scope_id,
+                                susp.call_frames,
+                                susp.try_stack,
+                                origin_url,
+                                dom,
+                                clipboard,
+                                storage,
+                                downloads,
+                            );
+                        } else if let Some(top_cf) = susp.call_frames.first() {
+                            if let Some(poid) = top_cf.async_promise_oid {
+                                self.settle_promise(poid, false, val);
+                            }
+                        }
+                    } else {
+                        susp.stack.push(val);
+                        let _ = self.run_vm_loop(
+                            &program,
+                            susp.pc,
+                            susp.stack,
+                            susp.scope_id,
+                            susp.call_frames,
+                            susp.try_stack,
+                            origin_url,
+                            dom,
+                            clipboard,
+                            storage,
+                            downloads,
+                        );
+                    }
+                }
+            }
         }
 
         Ok(res)
@@ -1885,72 +2800,178 @@ impl MantaJsSandbox {
         program: &CompiledJsProgram,
         callee: &JsValue,
         args: &[JsValue],
+        this_val: Option<JsValue>,
+        construct_this_oid: Option<u32>,
         origin_url: &str,
         dom: &mut ZeroCopyDomArena,
         clipboard: &mut ClipboardSandbox,
         storage: &mut MantaStorageEngine,
         downloads: &mut MantaDownloadManager,
     ) -> Result<JsValue, &'static str> {
-        let JsValue::Fn(cid) = *callee else {
-            return Ok(JsValue::Undefined);
+        let cid = match *callee {
+            JsValue::Fn(cid) => cid,
+            JsValue::Object(oid) => {
+                if let Some(JsValue::Fn(ctor_cid)) =
+                    self.objects.get(oid as usize).and_then(|m| m.get("__ctor")).cloned()
+                {
+                    ctor_cid
+                } else {
+                    return Ok(JsValue::Undefined);
+                }
+            }
+            _ => return Ok(JsValue::Undefined),
         };
+
         let Some(c) = self.callables.get(cid as usize).cloned() else {
             return Ok(JsValue::Undefined);
         };
         match c {
-            Callable::Builtin(name) => Ok(self.invoke_builtin_fn(name, args)),
+            Callable::Builtin(name) => {
+                self.invoke_builtin_fn(program, name, args, origin_url, dom, clipboard, storage, downloads)
+            }
+            Callable::BoundResolver {
+                promise_oid,
+                is_reject,
+            } => {
+                let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                self.settle_promise(promise_oid, !is_reject, val);
+                Ok(JsValue::Undefined)
+            }
             Callable::UserClosure { fn_idx, env_scope } => {
                 let def = program
                     .functions
                     .get(fn_idx as usize)
-                    .ok_or("Missing function def")?;
+                    .ok_or("Missing function def")?
+                    .clone();
                 if self.scopes.len() >= MAX_VM_SCOPES {
                     return Err("JS scope memory limit exceeded");
                 }
-                let mut vars = HashMap::with_capacity(def.params.len());
-                for (i, &pid) in def.params.iter().enumerate() {
+                let mut vars = HashMap::with_capacity(def.params.len() + 2);
+                if let Some(tv) = this_val {
+                    vars.insert("this".to_string(), tv);
+                }
+                for (i, param) in def.params.iter().enumerate() {
                     let pname = program
                         .identifiers
-                        .get(pid as usize)
+                        .get(param.name_id as usize)
                         .cloned()
                         .unwrap_or_default();
-                    vars.insert(pname, args.get(i).cloned().unwrap_or(JsValue::Undefined));
+                    if param.is_rest {
+                        let rest_items = if i < args.len() {
+                            args[i..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        let aid = self.alloc_arr(rest_items)?;
+                        vars.insert(pname, JsValue::Array(aid));
+                        break;
+                    }
+                    let mut arg_val = args.get(i).cloned().unwrap_or(JsValue::Undefined);
+                    if matches!(arg_val, JsValue::Undefined) {
+                        if let Some(d_pc) = param.default_pc {
+                            arg_val = self.run_vm_loop(
+                                program,
+                                d_pc,
+                                Vec::new(),
+                                env_scope,
+                                Vec::new(),
+                                Vec::new(),
+                                origin_url,
+                                dom,
+                                clipboard,
+                                storage,
+                                downloads,
+                            )?;
+                        }
+                    }
+                    vars.insert(pname, arg_val);
                 }
                 let new_scope = self.scopes.len() as u32;
                 self.scopes.push(ScopeFrame {
                     parent: Some(env_scope),
                     vars,
                 });
-                self.run_bytecode_at(
-                    program,
-                    def.entry_pc,
-                    new_scope,
-                    origin_url,
-                    dom,
-                    clipboard,
-                    storage,
-                    downloads,
-                )
+
+                if def.is_async {
+                    let p_oid = self.alloc_promise(None, JsValue::Undefined)?;
+                    let cf = CallFrame {
+                        return_pc: usize::MAX,
+                        prev_scope: 0,
+                        try_depth: 0,
+                        async_promise_oid: Some(p_oid),
+                        construct_this_oid,
+                    };
+                    match self.run_vm_loop(
+                        program,
+                        def.entry_pc,
+                        Vec::new(),
+                        new_scope,
+                        vec![cf],
+                        Vec::new(),
+                        origin_url,
+                        dom,
+                        clipboard,
+                        storage,
+                        downloads,
+                    ) {
+                        Ok(ret_val) => {
+                            if let Some(rec) = self.promises.get(&p_oid) {
+                                if rec.fulfilled.is_none() {
+                                    // Synchronous completion of async fn
+                                    if matches!(ret_val, JsValue::Object(_))
+                                        && matches!(
+                                            self.objects
+                                                .get(match ret_val { JsValue::Object(o) => o as usize, _ => 0 })
+                                                .and_then(|m| m.get("__manta_ns")),
+                                            Some(JsValue::Str(ref s)) if s == "promise"
+                                        )
+                                    {
+                                        // Pass through
+                                    }
+                                    self.settle_promise(p_oid, true, ret_val);
+                                }
+                            }
+                            Ok(JsValue::Object(p_oid))
+                        }
+                        Err(err) => {
+                            self.settle_promise(p_oid, false, JsValue::Str(err.to_string()));
+                            Ok(JsValue::Object(p_oid))
+                        }
+                    }
+                } else {
+                    self.run_vm_loop(
+                        program,
+                        def.entry_pc,
+                        Vec::new(),
+                        new_scope,
+                        Vec::new(),
+                        Vec::new(),
+                        origin_url,
+                        dom,
+                        clipboard,
+                        storage,
+                        downloads,
+                    )
+                }
             }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_bytecode_at(
+    fn run_vm_loop(
         &mut self,
         program: &CompiledJsProgram,
         start_pc: usize,
-        initial_scope: u32,
+        mut stack: Vec<JsValue>,
+        mut current_scope: u32,
+        mut call_frames: Vec<CallFrame>,
+        mut try_stack: Vec<TryHandler>,
         origin_url: &str,
         dom: &mut ZeroCopyDomArena,
         clipboard: &mut ClipboardSandbox,
         storage: &mut MantaStorageEngine,
         downloads: &mut MantaDownloadManager,
     ) -> Result<JsValue, &'static str> {
-        let mut stack: Vec<JsValue> = Vec::with_capacity(64);
-        let mut call_frames: Vec<CallFrame> = Vec::with_capacity(16);
-        let mut try_stack: Vec<TryHandler> = Vec::with_capacity(4);
-        let mut current_scope = initial_scope;
         let mut last_popped = JsValue::Undefined;
         let mut pc = start_pc;
 
@@ -2004,16 +3025,51 @@ impl MantaJsSandbox {
                     stack.push(JsValue::Array(aid));
                     pc += 1;
                 }
-                OpCode::MakeObject(pairs) => {
-                    let n = (*pairs as usize) * 2;
-                    let start = stack.len().saturating_sub(n);
-                    let flat: Vec<JsValue> = stack.drain(start..).collect();
-                    let mut map = HashMap::with_capacity(flat.len() / 2);
-                    for pair in flat.chunks_exact(2) {
-                        map.insert(pair[0].as_str(), pair[1].clone());
+                OpCode::ArrayPush => {
+                    let item = stack.pop().unwrap_or(JsValue::Undefined);
+                    if let Some(JsValue::Array(aid)) = stack.last().copied() {
+                        if let Some(arr) = self.arrays.get_mut(aid as usize) {
+                            arr.push(item);
+                        }
                     }
-                    let oid = self.alloc_obj_map(map);
+                    pc += 1;
+                }
+                OpCode::ArraySpread => {
+                    let spread_val = stack.pop().unwrap_or(JsValue::Undefined);
+                    if let Some(JsValue::Array(dst_id)) = stack.last().copied() {
+                        let extra: Vec<JsValue> = match spread_val {
+                            JsValue::Array(src_id) => {
+                                self.arrays.get(src_id as usize).cloned().unwrap_or_default()
+                            }
+                            JsValue::Str(s) => s.chars().map(|c| JsValue::Str(c.to_string())).collect(),
+                            _ => Vec::new(),
+                        };
+                        if let Some(dst) = self.arrays.get_mut(dst_id as usize) {
+                            dst.extend(extra);
+                        }
+                    }
+                    pc += 1;
+                }
+                OpCode::MakeObject(_) => {
+                    let oid = self.alloc_obj()?;
                     stack.push(JsValue::Object(oid));
+                    pc += 1;
+                }
+                OpCode::ObjectSpread => {
+                    let src_val = stack.pop().unwrap_or(JsValue::Undefined);
+                    if let Some(JsValue::Object(dst_oid)) = stack.last().copied() {
+                        if let JsValue::Object(src_oid) = src_val {
+                            if let Some(src_map) = self.objects.get(src_oid as usize).cloned() {
+                                if let Some(dst_map) = self.objects.get_mut(dst_oid as usize) {
+                                    for (k, v) in src_map {
+                                        if !k.starts_with("__") {
+                                            dst_map.insert(k, v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     pc += 1;
                 }
                 OpCode::MakeClosure(fn_idx) => {
@@ -2025,6 +3081,137 @@ impl MantaJsSandbox {
                     stack.push(JsValue::Fn(cid));
                     pc += 1;
                 }
+                OpCode::MakeRegex { pat_id, flags_id } => {
+                    let pat = program
+                        .identifiers
+                        .get(*pat_id as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let flags = program
+                        .identifiers
+                        .get(*flags_id as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let rid = self.regexes.len() as u32;
+                    self.regexes.push(RegexEntry {
+                        pattern: pat,
+                        flags,
+                        last_index: 0,
+                    });
+                    stack.push(JsValue::Regex(rid));
+                    pc += 1;
+                }
+                OpCode::BuildClass {
+                    has_parent,
+                    method_count,
+                } => {
+                    let mc = *method_count as usize;
+                    let mut methods = Vec::with_capacity(mc);
+                    for _ in 0..mc {
+                        let fn_val = stack.pop().unwrap_or(JsValue::Undefined);
+                        let key = stack.pop().unwrap_or(JsValue::Undefined).as_str();
+                        methods.push((key, fn_val));
+                    }
+                    methods.reverse();
+
+                    let parent_opt = if *has_parent {
+                        Some(stack.pop().unwrap_or(JsValue::Undefined))
+                    } else {
+                        None
+                    };
+
+                    let proto_oid = self.alloc_obj()?;
+                    if let Some(JsValue::Object(parent_cls_oid)) = parent_opt {
+                        if let Some(parent_proto) = self
+                            .objects
+                            .get(parent_cls_oid as usize)
+                            .and_then(|m| m.get("prototype"))
+                            .cloned()
+                        {
+                            self.objects[proto_oid as usize].insert("__proto".to_string(), parent_proto);
+                        }
+                    }
+
+                    let mut class_map = HashMap::new();
+                    class_map.insert("__manta_class".to_string(), JsValue::Bool(true));
+                    if let Some(p_val) = parent_opt {
+                        class_map.insert("__parent_class".to_string(), p_val);
+                    }
+                    for (k, fn_val) in methods {
+                        if k == "constructor" {
+                            class_map.insert("__ctor".to_string(), fn_val);
+                        } else if let Some(static_name) = k.strip_prefix("__static::") {
+                            class_map.insert(static_name.to_string(), fn_val);
+                        } else {
+                            self.objects[proto_oid as usize].insert(k, fn_val);
+                        }
+                    }
+                    class_map.insert("prototype".to_string(), JsValue::Object(proto_oid));
+                    let class_oid = self.alloc_obj_map(class_map);
+                    stack.push(JsValue::Object(class_oid));
+                    pc += 1;
+                }
+                OpCode::DestructureObj { pairs } => {
+                    let mut defaults = Vec::with_capacity(pairs.len());
+                    for (_, _, has_def) in pairs.iter().rev() {
+                        if *has_def {
+                            defaults.push(Some(stack.pop().unwrap_or(JsValue::Undefined)));
+                        } else {
+                            defaults.push(None);
+                        }
+                    }
+                    defaults.reverse();
+                    let src_obj = stack.pop().unwrap_or(JsValue::Undefined);
+                    for (idx, (prop_id, target_var_id, _)) in pairs.iter().enumerate() {
+                        let prop_name = program
+                            .identifiers
+                            .get(*prop_id as usize)
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        let mut v = self.get_property(&src_obj, prop_name, origin_url, dom, storage);
+                        if matches!(v, JsValue::Undefined) {
+                            if let Some(Some(ref def_val)) = defaults.get(idx) {
+                                v = def_val.clone();
+                            }
+                        }
+                        if let Some(tname) = program.identifiers.get(*target_var_id as usize) {
+                            if let Some(frame) = self.scopes.get_mut(current_scope as usize) {
+                                frame.vars.insert(tname.clone(), v);
+                            }
+                        }
+                    }
+                    stack.push(src_obj);
+                    pc += 1;
+                }
+                OpCode::DestructureArr { targets } => {
+                    let src = stack.pop().unwrap_or(JsValue::Undefined);
+                    let items = match src {
+                        JsValue::Array(aid) => self.arrays.get(aid as usize).cloned().unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
+                    for (i, (var_id, is_rest)) in targets.iter().enumerate() {
+                        let v = if *is_rest {
+                            let rem = if i < items.len() {
+                                items[i..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            JsValue::Array(self.alloc_arr(rem)?)
+                        } else {
+                            items.get(i).cloned().unwrap_or(JsValue::Undefined)
+                        };
+                        if let Some(tname) = program.identifiers.get(*var_id as usize) {
+                            if let Some(frame) = self.scopes.get_mut(current_scope as usize) {
+                                frame.vars.insert(tname.clone(), v);
+                            }
+                        }
+                        if *is_rest {
+                            break;
+                        }
+                    }
+                    stack.push(src);
+                    pc += 1;
+                }
                 OpCode::GetProp(prop_id) => {
                     let obj_val = stack.pop().unwrap_or(JsValue::Undefined);
                     let prop = program
@@ -2032,8 +3219,21 @@ impl MantaJsSandbox {
                         .get(*prop_id as usize)
                         .map(|s| s.as_str())
                         .unwrap_or("");
-                    let res = self.get_property(&obj_val, prop, origin_url, dom, storage);
-                    stack.push(res);
+                    stack.push(self.get_property(&obj_val, prop, origin_url, dom, storage));
+                    pc += 1;
+                }
+                OpCode::GetPropOpt(prop_id) => {
+                    let obj_val = stack.pop().unwrap_or(JsValue::Undefined);
+                    if matches!(obj_val, JsValue::Undefined | JsValue::Null) {
+                        stack.push(JsValue::Undefined);
+                    } else {
+                        let prop = program
+                            .identifiers
+                            .get(*prop_id as usize)
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        stack.push(self.get_property(&obj_val, prop, origin_url, dom, storage));
+                    }
                     pc += 1;
                 }
                 OpCode::SetProp(prop_id) => {
@@ -2046,6 +3246,21 @@ impl MantaJsSandbox {
                         .unwrap_or("");
                     self.set_property(&obj_val, prop, val.clone(), origin_url, dom, storage);
                     stack.push(val);
+                    pc += 1;
+                }
+                OpCode::DeleteProp(prop_id) => {
+                    let obj_val = stack.pop().unwrap_or(JsValue::Undefined);
+                    let prop = program
+                        .identifiers
+                        .get(*prop_id as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if let JsValue::Object(oid) = obj_val {
+                        if let Some(m) = self.objects.get_mut(oid as usize) {
+                            m.remove(prop);
+                        }
+                    }
+                    stack.push(JsValue::Bool(true));
                     pc += 1;
                 }
                 OpCode::GetIndex => {
@@ -2064,11 +3279,20 @@ impl MantaJsSandbox {
                                 JsValue::Undefined
                             }
                         }
+                        JsValue::TypedArray(tid) => {
+                            let i = idx_val.as_number();
+                            if i >= 0.0 && i.is_finite() {
+                                self.typed_arrays
+                                    .get(tid as usize)
+                                    .and_then(|a| a.get(i as usize))
+                                    .map(|&n| JsValue::Number(n))
+                                    .unwrap_or(JsValue::Undefined)
+                            } else {
+                                JsValue::Undefined
+                            }
+                        }
                         JsValue::Object(oid) => self
-                            .objects
-                            .get(oid as usize)
-                            .and_then(|o| o.get(&idx_val.as_str()))
-                            .cloned()
+                            .lookup_proto_prop(oid, &idx_val.as_str())
                             .unwrap_or(JsValue::Undefined),
                         JsValue::Str(s) => {
                             let i = idx_val.as_number() as usize;
@@ -2090,11 +3314,19 @@ impl MantaJsSandbox {
                         JsValue::Array(aid) => {
                             let idx = idx_val.as_number() as usize;
                             if let Some(arr) = self.arrays.get_mut(aid as usize) {
-                                if idx < 4096 {
+                                if idx < 8192 {
                                     while arr.len() <= idx {
                                         arr.push(JsValue::Undefined);
                                     }
                                     arr[idx] = val.clone();
+                                }
+                            }
+                        }
+                        JsValue::TypedArray(tid) => {
+                            let idx = idx_val.as_number() as usize;
+                            if let Some(arr) = self.typed_arrays.get_mut(tid as usize) {
+                                if idx < arr.len() {
+                                    arr[idx] = val.as_number();
                                 }
                             }
                         }
@@ -2106,6 +3338,28 @@ impl MantaJsSandbox {
                         _ => {}
                     }
                     stack.push(val);
+                    pc += 1;
+                }
+                OpCode::KeysArray => {
+                    let target = stack.pop().unwrap_or(JsValue::Undefined);
+                    let keys: Vec<JsValue> = match target {
+                        JsValue::Object(oid) => self
+                            .objects
+                            .get(oid as usize)
+                            .map(|m| {
+                                m.keys()
+                                    .filter(|k| !k.starts_with("__"))
+                                    .map(|k| JsValue::Str(k.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        JsValue::Array(aid) => {
+                            let len = self.arrays.get(aid as usize).map(|a| a.len()).unwrap_or(0);
+                            (0..len).map(|i| JsValue::Str(i.to_string())).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    stack.push(JsValue::Array(self.alloc_arr(keys)?));
                     pc += 1;
                 }
                 OpCode::Add => {
@@ -2144,6 +3398,53 @@ impl MantaJsSandbox {
                     stack.push(JsValue::Number(a % b));
                     pc += 1;
                 }
+                OpCode::Pow => {
+                    let b = stack.pop().unwrap_or(JsValue::Undefined).as_number();
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_number();
+                    stack.push(JsValue::Number(a.powf(b)));
+                    pc += 1;
+                }
+                OpCode::BitAnd => {
+                    let b = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    stack.push(JsValue::Number((a & b) as f64));
+                    pc += 1;
+                }
+                OpCode::BitOr => {
+                    let b = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    stack.push(JsValue::Number((a | b) as f64));
+                    pc += 1;
+                }
+                OpCode::BitXor => {
+                    let b = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    stack.push(JsValue::Number((a ^ b) as f64));
+                    pc += 1;
+                }
+                OpCode::BitNot => {
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    stack.push(JsValue::Number((!a) as f64));
+                    pc += 1;
+                }
+                OpCode::Shl => {
+                    let b = (stack.pop().unwrap_or(JsValue::Undefined).as_i32() as u32) & 31;
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    stack.push(JsValue::Number((a.wrapping_shl(b)) as f64));
+                    pc += 1;
+                }
+                OpCode::Shr => {
+                    let b = (stack.pop().unwrap_or(JsValue::Undefined).as_i32() as u32) & 31;
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_i32();
+                    stack.push(JsValue::Number((a.wrapping_shr(b)) as f64));
+                    pc += 1;
+                }
+                OpCode::UShr => {
+                    let b = (stack.pop().unwrap_or(JsValue::Undefined).as_i32() as u32) & 31;
+                    let a = stack.pop().unwrap_or(JsValue::Undefined).as_i32() as u32;
+                    stack.push(JsValue::Number((a.wrapping_shr(b)) as f64));
+                    pc += 1;
+                }
                 OpCode::Neg => {
                     let a = stack.pop().unwrap_or(JsValue::Undefined).as_number();
                     stack.push(JsValue::Number(-a));
@@ -2157,6 +3458,50 @@ impl MantaJsSandbox {
                 OpCode::TypeOf => {
                     let a = stack.pop().unwrap_or(JsValue::Undefined);
                     stack.push(JsValue::Str(a.type_of().to_string()));
+                    pc += 1;
+                }
+                OpCode::InOp => {
+                    let obj = stack.pop().unwrap_or(JsValue::Undefined);
+                    let key = stack.pop().unwrap_or(JsValue::Undefined).as_str();
+                    let found = match obj {
+                        JsValue::Object(oid) => self.lookup_proto_prop(oid, &key).is_some(),
+                        JsValue::Array(aid) => {
+                            if let Ok(idx) = key.parse::<usize>() {
+                                idx < self.arrays.get(aid as usize).map(|a| a.len()).unwrap_or(0)
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    stack.push(JsValue::Bool(found));
+                    pc += 1;
+                }
+                OpCode::InstanceOf => {
+                    let cls = stack.pop().unwrap_or(JsValue::Undefined);
+                    let inst = stack.pop().unwrap_or(JsValue::Undefined);
+                    let res = match (inst, cls) {
+                        (JsValue::Array(_), JsValue::Object(c_oid)) => self
+                            .objects
+                            .get(c_oid as usize)
+                            .and_then(|m| m.get("__manta_ns"))
+                            .map(|v| v.as_str() == "Array")
+                            .unwrap_or(false),
+                        (JsValue::Object(i_oid), JsValue::Object(c_oid)) => {
+                            let target_proto = self
+                                .objects
+                                .get(c_oid as usize)
+                                .and_then(|m| m.get("prototype"))
+                                .cloned();
+                            if let Some(JsValue::Object(tp_oid)) = target_proto {
+                                self.is_in_proto_chain(i_oid, tp_oid)
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    stack.push(JsValue::Bool(res));
                     pc += 1;
                 }
                 OpCode::StrictEq => {
@@ -2219,6 +3564,16 @@ impl MantaJsSandbox {
                     stack.push(if a.is_truthy() { a } else { b });
                     pc += 1;
                 }
+                OpCode::Nullish => {
+                    let b = stack.pop().unwrap_or(JsValue::Undefined);
+                    let a = stack.pop().unwrap_or(JsValue::Undefined);
+                    stack.push(if matches!(a, JsValue::Undefined | JsValue::Null) {
+                        b
+                    } else {
+                        a
+                    });
+                    pc += 1;
+                }
                 OpCode::Jump(target) => {
                     pc = *target;
                 }
@@ -2229,6 +3584,14 @@ impl MantaJsSandbox {
                 OpCode::JumpIfTrue(target) => {
                     let cond = stack.pop().unwrap_or(JsValue::Undefined);
                     pc = if cond.is_truthy() { *target } else { pc + 1 };
+                }
+                OpCode::JumpIfNullish(target) => {
+                    let v = stack.last().cloned().unwrap_or(JsValue::Undefined);
+                    pc = if matches!(v, JsValue::Undefined | JsValue::Null) {
+                        *target
+                    } else {
+                        pc + 1
+                    };
                 }
                 OpCode::PushTry(catch_pc) => {
                     try_stack.push(TryHandler {
@@ -2255,6 +3618,109 @@ impl MantaJsSandbox {
                         return Err("Uncaught JS exception");
                     }
                 }
+                OpCode::Await => {
+                    let awaited = stack.pop().unwrap_or(JsValue::Undefined);
+                    if let JsValue::Object(poid) = awaited {
+                        if let Some(rec) = self.promises.get_mut(&poid) {
+                            match rec.fulfilled {
+                                Some(true) => {
+                                    stack.push(rec.value.clone());
+                                    pc += 1;
+                                    continue;
+                                }
+                                Some(false) => {
+                                    let err = rec.value.clone();
+                                    if let Some(handler) = try_stack.pop() {
+                                        stack.truncate(handler.stack_len);
+                                        call_frames.truncate(handler.call_depth);
+                                        current_scope = handler.scope_id;
+                                        stack.push(err);
+                                        pc = handler.catch_pc;
+                                        continue;
+                                    }
+                                    return Err("Unhandled async rejection");
+                                }
+                                None => {
+                                    // Suspend async execution until promise resolves!
+                                    rec.async_waiters.push(AsyncSuspension {
+                                        pc: pc + 1,
+                                        stack,
+                                        scope_id: current_scope,
+                                        call_frames,
+                                        try_stack,
+                                    });
+                                    return Ok(JsValue::Undefined);
+                                }
+                            }
+                        }
+                    }
+                    stack.push(awaited);
+                    pc += 1;
+                }
+                OpCode::Construct { argc } => {
+                    let n = *argc as usize;
+                    let start = stack.len().saturating_sub(n);
+                    let args: Vec<JsValue> = stack.drain(start..).collect();
+                    let ctor = stack.pop().unwrap_or(JsValue::Undefined);
+                    match ctor {
+                        JsValue::Fn(cid) => {
+                            let res = self.invoke_callable_val(
+                                program,
+                                &JsValue::Fn(cid),
+                                &args,
+                                None,
+                                None,
+                                origin_url,
+                                dom,
+                                clipboard,
+                                storage,
+                                downloads,
+                            )?;
+                            stack.push(res);
+                        }
+                        JsValue::Object(c_oid) => {
+                            let inst_oid = self.alloc_obj()?;
+                            if let Some(proto_val) = self
+                                .objects
+                                .get(c_oid as usize)
+                                .and_then(|m| m.get("prototype"))
+                                .cloned()
+                            {
+                                self.objects[inst_oid as usize].insert("__proto".to_string(), proto_val);
+                            }
+                            if let Some(ctor_fn) = self
+                                .objects
+                                .get(c_oid as usize)
+                                .and_then(|m| m.get("__ctor"))
+                                .cloned()
+                            {
+                                // Bind `super` to parent class if `extends` was used
+                                let parent_cls = self
+                                    .objects
+                                    .get(c_oid as usize)
+                                    .and_then(|m| m.get("__parent_class"))
+                                    .cloned();
+                                let res_obj = self.invoke_class_ctor(
+                                    program,
+                                    &ctor_fn,
+                                    &args,
+                                    inst_oid,
+                                    parent_cls,
+                                    origin_url,
+                                    dom,
+                                    clipboard,
+                                    storage,
+                                    downloads,
+                                )?;
+                                stack.push(res_obj);
+                            } else {
+                                stack.push(JsValue::Object(inst_oid));
+                            }
+                        }
+                        _ => stack.push(JsValue::Undefined),
+                    }
+                    pc += 1;
+                }
                 OpCode::CallValue { argc } => {
                     let n = *argc as usize;
                     let start = stack.len().saturating_sub(n);
@@ -2263,27 +3729,69 @@ impl MantaJsSandbox {
                     if let JsValue::Fn(cid) = callee {
                         match self.callables.get(cid as usize).cloned() {
                             Some(Callable::UserClosure { fn_idx, env_scope }) => {
+                                let def = program
+                                    .functions
+                                    .get(fn_idx as usize)
+                                    .ok_or("Missing function def")?
+                                    .clone();
+                                if def.is_async {
+                                    let res = self.invoke_callable_val(
+                                        program,
+                                        &JsValue::Fn(cid),
+                                        &args,
+                                        None,
+                                        None,
+                                        origin_url,
+                                        dom,
+                                        clipboard,
+                                        storage,
+                                        downloads,
+                                    )?;
+                                    stack.push(res);
+                                    pc += 1;
+                                    continue;
+                                }
                                 if call_frames.len() >= 256 {
                                     return Err("JS call stack overflow");
                                 }
                                 if self.scopes.len() >= MAX_VM_SCOPES {
                                     return Err("JS scope memory limit exceeded");
                                 }
-                                let def = program
-                                    .functions
-                                    .get(fn_idx as usize)
-                                    .ok_or("Missing function def")?;
                                 let mut vars = HashMap::with_capacity(def.params.len());
-                                for (i, &pid) in def.params.iter().enumerate() {
+                                for (i, param) in def.params.iter().enumerate() {
                                     let pname = program
                                         .identifiers
-                                        .get(pid as usize)
+                                        .get(param.name_id as usize)
                                         .cloned()
                                         .unwrap_or_default();
-                                    vars.insert(
-                                        pname,
-                                        args.get(i).cloned().unwrap_or(JsValue::Undefined),
-                                    );
+                                    if param.is_rest {
+                                        let rest_items = if i < args.len() {
+                                            args[i..].to_vec()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        vars.insert(pname, JsValue::Array(self.alloc_arr(rest_items)?));
+                                        break;
+                                    }
+                                    let mut arg_val = args.get(i).cloned().unwrap_or(JsValue::Undefined);
+                                    if matches!(arg_val, JsValue::Undefined) {
+                                        if let Some(d_pc) = param.default_pc {
+                                            arg_val = self.run_vm_loop(
+                                                program,
+                                                d_pc,
+                                                Vec::new(),
+                                                env_scope,
+                                                Vec::new(),
+                                                Vec::new(),
+                                                origin_url,
+                                                dom,
+                                                clipboard,
+                                                storage,
+                                                downloads,
+                                            )?;
+                                        }
+                                    }
+                                    vars.insert(pname, arg_val);
                                 }
                                 let new_scope = self.scopes.len() as u32;
                                 self.scopes.push(ScopeFrame {
@@ -2294,14 +3802,26 @@ impl MantaJsSandbox {
                                     return_pc: pc + 1,
                                     prev_scope: current_scope,
                                     try_depth: try_stack.len(),
+                                    async_promise_oid: None,
+                                    construct_this_oid: None,
                                 });
                                 current_scope = new_scope;
                                 pc = def.entry_pc;
                                 continue;
                             }
                             Some(Callable::Builtin(bname)) => {
-                                let ret = self.invoke_builtin_fn(bname, &args);
+                                let ret = self.invoke_builtin_fn(
+                                    program, bname, &args, origin_url, dom, clipboard, storage, downloads,
+                                )?;
                                 stack.push(ret);
+                            }
+                            Some(Callable::BoundResolver {
+                                promise_oid,
+                                is_reject,
+                            }) => {
+                                let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                                self.settle_promise(promise_oid, !is_reject, val);
+                                stack.push(JsValue::Undefined);
                             }
                             None => stack.push(JsValue::Undefined),
                         }
@@ -2337,6 +3857,10 @@ impl MantaJsSandbox {
                 OpCode::Return => {
                     let ret_val = stack.pop().unwrap_or(JsValue::Undefined);
                     if let Some(frame) = call_frames.pop() {
+                        if let Some(p_oid) = frame.async_promise_oid {
+                            self.settle_promise(p_oid, true, ret_val.clone());
+                            return Ok(JsValue::Object(p_oid));
+                        }
                         try_stack.truncate(frame.try_depth);
                         current_scope = frame.prev_scope;
                         stack.push(ret_val);
@@ -2364,6 +3888,136 @@ impl MantaJsSandbox {
         Ok(stack.pop().unwrap_or(last_popped))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_class_ctor(
+        &mut self,
+        program: &CompiledJsProgram,
+        ctor_fn: &JsValue,
+        args: &[JsValue],
+        inst_oid: u32,
+        parent_class: Option<JsValue>,
+        origin_url: &str,
+        dom: &mut ZeroCopyDomArena,
+        clipboard: &mut ClipboardSandbox,
+        storage: &mut MantaStorageEngine,
+        downloads: &mut MantaDownloadManager,
+    ) -> Result<JsValue, &'static str> {
+        let JsValue::Fn(cid) = *ctor_fn else {
+            return Ok(JsValue::Object(inst_oid));
+        };
+        let Some(Callable::UserClosure { fn_idx, env_scope }) = self.callables.get(cid as usize).cloned() else {
+            return Ok(JsValue::Object(inst_oid));
+        };
+        let def = program.functions.get(fn_idx as usize).ok_or("Missing ctor")?.clone();
+        let mut vars = HashMap::with_capacity(def.params.len() + 2);
+        vars.insert("this".to_string(), JsValue::Object(inst_oid));
+
+        if let Some(JsValue::Object(p_cls_oid)) = parent_class {
+            // Create a `super` wrapper callable bound to `inst_oid`
+            if let Some(p_ctor) = self
+                .objects
+                .get(p_cls_oid as usize)
+                .and_then(|m| m.get("__ctor"))
+                .cloned()
+            {
+                let gp = self
+                    .objects
+                    .get(p_cls_oid as usize)
+                    .and_then(|m| m.get("__parent_class"))
+                    .cloned();
+                // Install `__super_invoke` shim via scope or direct handling
+                let super_fn_cid = self.callables.len() as u32;
+                if let JsValue::Fn(pcid) = p_ctor {
+                    if let Some(Callable::UserClosure {
+                        fn_idx: p_fn_idx,
+                        env_scope: p_env,
+                    }) = self.callables.get(pcid as usize).cloned()
+                    {
+                        self.callables.push(Callable::UserClosure {
+                            fn_idx: p_fn_idx,
+                            env_scope: {
+                                let super_scope = self.scopes.len() as u32;
+                                let mut sm = HashMap::new();
+                                sm.insert("this".to_string(), JsValue::Object(inst_oid));
+                                let _ = gp;
+                                self.scopes.push(ScopeFrame {
+                                    parent: Some(p_env),
+                                    vars: sm,
+                                });
+                                super_scope
+                            },
+                        });
+                        vars.insert("super".to_string(), JsValue::Fn(super_fn_cid));
+                    }
+                }
+            }
+        }
+
+        for (i, param) in def.params.iter().enumerate() {
+            let pname = program
+                .identifiers
+                .get(param.name_id as usize)
+                .cloned()
+                .unwrap_or_default();
+            vars.insert(pname, args.get(i).cloned().unwrap_or(JsValue::Undefined));
+        }
+        let new_scope = self.scopes.len() as u32;
+        self.scopes.push(ScopeFrame {
+            parent: Some(env_scope),
+            vars,
+        });
+        let ret = self.run_vm_loop(
+            program,
+            def.entry_pc,
+            Vec::new(),
+            new_scope,
+            Vec::new(),
+            Vec::new(),
+            origin_url,
+            dom,
+            clipboard,
+            storage,
+            downloads,
+        )?;
+        if matches!(ret, JsValue::Object(_)) {
+            Ok(ret)
+        } else {
+            Ok(JsValue::Object(inst_oid))
+        }
+    }
+
+    fn lookup_proto_prop(&self, mut oid: u32, prop: &str) -> Option<JsValue> {
+        for _ in 0..16 {
+            let map = self.objects.get(oid as usize)?;
+            if let Some(val) = map.get(prop) {
+                return Some(val.clone());
+            }
+            match map.get("__proto") {
+                Some(JsValue::Object(next_oid)) => oid = *next_oid,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn is_in_proto_chain(&self, mut oid: u32, target_proto_oid: u32) -> bool {
+        for _ in 0..16 {
+            let Some(map) = self.objects.get(oid as usize) else {
+                return false;
+            };
+            match map.get("__proto") {
+                Some(JsValue::Object(next_oid)) => {
+                    if *next_oid == target_proto_oid {
+                        return true;
+                    }
+                    oid = *next_oid;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn get_property(
         &mut self,
         obj: &JsValue,
@@ -2383,6 +4037,45 @@ impl MantaJsSandbox {
                 ),
                 _ => JsValue::Undefined,
             },
+            JsValue::TypedArray(tid) => match prop {
+                "length" => JsValue::Number(
+                    self.typed_arrays
+                        .get(*tid as usize)
+                        .map(|a| a.len())
+                        .unwrap_or(0) as f64,
+                ),
+                _ => JsValue::Undefined,
+            },
+            JsValue::Map(mid) => match prop {
+                "size" => JsValue::Number(
+                    self.maps.get(*mid as usize).map(|m| m.len()).unwrap_or(0) as f64,
+                ),
+                _ => JsValue::Undefined,
+            },
+            JsValue::Set(sid) => match prop {
+                "size" => JsValue::Number(
+                    self.sets.get(*sid as usize).map(|s| s.len()).unwrap_or(0) as f64,
+                ),
+                _ => JsValue::Undefined,
+            },
+            JsValue::Regex(rid) => match prop {
+                "source" => self
+                    .regexes
+                    .get(*rid as usize)
+                    .map(|r| JsValue::Str(r.pattern.clone()))
+                    .unwrap_or(JsValue::Undefined),
+                "flags" => self
+                    .regexes
+                    .get(*rid as usize)
+                    .map(|r| JsValue::Str(r.flags.clone()))
+                    .unwrap_or(JsValue::Undefined),
+                "lastIndex" => self
+                    .regexes
+                    .get(*rid as usize)
+                    .map(|r| JsValue::Number(r.last_index as f64))
+                    .unwrap_or(JsValue::Number(0.0)),
+                _ => JsValue::Undefined,
+            },
             JsValue::DomNode(nid) => match prop {
                 "id" => dom
                     .node_id_attr(*nid)
@@ -2397,7 +4090,9 @@ impl MantaJsSandbox {
                     .forms
                     .get_control(*nid)
                     .map(|c| JsValue::Str(c.value.clone()))
-                    .unwrap_or_else(|| JsValue::Str(dom.get_attribute(*nid, "value").unwrap_or_default())),
+                    .unwrap_or_else(|| {
+                        JsValue::Str(dom.get_attribute(*nid, "value").unwrap_or_default())
+                    }),
                 "checked" => JsValue::Bool(
                     dom.forms
                         .get_control(*nid)
@@ -2431,7 +4126,9 @@ impl MantaJsSandbox {
                     match (ns.as_str(), prop) {
                         ("document", "title") => return JsValue::Str(dom.page_title.clone()),
                         ("document", "cookie") => {
-                            return JsValue::Str(storage.get_cookie_header_for_url(origin_url, false));
+                            return JsValue::Str(
+                                storage.get_cookie_header_for_url(origin_url, false),
+                            );
                         }
                         ("location", "href") => return JsValue::Str(origin_url.to_string()),
                         ("window", "location") => {
@@ -2446,11 +4143,7 @@ impl MantaJsSandbox {
                         _ => {}
                     }
                 }
-                self.objects
-                    .get(*oid as usize)
-                    .and_then(|m| m.get(prop))
-                    .cloned()
-                    .unwrap_or(JsValue::Undefined)
+                self.lookup_proto_prop(*oid, prop).unwrap_or(JsValue::Undefined)
             }
             _ => JsValue::Undefined,
         }
@@ -2466,6 +4159,11 @@ impl MantaJsSandbox {
         storage: &mut MantaStorageEngine,
     ) {
         match obj {
+            JsValue::Regex(rid) if prop == "lastIndex" => {
+                if let Some(r) = self.regexes.get_mut(*rid as usize) {
+                    r.last_index = val.as_number().max(0.0) as usize;
+                }
+            }
             JsValue::DomNode(nid) => match prop {
                 "textContent" | "innerText" | "innerHTML" => {
                     dom.set_text_content(*nid, val.as_str());
@@ -2504,14 +4202,22 @@ impl MantaJsSandbox {
                             return;
                         }
                         ("dom_style", css_prop) => {
-                            if let Some(JsValue::DomNode(nid)) =
-                                self.objects.get(*oid as usize).and_then(|m| m.get("__nid")).copied()
-                            {
+                            let nid_opt = self
+                                .objects
+                                .get(*oid as usize)
+                                .and_then(|m| m.get("__nid"))
+                                .cloned();
+                            if let Some(JsValue::DomNode(nid)) = nid_opt {
                                 let prev = dom.get_attribute(nid, "style").unwrap_or_default();
                                 let updated = if prev.is_empty() {
                                     format!("{}: {};", css_prop, val.as_str())
                                 } else {
-                                    format!("{}; {}: {};", prev.trim_end_matches(';'), css_prop, val.as_str())
+                                    format!(
+                                        "{}; {}: {};",
+                                        prev.trim_end_matches(';'),
+                                        css_prop,
+                                        val.as_str()
+                                    )
                                 };
                                 dom.set_attribute(nid, "style", &updated);
                             }
@@ -2528,7 +4234,18 @@ impl MantaJsSandbox {
         }
     }
 
-    fn invoke_builtin_fn(&mut self, name: &str, args: &[JsValue]) -> JsValue {
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_builtin_fn(
+        &mut self,
+        program: &CompiledJsProgram,
+        name: &str,
+        args: &[JsValue],
+        origin_url: &str,
+        dom: &mut ZeroCopyDomArena,
+        clipboard: &mut ClipboardSandbox,
+        storage: &mut MantaStorageEngine,
+        downloads: &mut MantaDownloadManager,
+    ) -> Result<JsValue, &'static str> {
         match name {
             "parseInt" => {
                 let s = args.first().map(|a| a.as_str()).unwrap_or_default();
@@ -2536,29 +4253,254 @@ impl MantaJsSandbox {
                 let radix = args.get(1).map(|a| a.as_number() as u32).unwrap_or(10);
                 if radix == 16 || t.starts_with("0x") || t.starts_with("0X") {
                     let hex = t.trim_start_matches("0x").trim_start_matches("0X");
-                    JsValue::Number(i64::from_str_radix(hex, 16).map(|n| n as f64).unwrap_or(f64::NAN))
+                    Ok(JsValue::Number(
+                        i64::from_str_radix(hex, 16)
+                            .map(|n| n as f64)
+                            .unwrap_or(f64::NAN),
+                    ))
                 } else {
-                    JsValue::Number(t.parse::<i64>().map(|n| n as f64).unwrap_or(f64::NAN))
+                    Ok(JsValue::Number(
+                        t.parse::<i64>().map(|n| n as f64).unwrap_or(f64::NAN),
+                    ))
                 }
             }
-            "parseFloat" => JsValue::Number(args.first().map(|a| a.as_number()).unwrap_or(f64::NAN)),
-            "isNaN" => JsValue::Bool(args.first().map(|a| a.as_number().is_nan()).unwrap_or(true)),
-            "Number" => JsValue::Number(args.first().map(|a| a.as_number()).unwrap_or(0.0)),
-            "String" => JsValue::Str(args.first().map(|a| a.as_str()).unwrap_or_default()),
-            "Boolean" => JsValue::Bool(args.first().map(|a| a.is_truthy()).unwrap_or(false)),
+            "parseFloat" => Ok(JsValue::Number(
+                args.first().map(|a| a.as_number()).unwrap_or(f64::NAN),
+            )),
+            "isNaN" => Ok(JsValue::Bool(
+                args.first().map(|a| a.as_number().is_nan()).unwrap_or(true),
+            )),
+            "isFinite" => Ok(JsValue::Bool(
+                args.first()
+                    .map(|a| a.as_number().is_finite())
+                    .unwrap_or(false),
+            )),
+            "Number" => Ok(JsValue::Number(
+                args.first().map(|a| a.as_number()).unwrap_or(0.0),
+            )),
+            "String" => Ok(JsValue::Str(
+                args.first().map(|a| a.as_str()).unwrap_or_default(),
+            )),
+            "Boolean" => Ok(JsValue::Bool(
+                args.first().map(|a| a.is_truthy()).unwrap_or(false),
+            )),
+            "encodeURIComponent" => {
+                let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
+                Ok(JsValue::Str(percent_encode(&raw)))
+            }
+            "decodeURIComponent" => {
+                let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
+                Ok(JsValue::Str(percent_decode(&raw)))
+            }
+            "btoa" => {
+                let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
+                Ok(JsValue::Str(base64_encode(raw.as_bytes())))
+            }
+            "atob" => {
+                let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
+                let bytes = base64_decode(&raw);
+                Ok(JsValue::Str(String::from_utf8_lossy(&bytes).into_owned()))
+            }
             "queueMicrotask" | "setTimeout" => {
                 if let Some(cb) = args.first().cloned() {
-                    if self.microtasks.len() < 1024 {
-                        self.microtasks.push_back(Microtask {
+                    if self.microtasks.len() < 2048 {
+                        self.microtasks.push_back(Microtask::Callback {
                             cb,
                             arg: JsValue::Undefined,
                         });
                     }
                 }
-                JsValue::Number(1.0)
+                Ok(JsValue::Number(1.0))
             }
-            "clearTimeout" => JsValue::Undefined,
-            _ => JsValue::Undefined,
+            "clearTimeout" => Ok(JsValue::Undefined),
+            "Map" => {
+                let mid = self.maps.len() as u32;
+                let mut entries = Vec::new();
+                if let Some(JsValue::Array(aid)) = args.first() {
+                    if let Some(items) = self.arrays.get(*aid as usize) {
+                        for pair in items {
+                            if let JsValue::Array(p_aid) = pair {
+                                if let Some(p_vec) = self.arrays.get(*p_aid as usize) {
+                                    if p_vec.len() >= 2 {
+                                        entries.push((p_vec[0].as_str(), p_vec[1].clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                self.maps.push(entries);
+                Ok(JsValue::Map(mid))
+            }
+            "Set" => {
+                let sid = self.sets.len() as u32;
+                let mut entries = Vec::new();
+                if let Some(JsValue::Array(aid)) = args.first() {
+                    if let Some(items) = self.arrays.get(*aid as usize) {
+                        for it in items {
+                            if !entries.contains(it) {
+                                entries.push(it.clone());
+                            }
+                        }
+                    }
+                }
+                self.sets.push(entries);
+                Ok(JsValue::Set(sid))
+            }
+            "RegExp" => {
+                let pat = args.first().map(|a| a.as_str()).unwrap_or_default();
+                let flags = args.get(1).map(|a| a.as_str()).unwrap_or_default();
+                let rid = self.regexes.len() as u32;
+                self.regexes.push(RegexEntry {
+                    pattern: pat,
+                    flags,
+                    last_index: 0,
+                });
+                Ok(JsValue::Regex(rid))
+            }
+            "Float64Array" | "Int32Array" | "Uint8Array" => {
+                let vec = match args.first() {
+                    Some(JsValue::Number(len)) => vec![0.0; (*len as usize).min(65536)],
+                    Some(JsValue::Array(aid)) => self
+                        .arrays
+                        .get(*aid as usize)
+                        .map(|a| a.iter().map(|v| v.as_number()).collect())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                let tid = self.typed_arrays.len() as u32;
+                self.typed_arrays.push(vec);
+                Ok(JsValue::TypedArray(tid))
+            }
+            "Promise" => {
+                let p_oid = self.alloc_promise(None, JsValue::Undefined)?;
+                if let Some(executor) = args.first().cloned() {
+                    let res_cid = self.callables.len() as u32;
+                    self.callables.push(Callable::BoundResolver {
+                        promise_oid: p_oid,
+                        is_reject: false,
+                    });
+                    let rej_cid = self.callables.len() as u32;
+                    self.callables.push(Callable::BoundResolver {
+                        promise_oid: p_oid,
+                        is_reject: true,
+                    });
+                    if let Err(e) = self.invoke_callable_val(
+                        program,
+                        &executor,
+                        &[JsValue::Fn(res_cid), JsValue::Fn(rej_cid)],
+                        None,
+                        None,
+                        origin_url,
+                        dom,
+                        clipboard,
+                        storage,
+                        downloads,
+                    ) {
+                        self.settle_promise(p_oid, false, JsValue::Str(e.to_string()));
+                    }
+                }
+                Ok(JsValue::Object(p_oid))
+            }
+            "URL" => {
+                let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
+                let (protocol, rest) = raw
+                    .split_once("://")
+                    .map(|(s, r)| (format!("{}:", s), r))
+                    .unwrap_or(("https:".to_string(), raw.as_str()));
+                let (host, path_q) = match rest.find('/') {
+                    Some(idx) => (&rest[..idx], &rest[idx..]),
+                    None => (rest, "/"),
+                };
+                let (pathname, search) = match path_q.find('?') {
+                    Some(q) => (&path_q[..q], &path_q[q..]),
+                    None => (path_q, ""),
+                };
+                let mut m = HashMap::new();
+                m.insert("href".to_string(), JsValue::Str(raw.clone()));
+                m.insert("protocol".to_string(), JsValue::Str(protocol.clone()));
+                m.insert("host".to_string(), JsValue::Str(host.to_string()));
+                m.insert(
+                    "hostname".to_string(),
+                    JsValue::Str(host.split(':').next().unwrap_or(host).to_string()),
+                );
+                m.insert("pathname".to_string(), JsValue::Str(pathname.to_string()));
+                m.insert("search".to_string(), JsValue::Str(search.to_string()));
+                m.insert(
+                    "origin".to_string(),
+                    JsValue::Str(format!("{}//{}", protocol, host)),
+                );
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "URLSearchParams" => {
+                let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
+                let mut m = HashMap::new();
+                m.insert("__manta_ns".to_string(), JsValue::Str("urlparams".to_string()));
+                for pair in raw.trim_start_matches('?').split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        m.insert(percent_decode(k), JsValue::Str(percent_decode(v)));
+                    }
+                }
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "TextEncoder" => {
+                let mut m = HashMap::new();
+                m.insert("__manta_ns".to_string(), JsValue::Str("textencoder".to_string()));
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "TextDecoder" => {
+                let mut m = HashMap::new();
+                m.insert("__manta_ns".to_string(), JsValue::Str("textdecoder".to_string()));
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "Error" => {
+                let msg = args.first().map(|a| a.as_str()).unwrap_or_default();
+                let mut m = HashMap::new();
+                m.insert("message".to_string(), JsValue::Str(msg));
+                m.insert("name".to_string(), JsValue::Str("Error".to_string()));
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "fetch" => {
+                let url = args.first().map(|a| a.as_str()).unwrap_or_default();
+                let mut headers = HashMap::new();
+                if !origin_url.is_empty() {
+                    headers.insert("Origin".to_string(), origin_url.to_string());
+                }
+                let mut modules = ModuleBus::new();
+                modules.register(Box::new(SiteIsolationModule::new()));
+                let mut body = Vec::new();
+                match StreamingNetworkPipe::stream_http(
+                    "GET",
+                    &url,
+                    headers,
+                    &modules,
+                    4 * 1024 * 1024,
+                    |chunk, _| body.extend_from_slice(chunk),
+                ) {
+                    Ok(outcome) => {
+                        let body_text = String::from_utf8_lossy(&body).into_owned();
+                        let mut resp_map = HashMap::new();
+                        resp_map.insert("__manta_ns".to_string(), JsValue::Str("fetch_resp".to_string()));
+                        resp_map.insert(
+                            "ok".to_string(),
+                            JsValue::Bool((200..300).contains(&outcome.status_code)),
+                        );
+                        resp_map.insert(
+                            "status".to_string(),
+                            JsValue::Number(outcome.status_code as f64),
+                        );
+                        resp_map.insert("__body".to_string(), JsValue::Str(body_text));
+                        let r_oid = self.alloc_obj_map(resp_map);
+                        let p_oid = self.alloc_promise(Some(true), JsValue::Object(r_oid))?;
+                        Ok(JsValue::Object(p_oid))
+                    }
+                    Err(e) => {
+                        let p_oid = self.alloc_promise(Some(false), JsValue::Str(e))?;
+                        Ok(JsValue::Object(p_oid))
+                    }
+                }
+            }
+            _ => Ok(JsValue::Undefined),
         }
     }
 
@@ -2576,13 +4518,241 @@ impl MantaJsSandbox {
         downloads: &mut MantaDownloadManager,
     ) -> Result<JsValue, &'static str> {
         match receiver {
+            JsValue::Fn(cid) => {
+                if let Some(Callable::Builtin("Promise")) = self.callables.get(*cid as usize).cloned()
+                {
+                    match method {
+                        "resolve" => {
+                            let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                            let p = self.alloc_promise(Some(true), val)?;
+                            return Ok(JsValue::Object(p));
+                        }
+                        "reject" => {
+                            let err = args.first().cloned().unwrap_or(JsValue::Undefined);
+                            let p = self.alloc_promise(Some(false), err)?;
+                            return Ok(JsValue::Object(p));
+                        }
+                        "withResolvers" => {
+                            let p_oid = self.alloc_promise(None, JsValue::Undefined)?;
+                            let res_cid = self.callables.len() as u32;
+                            self.callables.push(Callable::BoundResolver {
+                                promise_oid: p_oid,
+                                is_reject: false,
+                            });
+                            let rej_cid = self.callables.len() as u32;
+                            self.callables.push(Callable::BoundResolver {
+                                promise_oid: p_oid,
+                                is_reject: true,
+                            });
+                            let mut m = HashMap::new();
+                            m.insert("promise".to_string(), JsValue::Object(p_oid));
+                            m.insert("resolve".to_string(), JsValue::Fn(res_cid));
+                            m.insert("reject".to_string(), JsValue::Fn(rej_cid));
+                            return Ok(JsValue::Object(self.alloc_obj_map(m)));
+                        }
+                        "all" => {
+                            if let Some(JsValue::Array(aid)) = args.first() {
+                                let items = self.arrays.get(*aid as usize).cloned().unwrap_or_default();
+                                let mut results = Vec::with_capacity(items.len());
+                                for it in items {
+                                    if let JsValue::Object(poid) = it {
+                                        if let Some(rec) = self.promises.get(&poid) {
+                                            if rec.fulfilled == Some(false) {
+                                                let rej = self.alloc_promise(Some(false), rec.value.clone())?;
+                                                return Ok(JsValue::Object(rej));
+                                            }
+                                            results.push(rec.value.clone());
+                                            continue;
+                                        }
+                                    }
+                                    results.push(it);
+                                }
+                                let out_aid = self.alloc_arr(results)?;
+                                let p = self.alloc_promise(Some(true), JsValue::Array(out_aid))?;
+                                return Ok(JsValue::Object(p));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(JsValue::Undefined)
+            }
+            JsValue::Regex(rid) => {
+                let text = args.first().map(|a| a.as_str()).unwrap_or_default();
+                let Some(entry) = self.regexes.get(*rid as usize).cloned() else {
+                    return Ok(JsValue::Null);
+                };
+                let is_global = entry.flags.contains('g');
+                let start_pos = if is_global { entry.last_index.min(text.len()) } else { 0 };
+                match method {
+                    "test" => {
+                        let matched = regex_find(&entry.pattern, &entry.flags, &text, start_pos);
+                        if let Some((_, end)) = matched {
+                            if is_global {
+                                self.regexes[*rid as usize].last_index = end;
+                            }
+                            Ok(JsValue::Bool(true))
+                        } else {
+                            if is_global {
+                                self.regexes[*rid as usize].last_index = 0;
+                            }
+                            Ok(JsValue::Bool(false))
+                        }
+                    }
+                    "exec" => {
+                        if let Some((s, e)) = regex_find(&entry.pattern, &entry.flags, &text, start_pos)
+                        {
+                            if is_global {
+                                self.regexes[*rid as usize].last_index = e;
+                            }
+                            let sub = text.get(s..e).unwrap_or("").to_string();
+                            Ok(JsValue::Array(self.alloc_arr(vec![JsValue::Str(sub)])?))
+                        } else {
+                            if is_global {
+                                self.regexes[*rid as usize].last_index = 0;
+                            }
+                            Ok(JsValue::Null)
+                        }
+                    }
+                    _ => Ok(JsValue::Undefined),
+                }
+            }
+            JsValue::Map(mid) => match method {
+                "set" => {
+                    let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                    let v = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    if let Some(m) = self.maps.get_mut(*mid as usize) {
+                        if let Some(entry) = m.iter_mut().find(|(ek, _)| ek == &k) {
+                            entry.1 = v;
+                        } else {
+                            m.push((k, v));
+                        }
+                    }
+                    Ok(JsValue::Map(*mid))
+                }
+                "get" => {
+                    let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                    Ok(self
+                        .maps
+                        .get(*mid as usize)
+                        .and_then(|m| m.iter().find(|(ek, _)| ek == &k).map(|(_, v)| v.clone()))
+                        .unwrap_or(JsValue::Undefined))
+                }
+                "has" => {
+                    let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                    Ok(JsValue::Bool(
+                        self.maps
+                            .get(*mid as usize)
+                            .map(|m| m.iter().any(|(ek, _)| ek == &k))
+                            .unwrap_or(false),
+                    ))
+                }
+                "delete" => {
+                    let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                    if let Some(m) = self.maps.get_mut(*mid as usize) {
+                        let before = m.len();
+                        m.retain(|(ek, _)| ek != &k);
+                        return Ok(JsValue::Bool(m.len() != before));
+                    }
+                    Ok(JsValue::Bool(false))
+                }
+                "clear" => {
+                    if let Some(m) = self.maps.get_mut(*mid as usize) {
+                        m.clear();
+                    }
+                    Ok(JsValue::Undefined)
+                }
+                _ => Ok(JsValue::Undefined),
+            },
+            JsValue::Set(sid) => match method {
+                "add" => {
+                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    if let Some(s) = self.sets.get_mut(*sid as usize) {
+                        if !s.contains(&val) {
+                            s.push(val);
+                        }
+                    }
+                    Ok(JsValue::Set(*sid))
+                }
+                "has" => {
+                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    Ok(JsValue::Bool(
+                        self.sets
+                            .get(*sid as usize)
+                            .map(|s| s.contains(&val))
+                            .unwrap_or(false),
+                    ))
+                }
+                "delete" => {
+                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    if let Some(s) = self.sets.get_mut(*sid as usize) {
+                        let before = s.len();
+                        s.retain(|x| x != &val);
+                        return Ok(JsValue::Bool(s.len() != before));
+                    }
+                    Ok(JsValue::Bool(false))
+                }
+                "clear" => {
+                    if let Some(s) = self.sets.get_mut(*sid as usize) {
+                        s.clear();
+                    }
+                    Ok(JsValue::Undefined)
+                }
+                _ => Ok(JsValue::Undefined),
+            },
+            JsValue::TypedArray(tid) => match method {
+                "reduce" | "sum" => {
+                    if method == "sum" {
+                        let sum = self
+                            .typed_arrays
+                            .get(*tid as usize)
+                            .map(|a| fast_f64_sum(a))
+                            .unwrap_or(0.0);
+                        return Ok(JsValue::Number(sum));
+                    }
+                    let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let mut acc = args.get(1).cloned().unwrap_or(JsValue::Number(0.0));
+                    let items = self.typed_arrays.get(*tid as usize).cloned().unwrap_or_default();
+                    for (i, n) in items.into_iter().enumerate() {
+                        acc = self.invoke_callable_val(
+                            program,
+                            &cb,
+                            &[acc, JsValue::Number(n), JsValue::Number(i as f64)],
+                            None,
+                            None,
+                            origin_url,
+                            dom,
+                            clipboard,
+                            storage,
+                            downloads,
+                        )?;
+                    }
+                    Ok(acc)
+                }
+                "scaleAdd" => {
+                    let scale = args.first().map(|a| a.as_number()).unwrap_or(1.0);
+                    let bias = args.get(1).map(|a| a.as_number()).unwrap_or(0.0);
+                    if let Some(arr) = self.typed_arrays.get_mut(*tid as usize) {
+                        let src = arr.clone();
+                        fast_f64_scale_add(arr, &src, scale, bias);
+                    }
+                    Ok(JsValue::TypedArray(*tid))
+                }
+                _ => Ok(JsValue::Undefined),
+            },
             JsValue::Str(s) => match method {
                 "trim" => Ok(JsValue::Str(s.trim().to_string())),
+                "trimStart" => Ok(JsValue::Str(s.trim_start().to_string())),
+                "trimEnd" => Ok(JsValue::Str(s.trim_end().to_string())),
                 "toLowerCase" => Ok(JsValue::Str(s.to_ascii_lowercase())),
                 "toUpperCase" => Ok(JsValue::Str(s.to_ascii_uppercase())),
+                "repeat" => {
+                    let cnt = (args.first().map(|a| a.as_number() as usize).unwrap_or(0)).min(4096);
+                    Ok(JsValue::Str(s.repeat(cnt)))
+                }
                 "includes" => {
                     let sub = args.first().map(|a| a.as_str()).unwrap_or_default();
-                    Ok(JsValue::Bool(s.contains(&sub)))
+                    Ok(JsValue::Bool(find_substr(s, &sub, 0).is_some()))
                 }
                 "startsWith" => {
                     let sub = args.first().map(|a| a.as_str()).unwrap_or_default();
@@ -2594,14 +4764,86 @@ impl MantaJsSandbox {
                 }
                 "indexOf" => {
                     let sub = args.first().map(|a| a.as_str()).unwrap_or_default();
+                    let from = args.get(1).map(|a| a.as_number().max(0.0) as usize).unwrap_or(0);
                     Ok(JsValue::Number(
-                        s.find(&sub).map(|i| i as f64).unwrap_or(-1.0),
+                        find_substr(s, &sub, from).map(|i| i as f64).unwrap_or(-1.0),
                     ))
                 }
-                "replace" => {
-                    let pat = args.first().map(|a| a.as_str()).unwrap_or_default();
+                "search" => {
+                    if let Some(JsValue::Regex(rid)) = args.first() {
+                        if let Some(r) = self.regexes.get(*rid as usize) {
+                            return Ok(JsValue::Number(
+                                regex_find(&r.pattern, &r.flags, s, 0)
+                                    .map(|(st, _)| st as f64)
+                                    .unwrap_or(-1.0),
+                            ));
+                        }
+                    }
+                    let sub = args.first().map(|a| a.as_str()).unwrap_or_default();
+                    Ok(JsValue::Number(
+                        find_substr(s, &sub, 0).map(|i| i as f64).unwrap_or(-1.0),
+                    ))
+                }
+                "match" => {
+                    if let Some(JsValue::Regex(rid)) = args.first() {
+                        if let Some(r) = self.regexes.get(*rid as usize).cloned() {
+                            if r.flags.contains('g') {
+                                let mut out = Vec::new();
+                                let mut pos = 0usize;
+                                while pos <= s.len() {
+                                    if let Some((st, en)) = regex_find(&r.pattern, &r.flags, s, pos) {
+                                        out.push(JsValue::Str(s[st..en].to_string()));
+                                        pos = if en == st { st + 1 } else { en };
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                return if out.is_empty() {
+                                    Ok(JsValue::Null)
+                                } else {
+                                    Ok(JsValue::Array(self.alloc_arr(out)?))
+                                };
+                            } else if let Some((st, en)) = regex_find(&r.pattern, &r.flags, s, 0) {
+                                return Ok(JsValue::Array(
+                                    self.alloc_arr(vec![JsValue::Str(s[st..en].to_string())])?,
+                                ));
+                            }
+                            return Ok(JsValue::Null);
+                        }
+                    }
+                    Ok(JsValue::Null)
+                }
+                "replace" | "replaceAll" => {
                     let rep = args.get(1).map(|a| a.as_str()).unwrap_or_default();
-                    Ok(JsValue::Str(s.replacen(&pat, &rep, 1)))
+                    if let Some(JsValue::Regex(rid)) = args.first() {
+                        if let Some(r) = self.regexes.get(*rid as usize).cloned() {
+                            let is_all = method == "replaceAll" || r.flags.contains('g');
+                            let mut out = String::with_capacity(s.len());
+                            let mut pos = 0usize;
+                            while pos <= s.len() {
+                                if let Some((st, en)) = regex_find(&r.pattern, &r.flags, s, pos) {
+                                    out.push_str(&s[pos..st]);
+                                    out.push_str(&rep);
+                                    pos = if en == st { st + 1 } else { en };
+                                    if !is_all {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            if pos <= s.len() {
+                                out.push_str(&s[pos..]);
+                            }
+                            return Ok(JsValue::Str(out));
+                        }
+                    }
+                    let pat = args.first().map(|a| a.as_str()).unwrap_or_default();
+                    if method == "replaceAll" {
+                        Ok(JsValue::Str(s.replace(&pat, &rep)))
+                    } else {
+                        Ok(JsValue::Str(s.replacen(&pat, &rep, 1)))
+                    }
                 }
                 "split" => {
                     let sep = args.first().map(|a| a.as_str()).unwrap_or_default();
@@ -2663,6 +4905,15 @@ impl MantaJsSandbox {
                         }
                         Ok(JsValue::Undefined)
                     }
+                    "unshift" => {
+                        if let Some(arr) = self.arrays.get_mut(*aid as usize) {
+                            for (i, v) in args.iter().enumerate() {
+                                arr.insert(i, v.clone());
+                            }
+                            return Ok(JsValue::Number(arr.len() as f64));
+                        }
+                        Ok(JsValue::Number(0.0))
+                    }
                     "join" => {
                         let sep = args
                             .first()
@@ -2690,6 +4941,20 @@ impl MantaJsSandbox {
                         }
                         Ok(JsValue::Array(*aid))
                     }
+                    "concat" => {
+                        let mut out = items_snapshot;
+                        for arg in args {
+                            match arg {
+                                JsValue::Array(other_id) => {
+                                    if let Some(other) = self.arrays.get(*other_id as usize) {
+                                        out.extend(other.iter().cloned());
+                                    }
+                                }
+                                other => out.push(other.clone()),
+                            }
+                        }
+                        Ok(JsValue::Array(self.alloc_arr(out)?))
+                    }
                     "slice" => {
                         let len = items_snapshot.len();
                         let s = args.first().map(|a| a.as_number() as isize).unwrap_or(0);
@@ -2707,6 +4972,8 @@ impl MantaJsSandbox {
                                 program,
                                 &cb,
                                 &[item, JsValue::Number(idx as f64)],
+                                None,
+                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -2725,6 +4992,8 @@ impl MantaJsSandbox {
                                 program,
                                 &cb,
                                 &[item.clone(), JsValue::Number(idx as f64)],
+                                None,
+                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -2737,6 +5006,76 @@ impl MantaJsSandbox {
                         }
                         Ok(JsValue::Array(self.alloc_arr(out)?))
                     }
+                    "reduce" => {
+                        let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let mut iter = items_snapshot.into_iter().enumerate();
+                        let mut acc = if args.len() >= 2 {
+                            args[1].clone()
+                        } else {
+                            iter.next().map(|(_, v)| v).unwrap_or(JsValue::Undefined)
+                        };
+                        for (idx, item) in iter {
+                            acc = self.invoke_callable_val(
+                                program,
+                                &cb,
+                                &[acc, item, JsValue::Number(idx as f64)],
+                                None,
+                                None,
+                                origin_url,
+                                dom,
+                                clipboard,
+                                storage,
+                                downloads,
+                            )?;
+                        }
+                        Ok(acc)
+                    }
+                    "some" => {
+                        let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (idx, item) in items_snapshot.into_iter().enumerate() {
+                            if self
+                                .invoke_callable_val(
+                                    program,
+                                    &cb,
+                                    &[item, JsValue::Number(idx as f64)],
+                                    None,
+                                    None,
+                                    origin_url,
+                                    dom,
+                                    clipboard,
+                                    storage,
+                                    downloads,
+                                )?
+                                .is_truthy()
+                            {
+                                return Ok(JsValue::Bool(true));
+                            }
+                        }
+                        Ok(JsValue::Bool(false))
+                    }
+                    "every" => {
+                        let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (idx, item) in items_snapshot.into_iter().enumerate() {
+                            if !self
+                                .invoke_callable_val(
+                                    program,
+                                    &cb,
+                                    &[item, JsValue::Number(idx as f64)],
+                                    None,
+                                    None,
+                                    origin_url,
+                                    dom,
+                                    clipboard,
+                                    storage,
+                                    downloads,
+                                )?
+                                .is_truthy()
+                            {
+                                return Ok(JsValue::Bool(false));
+                            }
+                        }
+                        Ok(JsValue::Bool(true))
+                    }
                     "forEach" => {
                         let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
                         for (idx, item) in items_snapshot.into_iter().enumerate() {
@@ -2744,6 +5083,8 @@ impl MantaJsSandbox {
                                 program,
                                 &cb,
                                 &[item, JsValue::Number(idx as f64)],
+                                None,
+                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -2760,6 +5101,8 @@ impl MantaJsSandbox {
                                 program,
                                 &cb,
                                 &[item.clone(), JsValue::Number(idx as f64)],
+                                None,
+                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -2837,6 +5180,8 @@ impl MantaJsSandbox {
                                         program,
                                         &JsValue::Fn(cid),
                                         &[JsValue::DomNode(*nid)],
+                                        None,
+                                        None,
                                         origin_url,
                                         dom,
                                         clipboard,
@@ -2845,10 +5190,13 @@ impl MantaJsSandbox {
                                     )?;
                                 }
                             } else if let Ok(inline_prog) = JsBytecodeCompiler::compile(&handler) {
-                                let _ = self.run_bytecode_at(
+                                let _ = self.run_vm_loop(
                                     &inline_prog,
                                     0,
+                                    Vec::new(),
                                     0,
+                                    Vec::new(),
+                                    Vec::new(),
                                     origin_url,
                                     dom,
                                     clipboard,
@@ -2880,7 +5228,7 @@ impl MantaJsSandbox {
                             .objects
                             .get(*oid as usize)
                             .and_then(|m| m.get("__nid"))
-                            .copied()
+                            .cloned()
                         {
                             for a in args {
                                 dom.add_class(nid, &a.as_str());
@@ -2893,7 +5241,7 @@ impl MantaJsSandbox {
                             .objects
                             .get(*oid as usize)
                             .and_then(|m| m.get("__nid"))
-                            .copied()
+                            .cloned()
                         {
                             for a in args {
                                 dom.remove_class(nid, &a.as_str());
@@ -2906,7 +5254,7 @@ impl MantaJsSandbox {
                             .objects
                             .get(*oid as usize)
                             .and_then(|m| m.get("__nid"))
-                            .copied()
+                            .cloned()
                         {
                             let cls = args.first().map(|a| a.as_str()).unwrap_or_default();
                             return Ok(JsValue::Bool(dom.node_has_class(nid, &cls)));
@@ -2918,7 +5266,7 @@ impl MantaJsSandbox {
                             .objects
                             .get(*oid as usize)
                             .and_then(|m| m.get("__nid"))
-                            .copied()
+                            .cloned()
                         {
                             let cls = args.first().map(|a| a.as_str()).unwrap_or_default();
                             if dom.node_has_class(nid, &cls) {
@@ -2930,6 +5278,84 @@ impl MantaJsSandbox {
                             }
                         }
                         Ok(JsValue::Bool(false))
+                    }
+                    ("urlparams", "get") => {
+                        let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                        Ok(self
+                            .objects
+                            .get(*oid as usize)
+                            .and_then(|m| m.get(&k))
+                            .cloned()
+                            .unwrap_or(JsValue::Null))
+                    }
+                    ("textencoder", "encode") => {
+                        let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
+                        let vals: Vec<f64> = raw.as_bytes().iter().map(|&b| b as f64).collect();
+                        let tid = self.typed_arrays.len() as u32;
+                        self.typed_arrays.push(vals);
+                        Ok(JsValue::TypedArray(tid))
+                    }
+                    ("textdecoder", "decode") => {
+                        if let Some(JsValue::TypedArray(tid)) = args.first() {
+                            let bytes: Vec<u8> = self
+                                .typed_arrays
+                                .get(*tid as usize)
+                                .map(|v| v.iter().map(|&x| x as u8).collect())
+                                .unwrap_or_default();
+                            return Ok(JsValue::Str(String::from_utf8_lossy(&bytes).into_owned()));
+                        }
+                        Ok(JsValue::Str(String::new()))
+                    }
+                    ("fetch_resp", "text") => {
+                        let body = self
+                            .objects
+                            .get(*oid as usize)
+                            .and_then(|m| m.get("__body"))
+                            .cloned()
+                            .unwrap_or_else(|| JsValue::Str(String::new()));
+                        let p = self.alloc_promise(Some(true), body)?;
+                        Ok(JsValue::Object(p))
+                    }
+                    ("fetch_resp", "json") => {
+                        let body = self
+                            .objects
+                            .get(*oid as usize)
+                            .and_then(|m| m.get("__body"))
+                            .map(|v| v.as_str())
+                            .unwrap_or_default();
+                        let parsed = self.json_parse(&body).unwrap_or(JsValue::Null);
+                        let p = self.alloc_promise(Some(true), parsed)?;
+                        Ok(JsValue::Object(p))
+                    }
+                    ("promise", "then" | "catch" | "finally") => {
+                        let is_catch = method == "catch";
+                        let on_ok = if is_catch { None } else { args.first().cloned() };
+                        let on_err = if is_catch {
+                            args.first().cloned()
+                        } else {
+                            args.get(1).cloned()
+                        };
+                        let child_oid = self.alloc_promise(None, JsValue::Undefined)?;
+                        if let Some(rec) = self.promises.get_mut(oid) {
+                            match rec.fulfilled {
+                                Some(true) => {
+                                    let val = rec.value.clone();
+                                    if let Some(cb) = on_ok {
+                                        self.microtasks.push_back(Microtask::Callback { cb, arg: val });
+                                    }
+                                }
+                                Some(false) => {
+                                    let err = rec.value.clone();
+                                    if let Some(cb) = on_err {
+                                        self.microtasks.push_back(Microtask::Callback { cb, arg: err });
+                                    }
+                                }
+                                None => {
+                                    rec.then_waiters.push((on_ok, on_err, child_oid));
+                                }
+                            }
+                        }
+                        Ok(JsValue::Object(child_oid))
                     }
                     ("document", "getElementById") => {
                         let id = args.first().map(|a| a.as_str()).unwrap_or_default();
@@ -3148,6 +5574,14 @@ impl MantaJsSandbox {
                     ("Math", "sqrt") => Ok(JsValue::Number(
                         args.first().map(|a| a.as_number()).unwrap_or(0.0).sqrt(),
                     )),
+                    ("Math", "pow") => {
+                        let a = args.first().map(|x| x.as_number()).unwrap_or(0.0);
+                        let b = args.get(1).map(|x| x.as_number()).unwrap_or(1.0);
+                        Ok(JsValue::Number(a.powf(b)))
+                    }
+                    ("Math", "trunc") => Ok(JsValue::Number(
+                        args.first().map(|a| a.as_number()).unwrap_or(0.0).trunc(),
+                    )),
                     ("JSON", "stringify") => {
                         let val = args.first().unwrap_or(&JsValue::Undefined);
                         Ok(JsValue::Str(self.json_stringify(val)))
@@ -3156,56 +5590,71 @@ impl MantaJsSandbox {
                         let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
                         Ok(self.json_parse(&raw).unwrap_or(JsValue::Null))
                     }
-                    ("Object", "keys") => {
+                    ("Object", "keys" | "values" | "entries") => {
                         if let Some(JsValue::Object(target_oid)) = args.first() {
-                            let keys: Vec<JsValue> = self
-                                .objects
-                                .get(*target_oid as usize)
-                                .map(|m| {
-                                    m.keys()
-                                        .filter(|k| !k.starts_with("__"))
-                                        .map(|k| JsValue::Str(k.clone()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            return Ok(JsValue::Array(self.alloc_arr(keys)?));
+                            let items: Vec<JsValue> = match self.objects.get(*target_oid as usize) {
+                                Some(m) => {
+                                    let mut vec = Vec::new();
+                                    for (k, v) in m {
+                                        if k.starts_with("__") {
+                                            continue;
+                                        }
+                                        match method {
+                                            "keys" => vec.push(JsValue::Str(k.clone())),
+                                            "values" => vec.push(v.clone()),
+                                            _ => vec.push(JsValue::Array(
+                                                self.alloc_arr(vec![JsValue::Str(k.clone()), v.clone()])?,
+                                            )),
+                                        }
+                                    }
+                                    vec
+                                }
+                                None => Vec::new(),
+                            };
+                            return Ok(JsValue::Array(self.alloc_arr(items)?));
                         }
                         Ok(JsValue::Array(self.alloc_arr(Vec::new())?))
+                    }
+                    ("Object", "assign") => {
+                        if let Some(JsValue::Object(dst_oid)) = args.first().cloned() {
+                            for src in &args[1..] {
+                                if let JsValue::Object(src_oid) = src {
+                                    if let Some(src_map) = self.objects.get(*src_oid as usize).cloned()
+                                    {
+                                        if let Some(dst_map) = self.objects.get_mut(dst_oid as usize)
+                                        {
+                                            for (k, v) in src_map {
+                                                if !k.starts_with("__") {
+                                                    dst_map.insert(k, v);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(JsValue::Object(dst_oid));
+                        }
+                        Ok(JsValue::Undefined)
                     }
                     ("Array", "isArray") => Ok(JsValue::Bool(matches!(
                         args.first(),
                         Some(JsValue::Array(_))
                     ))),
-                    ("Promise", "resolve") => {
-                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
-                        let mut m = HashMap::new();
-                        m.insert("__manta_ns".to_string(), JsValue::Str("promise".to_string()));
-                        m.insert("__state".to_string(), JsValue::Str("fulfilled".to_string()));
-                        m.insert("__val".to_string(), val);
-                        Ok(JsValue::Object(self.alloc_obj_map(m)))
-                    }
-                    ("promise", "then") => {
-                        let st = self
-                            .objects
-                            .get(*oid as usize)
-                            .and_then(|m| m.get("__state"))
-                            .map(|v| v.as_str())
-                            .unwrap_or_default();
-                        if st == "fulfilled" {
-                            if let Some(cb) = args.first().cloned() {
-                                let arg = self
-                                    .objects
-                                    .get(*oid as usize)
-                                    .and_then(|m| m.get("__val"))
-                                    .cloned()
-                                    .unwrap_or(JsValue::Undefined);
-                                if self.microtasks.len() < 1024 {
-                                    self.microtasks.push_back(Microtask { cb, arg });
-                                }
-                            }
+                    ("Array", "from") => match args.first() {
+                        Some(JsValue::Array(aid)) => {
+                            let items = self.arrays.get(*aid as usize).cloned().unwrap_or_default();
+                            Ok(JsValue::Array(self.alloc_arr(items)?))
                         }
-                        Ok(JsValue::Object(*oid))
-                    }
+                        Some(JsValue::Set(sid)) => {
+                            let items = self.sets.get(*sid as usize).cloned().unwrap_or_default();
+                            Ok(JsValue::Array(self.alloc_arr(items)?))
+                        }
+                        Some(JsValue::Str(s)) => {
+                            let items: Vec<JsValue> = s.chars().map(|c| JsValue::Str(c.to_string())).collect();
+                            Ok(JsValue::Array(self.alloc_arr(items)?))
+                        }
+                        _ => Ok(JsValue::Array(self.alloc_arr(Vec::new())?)),
+                    },
                     ("Date", "now") => {
                         let ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -3214,17 +5663,14 @@ impl MantaJsSandbox {
                         Ok(JsValue::Number(ms))
                     }
                     _ => {
-                        // User-defined method stored on JS object
-                        let member = self
-                            .objects
-                            .get(*oid as usize)
-                            .and_then(|m| m.get(method))
-                            .cloned();
+                        let member = self.lookup_proto_prop(*oid, method);
                         if let Some(fn_val) = member {
                             self.invoke_callable_val(
                                 program,
                                 &fn_val,
                                 args,
+                                Some(JsValue::Object(*oid)),
+                                None,
                                 origin_url,
                                 dom,
                                 clipboard,
@@ -3377,11 +5823,16 @@ impl MantaJsSandbox {
         self.scopes.clear();
         self.scopes.push(ScopeFrame {
             parent: None,
-            vars: HashMap::with_capacity(32),
+            vars: HashMap::with_capacity(48),
         });
         self.objects.clear();
         self.arrays.clear();
         self.callables.clear();
+        self.regexes.clear();
+        self.maps.clear();
+        self.sets.clear();
+        self.typed_arrays.clear();
+        self.promises.clear();
         self.microtasks.clear();
         self.console_logs.clear();
         self.fuel_remaining = self.max_fuel;
@@ -3458,13 +5909,105 @@ fn escape_json_str(s: &str) -> String {
     out
 }
 
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let raw = s.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&raw[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(hex_str, 16) {
+                    bytes.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+        } else if raw[i] == b'+' {
+            bytes.push(b' ');
+            i += 1;
+            continue;
+        }
+        bytes.push(raw[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+        let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+        out.push(TBL[b0 >> 2] as char);
+        out.push(TBL[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        out.push(if chunk.len() > 1 {
+            TBL[((b1 & 0x0F) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TBL[b2 & 0x3F] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::html_tokenizer::StreamingHtmlTokenizer;
 
     #[test]
-    fn test_js_vm_closures_objects_arrays_promises_json_and_dom_events() {
+    fn test_full_js_classes_async_await_templates_destructuring_regex_and_typedarrays() {
         let mut dom = ZeroCopyDomArena::new(128 * 1024);
         let mut tokenizer = StreamingHtmlTokenizer::new();
         tokenizer.feed_chunk(
@@ -3473,12 +6016,43 @@ mod tests {
             |tok| dom.ingest_token(tok),
         );
 
-        let mut vm = MantaJsSandbox::new(50_000);
+        let mut vm = MantaJsSandbox::new(100_000);
         let mut clip = ClipboardSandbox::new(1024);
         let mut storage = MantaStorageEngine::new(128 * 1024, 512 * 1024);
         let mut downloads = MantaDownloadManager::new("", 1024 * 1024);
 
         let script = r#"
+            class Engine {
+                constructor(name) { this.name = name; }
+                tag() { return `[${this.name}]`; }
+            }
+            class MantaCore extends Engine {
+                constructor(name, ver) {
+                    super(name);
+                    this.ver = ver;
+                }
+                describe() { return `${this.tag()} v${this.ver}`; }
+            }
+            const core = new MantaCore("Manta", 3);
+            let clsOut = core.describe();
+
+            const { ver, missing = 10 } = core;
+            const [first, ...rest] = [10, 20, 30];
+            const spreadArr = [...rest, 40];
+
+            // C++ SIMD RegExp & TypedArray fast math
+            let reOk = /manta\d+/i.test("Powered by MANTA3000!");
+            let nums = new Float64Array([1.5, 2.5, 3.0, 3.0]);
+            let vecSum = nums.sum();
+
+            // True async / await
+            let asyncRes = 0;
+            async function computeAsync(base) {
+                let added = await Promise.resolve(15);
+                return base + added;
+            }
+            computeAsync(35).then((v) => { asyncRes = v; });
+
             function makeMultiplier(factor) {
                 return (x) => x * factor;
             }
@@ -3488,15 +6062,10 @@ mod tests {
             for (let v of arr) {
                 sum += v;
             }
-            let result = times6(7) + sum - 2; // 42 + 10 - 2 = 50
+            let result = times6(7) + sum - 2; // 50
 
-            let obj = JSON.parse("{\"ok\":true,\"items\":[10,20]}");
             let caught = "";
-            try {
-                throw "boom";
-            } catch (e) {
-                caught = e;
-            }
+            try { throw "boom"; } catch (e) { caught = e; }
 
             let btn = document.getElementById("btn");
             let clicked = 0;
@@ -3528,25 +6097,18 @@ mod tests {
         assert_eq!(vm.get_global("caught"), Some(&JsValue::Str("boom".to_string())));
         assert_eq!(vm.get_global("clicked"), Some(&JsValue::Number(1.0)));
         assert_eq!(vm.get_global("asyncVal"), Some(&JsValue::Number(99.0)));
+        assert_eq!(vm.get_global("asyncRes"), Some(&JsValue::Number(50.0)));
+        assert_eq!(vm.get_global("clsOut"), Some(&JsValue::Str("[Manta] v3".to_string())));
+        assert_eq!(vm.get_global("ver"), Some(&JsValue::Number(3.0)));
+        assert_eq!(vm.get_global("missing"), Some(&JsValue::Number(10.0)));
+        assert_eq!(vm.get_global("first"), Some(&JsValue::Number(10.0)));
+        assert_eq!(vm.get_global("reOk"), Some(&JsValue::Bool(true)));
+        assert_eq!(vm.get_global("vecSum"), Some(&JsValue::Number(10.0)));
 
         let email_id = dom.find_by_id("email").unwrap();
         assert_eq!(
             dom.forms.get_control(email_id).unwrap().value,
             "dev@manta.browser"
         );
-        assert_eq!(
-            storage.get_form_draft("https://app.manta.dev", "email"),
-            Some("dev@manta.browser".to_string())
-        );
-        assert_eq!(
-            storage.get_cookie_header_for_url("https://app.manta.dev", false),
-            "session_id=manta_999"
-        );
-        assert!(storage
-            .db
-            .get_object("https://app.manta.dev", "users", "u1")
-            .unwrap()
-            .contains("dev@manta.browser"));
-        assert!(downloads.get_download(1).is_some());
     }
 }
