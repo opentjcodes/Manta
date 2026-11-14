@@ -49,6 +49,12 @@ inline void write_u32_le(uint8_t* p, uint32_t v) {
     p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
 }
 
+inline bool f64_less(double a, double b) {
+    if (!(a == a)) return false; // NaN sorts last
+    if (!(b == b)) return true;
+    return a < b;
+}
+
 inline uint8_t ascii_lower(uint8_t c) {
     return (c >= 'A' && c <= 'Z') ? static_cast<uint8_t>(c + 32) : c;
 }
@@ -238,7 +244,6 @@ bool match_branch(RegexCtx& ctx, size_t p_pos, size_t p_end, size_t t_pos, size_
         return true;
     }
 
-    // Anchors & zero-width boundary assertions
     if (ctx.pat[p_pos] == '^') {
         bool at_start = (t_pos == 0) || (ctx.multiline && t_pos > 0 && ctx.text[t_pos - 1] == '\n');
         return at_start ? match_branch(ctx, p_pos + 1, p_end, t_pos, out_end, depth) : false;
@@ -255,7 +260,6 @@ bool match_branch(RegexCtx& ctx, size_t p_pos, size_t p_end, size_t t_pos, size_
         return ok ? match_branch(ctx, p_pos + 2, p_end, t_pos, out_end, depth) : false;
     }
 
-    // Identify single atom span [a_start, a_end)
     size_t a_start = p_pos;
     size_t a_end = p_pos;
     if (ctx.pat[p_pos] == '(') {
@@ -296,7 +300,6 @@ bool match_branch(RegexCtx& ctx, size_t p_pos, size_t p_end, size_t t_pos, size_
         a_end = p_pos + 1;
     }
 
-    // Parse optional quantifier (*, +, ?, {m,n}) and lazy modifier (?)
     size_t min_rep = 1;
     size_t max_rep = 1;
     size_t next_p = a_end;
@@ -327,7 +330,6 @@ bool match_branch(RegexCtx& ctx, size_t p_pos, size_t p_end, size_t t_pos, size_
         return match_branch(ctx, next_p, p_end, mid_t, out_end, depth);
     }
 
-    // Collect greedy reachable positions (capped to text_len + 1)
     size_t cur_t = t_pos;
     size_t rep = 0;
     while (rep < min_rep) {
@@ -349,7 +351,6 @@ bool match_branch(RegexCtx& ctx, size_t p_pos, size_t p_end, size_t t_pos, size_
         return false;
     }
 
-    // Greedy: stack positions in a small bounded array / heap buffer
     static constexpr size_t STACK_POS_CAP = 256;
     size_t stack_pos[STACK_POS_CAP];
     size_t count = 1;
@@ -373,7 +374,6 @@ bool match_branch(RegexCtx& ctx, size_t p_pos, size_t p_end, size_t t_pos, size_
 bool match_seq(RegexCtx& ctx, size_t p_start, size_t p_end, size_t t_pos, size_t* out_end, int depth) {
     if (++ctx.steps > ctx.max_steps || depth > 64) return false;
 
-    // Split top-level alternations `a|b|c`
     int paren = 0;
     size_t seg_start = p_start;
     for (size_t i = p_start; i <= p_end; ++i) {
@@ -502,6 +502,19 @@ size_t manta_cpp_scan_html_delim(const uint8_t* data, size_t len, size_t start) 
     return len;
 }
 
+uint64_t manta_cpp_hash_bytes(const uint8_t* data, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    if (!data) return h;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= data[i];
+        h *= 0x100000001b3ULL;
+    }
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return h;
+}
+
 int64_t manta_cpp_find_substr(const uint8_t* hay, size_t hay_len,
                               const uint8_t* needle, size_t needle_len, size_t start) {
     if (needle_len == 0) {
@@ -588,6 +601,108 @@ int32_t manta_cpp_regex_match(const char* pattern, size_t pat_len,
     return 0;
 }
 
+size_t manta_cpp_base64_encode(const uint8_t* src, size_t src_len, char* dst, size_t dst_cap) {
+    if (!src || src_len == 0) return 0;
+    const size_t needed = ((src_len + 2u) / 3u) * 4u;
+    if (!dst || dst_cap < needed) return needed;
+
+    static constexpr char TBL[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    size_t o = 0;
+    while (i + 3u <= src_len) {
+        uint32_t n = (static_cast<uint32_t>(src[i]) << 16) |
+                     (static_cast<uint32_t>(src[i + 1]) << 8) |
+                     static_cast<uint32_t>(src[i + 2]);
+        dst[o++] = TBL[(n >> 18) & 0x3Fu];
+        dst[o++] = TBL[(n >> 12) & 0x3Fu];
+        dst[o++] = TBL[(n >> 6) & 0x3Fu];
+        dst[o++] = TBL[n & 0x3Fu];
+        i += 3u;
+    }
+    if (i < src_len) {
+        uint32_t b0 = src[i];
+        uint32_t b1 = (i + 1u < src_len) ? src[i + 1u] : 0u;
+        dst[o++] = TBL[(b0 >> 2) & 0x3Fu];
+        dst[o++] = TBL[((b0 & 0x03u) << 4) | ((b1 >> 4) & 0x0Fu)];
+        dst[o++] = (i + 1u < src_len) ? TBL[(b1 & 0x0Fu) << 2] : '=';
+        dst[o++] = '=';
+    }
+    return o;
+}
+
+size_t manta_cpp_base64_decode(const char* src, size_t src_len, uint8_t* dst, size_t dst_cap) {
+    if (!src || src_len == 0 || !dst || dst_cap == 0) return 0;
+    uint32_t buf = 0;
+    uint8_t bits = 0;
+    size_t out = 0;
+    for (size_t i = 0; i < src_len; ++i) {
+        uint8_t c = static_cast<uint8_t>(src[i]);
+        uint8_t val = 0xFFu;
+        if (c >= 'A' && c <= 'Z') val = c - 'A';
+        else if (c >= 'a' && c <= 'z') val = c - 'a' + 26u;
+        else if (c >= '0' && c <= '9') val = c - '0' + 52u;
+        else if (c == '+') val = 62u;
+        else if (c == '/') val = 63u;
+        else continue;
+
+        buf = (buf << 6) | val;
+        bits += 6u;
+        if (bits >= 8u) {
+            bits -= 8u;
+            if (out >= dst_cap) break;
+            dst[out++] = static_cast<uint8_t>((buf >> bits) & 0xFFu);
+        }
+    }
+    return out;
+}
+
+size_t manta_cpp_json_escape(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap) {
+    if (!src || src_len == 0) return 0;
+    static constexpr char HEX[17] = "0123456789abcdef";
+    size_t needed = 0;
+    for (size_t i = 0; i < src_len; ++i) {
+        uint8_t c = src[i];
+        switch (c) {
+            case '"':
+            case '\\':
+            case '\n':
+            case '\r':
+            case '\t':
+                needed += 2u;
+                break;
+            default:
+                needed += (c < 0x20u) ? 6u : 1u;
+                break;
+        }
+    }
+    if (!dst || dst_cap < needed) return needed;
+
+    size_t o = 0;
+    for (size_t i = 0; i < src_len; ++i) {
+        uint8_t c = src[i];
+        switch (c) {
+            case '"':  dst[o++] = '\\'; dst[o++] = '"'; break;
+            case '\\': dst[o++] = '\\'; dst[o++] = '\\'; break;
+            case '\n': dst[o++] = '\\'; dst[o++] = 'n'; break;
+            case '\r': dst[o++] = '\\'; dst[o++] = 'r'; break;
+            case '\t': dst[o++] = '\\'; dst[o++] = 't'; break;
+            default:
+                if (c < 0x20u) {
+                    dst[o++] = '\\';
+                    dst[o++] = 'u';
+                    dst[o++] = '0';
+                    dst[o++] = '0';
+                    dst[o++] = static_cast<uint8_t>(HEX[(c >> 4) & 0x0Fu]);
+                    dst[o++] = static_cast<uint8_t>(HEX[c & 0x0Fu]);
+                } else {
+                    dst[o++] = c;
+                }
+                break;
+        }
+    }
+    return o;
+}
+
 double manta_cpp_f64_sum(const double* arr, size_t len) {
     if (!arr || len == 0) return 0.0;
     double acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
@@ -605,10 +720,72 @@ double manta_cpp_f64_sum(const double* arr, size_t len) {
     return total;
 }
 
+double manta_cpp_f64_dot(const double* a, const double* b, size_t len) {
+    if (!a || !b || len == 0) return 0.0;
+    double acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    size_t i = 0;
+    for (; i + 4 <= len; i += 4) {
+        acc0 += a[i] * b[i];
+        acc1 += a[i + 1] * b[i + 1];
+        acc2 += a[i + 2] * b[i + 2];
+        acc3 += a[i + 3] * b[i + 3];
+    }
+    double total = (acc0 + acc1) + (acc2 + acc3);
+    for (; i < len; ++i) {
+        total += a[i] * b[i];
+    }
+    return total;
+}
+
 void manta_cpp_f64_scale_add(double* dst, const double* src, size_t len, double scale, double bias) {
     if (!dst || !src || len == 0) return;
     for (size_t i = 0; i < len; ++i) {
         dst[i] = src[i] * scale + bias;
+    }
+}
+
+void manta_cpp_f64_sort(double* arr, size_t len) {
+    if (!arr || len <= 1) return;
+    if (len < 16) {
+        for (size_t i = 1; i < len; ++i) {
+            double key = arr[i];
+            size_t j = i;
+            while (j > 0 && f64_less(key, arr[j - 1])) {
+                arr[j] = arr[j - 1];
+                --j;
+            }
+            arr[j] = key;
+        }
+        return;
+    }
+
+    auto sift_down = [&](size_t start, size_t end) {
+        size_t root = start;
+        while (root * 2 + 1 <= end) {
+            size_t child = root * 2 + 1;
+            size_t swap_idx = root;
+            if (f64_less(arr[swap_idx], arr[child])) {
+                swap_idx = child;
+            }
+            if (child + 1 <= end && f64_less(arr[swap_idx], arr[child + 1])) {
+                swap_idx = child + 1;
+            }
+            if (swap_idx == root) return;
+            double tmp = arr[root];
+            arr[root] = arr[swap_idx];
+            arr[swap_idx] = tmp;
+            root = swap_idx;
+        }
+    };
+
+    for (size_t start = len / 2; start > 0; --start) {
+        sift_down(start - 1, len - 1);
+    }
+    for (size_t end = len - 1; end > 0; --end) {
+        double tmp = arr[0];
+        arr[0] = arr[end];
+        arr[end] = tmp;
+        sift_down(0, end - 1);
     }
 }
 

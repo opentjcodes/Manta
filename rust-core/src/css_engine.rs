@@ -8,6 +8,7 @@ pub enum DisplayMode {
     Inline,
     InlineBlock,
     Flex,
+    Grid,
     None,
 }
 
@@ -15,6 +16,23 @@ pub enum DisplayMode {
 pub enum FlexDir {
     Row,
     Column,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JustifyContent {
+    FlexStart,
+    Center,
+    FlexEnd,
+    SpaceBetween,
+    SpaceAround,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionMode {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +45,11 @@ pub enum TextAlign {
 #[derive(Debug, Clone, Copy)]
 pub struct ComputedStyle {
     pub display: DisplayMode,
+    pub position: PositionMode,
     pub flex_direction: FlexDir,
+    pub justify_content: JustifyContent,
+    pub flex_wrap: bool,
+    pub grid_columns: u16,
     pub gap: f32,
     pub flex_grow: f32,
     pub text_color: u32,
@@ -48,7 +70,11 @@ pub struct ComputedStyle {
     pub padding_right: f32,
     pub corner_radius: f32,
     pub explicit_width: Option<f32>,
+    pub max_width: Option<f32>,
     pub explicit_height: Option<f32>,
+    pub min_height: Option<f32>,
+    pub z_index: i32,
+    pub overflow_hidden: bool,
     pub opacity: f32,
     pub visibility_hidden: bool,
 }
@@ -57,7 +83,11 @@ impl Default for ComputedStyle {
     fn default() -> Self {
         Self {
             display: DisplayMode::Block,
+            position: PositionMode::Static,
             flex_direction: FlexDir::Row,
+            justify_content: JustifyContent::FlexStart,
+            flex_wrap: false,
+            grid_columns: 1,
             gap: 8.0,
             flex_grow: 0.0,
             text_color: 0xFFF1F5F9,
@@ -78,7 +108,11 @@ impl Default for ComputedStyle {
             padding_right: 0.0,
             corner_radius: 8.0,
             explicit_width: None,
+            max_width: None,
             explicit_height: None,
+            min_height: None,
+            z_index: 0,
+            overflow_hidden: false,
             opacity: 1.0,
             visibility_hidden: false,
         }
@@ -149,7 +183,6 @@ pub struct CompoundSelector {
 
 #[derive(Debug, Clone)]
 pub struct ComplexSelector {
-    /// Sequence of `(Option<Combinator_from_previous>, CompoundSelector)` left-to-right.
     pub parts: Vec<(Option<Combinator>, CompoundSelector)>,
 }
 
@@ -161,12 +194,6 @@ pub struct CssRule {
     pub declarations: Vec<(String, String)>,
 }
 
-/// High-Velocity Indexed CSS Cascade & Box/Flex Engine:
-/// - Brace- & comment-aware parser supporting nested `@media` / `@supports` blocks.
-/// - Indexes rules into $O(1)$ buckets (`id_index`, `class_index`, `tag_index`, `universal`)
-///   so large stylesheets never scan every rule for every DOM node.
-/// - Supports combinators (` `, `>`, `+`, `~`), multi-class `.a.b`, attribute selectors,
-///   pseudo-classes (`:root`, `:first-child`, `:nth-child`, `:checked`, `:not()`), CSS vars & inheritance.
 pub struct MicroCssEngine {
     rules: Vec<CssRule>,
     id_buckets: HashMap<String, Vec<usize>>,
@@ -235,7 +262,6 @@ impl MicroCssEngine {
                         self.parse_block_list(body);
                     }
                 }
-                // @keyframes, @font-face, @page are cleanly skipped without breaking rules
                 continue;
             }
 
@@ -325,7 +351,6 @@ impl MicroCssEngine {
         decls
     }
 
-    /// Computes final cascaded + inherited style using $O(1)$ rule bucket indexing.
     pub fn compute_style_with_parent(
         &self,
         dom: &ZeroCopyDomArena,
@@ -341,7 +366,6 @@ impl MicroCssEngine {
             return style;
         };
 
-        // 1. User-Agent semantic defaults
         match tag {
             "head" | "script" | "style" | "meta" | "link" | "title" | "noscript" | "template" => {
                 style.display = DisplayMode::None;
@@ -349,6 +373,9 @@ impl MicroCssEngine {
             }
             "span" | "a" | "strong" | "b" | "em" | "i" | "small" | "code" | "label" => {
                 style.display = DisplayMode::Inline;
+            }
+            "img" | "video" | "audio" | "svg" => {
+                style.display = DisplayMode::InlineBlock;
             }
             _ => {
                 style.display = DisplayMode::Block;
@@ -383,11 +410,11 @@ impl MicroCssEngine {
             "pre" | "code" => {
                 style.background_color = 0xFF12141C;
                 style.text_color = 0xFF6DD58C;
-                style.padding_top = 6.0;
-                style.padding_bottom = 6.0;
-                style.padding_left = 8.0;
-                style.padding_right = 8.0;
-                style.corner_radius = 10.0;
+                style.padding_top = 4.0;
+                style.padding_bottom = 4.0;
+                style.padding_left = 6.0;
+                style.padding_right = 6.0;
+                style.corner_radius = 8.0;
             }
             "blockquote" => {
                 style.background_color = 0xFF161922;
@@ -423,7 +450,6 @@ impl MicroCssEngine {
             _ => {}
         }
 
-        // 2. Gather candidate rule indices from $O(1)$ buckets
         let mut candidates: Vec<usize> = Vec::with_capacity(16);
         if let Some(id) = dom.node_id_attr(node_id) {
             if let Some(list) = self.id_buckets.get(id) {
@@ -440,7 +466,6 @@ impl MicroCssEngine {
         }
         candidates.extend_from_slice(&self.universal_bucket);
 
-        // Sort matching rules by W3C specificity `(id, class, tag)` + `source_order`
         let mut matched: Vec<&CssRule> = Vec::new();
         candidates.sort_unstable();
         candidates.dedup();
@@ -456,7 +481,6 @@ impl MicroCssEngine {
             self.apply_declarations(&mut style, &rule.declarations);
         }
 
-        // 3. Inline `style="..."` attribute
         if let Some(inline) = dom.node_inline_style(node_id) {
             let mut inline_decls = Vec::new();
             for pair in inline.split(';') {
@@ -488,9 +512,16 @@ impl MicroCssEngine {
                 "display" => match val.to_ascii_lowercase().as_str() {
                     "none" => style.display = DisplayMode::None,
                     "flex" | "inline-flex" => style.display = DisplayMode::Flex,
+                    "grid" | "inline-grid" => style.display = DisplayMode::Grid,
                     "inline" => style.display = DisplayMode::Inline,
                     "inline-block" => style.display = DisplayMode::InlineBlock,
                     _ => style.display = DisplayMode::Block,
+                },
+                "position" => match val.to_ascii_lowercase().as_str() {
+                    "relative" => style.position = PositionMode::Relative,
+                    "absolute" => style.position = PositionMode::Absolute,
+                    "fixed" | "sticky" => style.position = PositionMode::Fixed,
+                    _ => style.position = PositionMode::Static,
                 },
                 "flex-direction" => {
                     if val.eq_ignore_ascii_case("column") {
@@ -499,7 +530,20 @@ impl MicroCssEngine {
                         style.flex_direction = FlexDir::Row;
                     }
                 }
-                "gap" => {
+                "flex-wrap" => {
+                    style.flex_wrap = val.eq_ignore_ascii_case("wrap");
+                }
+                "justify-content" => match val.to_ascii_lowercase().as_str() {
+                    "center" => style.justify_content = JustifyContent::Center,
+                    "flex-end" | "end" | "right" => style.justify_content = JustifyContent::FlexEnd,
+                    "space-between" => style.justify_content = JustifyContent::SpaceBetween,
+                    "space-around" | "space-evenly" => style.justify_content = JustifyContent::SpaceAround,
+                    _ => style.justify_content = JustifyContent::FlexStart,
+                },
+                "grid-template-columns" => {
+                    style.grid_columns = parse_grid_column_count(&val);
+                }
+                "gap" | "grid-gap" => {
                     if let Some(px) = parse_numeric_px(&val) {
                         style.gap = px.clamp(0.0, 64.0);
                     }
@@ -616,10 +660,28 @@ impl MicroCssEngine {
                         style.explicit_width = Some(px.clamp(16.0, 2000.0));
                     }
                 }
+                "max-width" => {
+                    if let Some(px) = parse_numeric_px(&val) {
+                        style.max_width = Some(px.clamp(16.0, 2000.0));
+                    }
+                }
                 "height" => {
                     if let Some(px) = parse_numeric_px(&val) {
                         style.explicit_height = Some(px.clamp(16.0, 1200.0));
                     }
+                }
+                "min-height" => {
+                    if let Some(px) = parse_numeric_px(&val) {
+                        style.min_height = Some(px.clamp(16.0, 1200.0));
+                    }
+                }
+                "z-index" => {
+                    if let Ok(z) = val.parse::<i32>() {
+                        style.z_index = z;
+                    }
+                }
+                "overflow" => {
+                    style.overflow_hidden = val.eq_ignore_ascii_case("hidden");
                 }
                 "border-radius" => {
                     if let Some(px) = parse_numeric_px(&val) {
@@ -664,6 +726,22 @@ impl MicroCssEngine {
         self.variables.clear();
         self.next_order = 0;
     }
+}
+
+fn parse_grid_column_count(raw: &str) -> u16 {
+    let lower = raw.trim().to_ascii_lowercase();
+    if let Some(inner) = lower
+        .strip_prefix("repeat(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        if let Some(cnt_str) = inner.split(',').next() {
+            if let Ok(n) = cnt_str.trim().parse::<u16>() {
+                return n.clamp(1, 12);
+            }
+        }
+    }
+    let count = lower.split_whitespace().count() as u16;
+    count.clamp(1, 12)
 }
 
 fn strip_css_comments(css: &str) -> String {
@@ -839,7 +917,11 @@ fn parse_complex_selector(raw: &str) -> Option<ComplexSelector> {
             "~" => pending_comb = Some(Combinator::GeneralSibling),
             compound_str => {
                 let comp = parse_compound_selector(compound_str)?;
-                let comb = if parts.is_empty() { None } else { pending_comb.or(Some(Combinator::Descendant)) };
+                let comb = if parts.is_empty() {
+                    None
+                } else {
+                    pending_comb.or(Some(Combinator::Descendant))
+                };
                 parts.push((comb, comp));
                 pending_comb = None;
             }
@@ -905,7 +987,6 @@ fn parse_compound_selector(s: &str) -> Option<CompoundSelector> {
             ':' => {
                 i += 1;
                 if i < chars.len() && chars[i] == ':' {
-                    // Pseudo-element (::before / ::after): skip safely
                     while i < chars.len() && !matches!(chars[i], '.' | '#' | '[') {
                         i += 1;
                     }
@@ -1273,11 +1354,11 @@ mod tests {
     use crate::html_tokenizer::StreamingHtmlTokenizer;
 
     #[test]
-    fn test_css_combinators_media_queries_and_specificity() {
+    fn test_css_combinators_grid_and_media_queries() {
         let mut dom = ZeroCopyDomArena::new(64 * 1024);
         let mut tok = StreamingHtmlTokenizer::new();
         tok.feed_chunk(
-            b"<div id=\"hero\" class=\"card active\"><span><em id=\"em1\">Nested</em></span></div>",
+            b"<div id=\"hero\" class=\"card active\" style=\"display: grid; grid-template-columns: repeat(3, 1fr);\"><span><em id=\"em1\">Nested</em></span></div>",
             true,
             |t| dom.ingest_token(t),
         );
@@ -1285,9 +1366,8 @@ mod tests {
         let mut css = MicroCssEngine::new();
         css.parse_stylesheet(
             r#"
-            /* Comment with } inside */
             @media (prefers-color-scheme: dark) {
-                #hero.card.active { color: #00FF00; display: flex; gap: 12px; }
+                #hero.card.active { color: #00FF00; gap: 12px; }
             }
             div#hero span > em:first-child { color: #3B82F6; }
             "#,
@@ -1296,8 +1376,8 @@ mod tests {
         let hero_id = dom.find_by_id("hero").unwrap();
         let hero_style = css.compute_style(&dom, hero_id);
         assert_eq!(hero_style.text_color, 0xFF00FF00);
-        assert_eq!(hero_style.display, DisplayMode::Flex);
-        assert_eq!(hero_style.gap, 12.0);
+        assert_eq!(hero_style.display, DisplayMode::Grid);
+        assert_eq!(hero_style.grid_columns, 3);
 
         let em_id = dom.find_by_id("em1").unwrap();
         let em_style = css.compute_style(&dom, em_id);

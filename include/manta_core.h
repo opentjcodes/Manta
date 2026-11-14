@@ -9,16 +9,9 @@ extern "C" {
 #endif
 
 /**
- * Manta Core v3.0 — Default Base Flavour Universal Bolt-On C-ABI Header
- * High-velocity Rust + C++20/17 SIMD Browser Engine with:
- * - 3-Tier Non-Destructive Active Tabs (3x-8x lower RAM, zero tab killing)
- * - Encrypted Append-Only WAL Storage (MANTADB4 + ChaCha20/HMAC-SHA256)
- * - Zero Permanent HTTP/Media Disk Caching
- * - Low-Latency HLS/DASH/Range Streaming over Lock-Free C++ SPSC Ring Buffers
- * - Full CSS Flexbox/Combinator Engine & Lexical JS Bytecode VM
+ * Manta Core v3.0 — Universal Bolt-On C-ABI Header
  */
 
-/* Optional Pluggable Host Network/TLS Transport Callback */
 typedef int32_t (*MantaNetFetchCallback)(
     const char* method,
     const char* url,
@@ -32,7 +25,7 @@ uint32_t manta_abi_init_engine(const char* storage_path, const char* download_di
 uint32_t manta_abi_get_worker_cores(void);
 void     manta_abi_register_net_transport(MantaNetFetchCallback callback);
 
-/* Non-Destructive Hot-Active Tab Multiplexing (Tabs never killed while open) */
+/* Non-Destructive Hot-Active Tab Multiplexing */
 uint32_t manta_abi_create_tab(void);
 bool     manta_abi_switch_tab(uint32_t tab_id);
 bool     manta_abi_close_tab(uint32_t tab_id);
@@ -43,7 +36,8 @@ char*    manta_abi_get_memory_stats_json(void);
 /* High-Velocity Kernel Script & Web Compatibility Compiler */
 char*    manta_abi_compile_kernel_script(const char* origin_url);
 
-/* Streaming HTML/CSS/JS & Viewport-Culled DisplayList Frame Output */
+/* Full End-to-End Page Navigation (HTML + External CSS/JS via Keep-Alive) & Chunk Streaming */
+char*    manta_abi_navigate_url(uint32_t tab_id, const char* url);
 char*    manta_abi_stream_html_chunk(uint32_t tab_id, const char* url, const char* html_chunk, bool is_eof);
 char*    manta_abi_render_viewport_frame(uint32_t tab_id, float viewport_w, float scroll_y, float viewport_h);
 
@@ -77,7 +71,7 @@ bool     manta_abi_media_seek_ms(uint32_t stream_id, uint64_t target_ms);
 char*    manta_abi_media_get_stats_json(uint32_t stream_id);
 bool     manta_abi_media_close_stream(uint32_t stream_id);
 
-/* Encrypted WAL MantaDB4, IndexedDB, Cookies, Virtual File System (OPFS) & Zero-Trace Mode */
+/* Encrypted WAL Storage, Tab Sessions, Offline Page Snapshots & Zero-Trace Mode */
 bool     manta_abi_set_ephemeral_mode(bool enabled);
 bool     manta_abi_set_vault_passphrase(const char* passphrase);
 bool     manta_abi_storage_set(const char* origin_url, const char* key, const char* value, bool is_session);
@@ -89,6 +83,9 @@ bool     manta_abi_idb_put(const char* origin_url, const char* store_name, const
 char*    manta_abi_idb_get(const char* origin_url, const char* store_name, const char* key);
 bool     manta_abi_idb_delete(const char* origin_url, const char* store_name, const char* key);
 bool     manta_abi_vfs_save_file(const char* origin_url, const char* virtual_path, const char* mime_type, const uint8_t* data_ptr, uint32_t data_len);
+bool     manta_abi_save_page_offline(const char* url, const char* html_text);
+char*    manta_abi_load_page_offline(const char* url);
+char*    manta_abi_list_saved_tabs_json(void);
 char*    manta_abi_inspect_storage_manifest_json(void);
 bool     manta_abi_clear_origin_data(const char* origin_url);
 bool     manta_abi_shred_all_storage_and_ram(void);

@@ -1,9 +1,11 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
+use crate::module_bus::ModuleBus;
 use crate::page_compiler::PageRuntimeCompiler;
-use crate::site_isolation::IsolationVerdict;
+use crate::site_isolation::{IsolationVerdict, SiteIsolationModule};
 use crate::tab_compressor::TabCompressor;
+use crate::tab_manager::TabManager;
 use crate::MantaEngine;
 
 #[repr(transparent)]
@@ -114,6 +116,60 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCrea
 }
 
 #[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeNavigateUrl(
+    env: JNIEnv,
+    _class: JClass,
+    tab_id: JInt,
+    j_url: JString,
+) -> JString {
+    let raw_url = unsafe { env.get_rust_string(j_url) };
+    let (resolved_url, cookie_hdr, max_bytes) = {
+        let Ok(engine) = MantaEngine::global().lock() else {
+            return unsafe { env.new_java_string("MANTA_ERR|Engine Lock Poisoned") };
+        };
+        let resolved = engine.controls.settings.resolve_omnibox_input(&raw_url);
+        let cookies = engine.storage.get_cookie_header_for_url(&resolved, true);
+        (resolved, cookies, engine.config.per_tab_ram_ceiling_bytes)
+    };
+
+    let mut standalone_modules = ModuleBus::new();
+    standalone_modules.register(Box::new(SiteIsolationModule::new()));
+
+    let bundle = match TabManager::fetch_page_bundle(
+        &resolved_url,
+        &cookie_hdr,
+        &standalone_modules,
+        max_bytes,
+    ) {
+        Ok(b) => b,
+        Err(e) => return unsafe { env.new_java_string(&format!("MANTA_ERR|{}", e)) },
+    };
+
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("MANTA_ERR|Engine Lock Poisoned") };
+    };
+    let engine_ref = &mut *engine;
+    let final_url = bundle.final_url.clone();
+    match engine_ref.tabs.apply_fetched_page_bundle(
+        tab_id as u32,
+        bundle,
+        &mut engine_ref.modules,
+        &mut engine_ref.vault,
+        &mut engine_ref.storage,
+        &mut engine_ref.downloads,
+    ) {
+        Ok(frame) => {
+            engine_ref
+                .controls
+                .ensure_tab_state(tab_id as u32)
+                .record_navigation(&final_url, &frame.page_title);
+            unsafe { env.new_java_string(&frame.to_compact_wire_string()) }
+        }
+        Err(e) => unsafe { env.new_java_string(&format!("MANTA_ERR|{}", e)) },
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeCompressTabState(
     env: JNIEnv,
     _class: JClass,
@@ -136,6 +192,9 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeComp
         tab.is_hibernated = false;
     }
     engine.storage.record_history_visit(&url, &title);
+    engine
+        .storage
+        .save_tab_session_state(tab_id as u32, &url, &title, scroll_y);
     TabCompressor::store_tab_snapshot(&mut engine.vault, tab_id as u32, &url, &title, scroll_y)
         as JInt
 }
@@ -164,6 +223,51 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeRest
             }
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeListSavedTabsJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("[]") };
+    };
+    let json = engine.storage.export_saved_tabs_json();
+    unsafe { env.new_java_string(&json) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeSavePageOffline(
+    env: JNIEnv,
+    _class: JClass,
+    j_url: JString,
+    j_html: JString,
+) -> JBoolean {
+    let url = unsafe { env.get_rust_string(j_url) };
+    let html = unsafe { env.get_rust_string(j_html) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    u8::from(engine.storage.save_offline_page_snapshot(&url, html.as_bytes()))
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeLoadPageOffline(
+    env: JNIEnv,
+    _class: JClass,
+    j_url: JString,
+) -> JString {
+    let url = unsafe { env.get_rust_string(j_url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    let html = engine
+        .storage
+        .load_offline_page_snapshot(&url)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    unsafe { env.new_java_string(&html) }
 }
 
 #[no_mangle]
@@ -610,6 +714,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeClos
             .tabs
             .close_tab(tab_id as u32, &mut engine_ref.vault);
         engine_ref.controls.remove_tab(tab_id as u32);
+        engine_ref.storage.remove_tab_session_state(tab_id as u32);
         engine_ref.modules.dispatch_tab_closed(tab_id as u32);
     }
 }

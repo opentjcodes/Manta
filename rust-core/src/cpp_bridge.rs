@@ -15,6 +15,7 @@ extern "C" {
     fn manta_cpp_arena_release_pages(ptr: *mut u8, offset: usize, len: usize);
     fn manta_cpp_arena_free(ptr: *mut u8, bytes: usize);
     fn manta_cpp_scan_html_delim(data: *const u8, len: usize, start: usize) -> usize;
+    fn manta_cpp_hash_bytes(data: *const u8, len: usize) -> u64;
     fn manta_cpp_find_substr(
         hay: *const u8,
         hay_len: usize,
@@ -33,7 +34,26 @@ extern "C" {
         out_match_start: *mut usize,
         out_match_end: *mut usize,
     ) -> i32;
+    fn manta_cpp_base64_encode(
+        src: *const u8,
+        src_len: usize,
+        dst: *mut c_char,
+        dst_cap: usize,
+    ) -> usize;
+    fn manta_cpp_base64_decode(
+        src: *const c_char,
+        src_len: usize,
+        dst: *mut u8,
+        dst_cap: usize,
+    ) -> usize;
+    fn manta_cpp_json_escape(
+        src: *const u8,
+        src_len: usize,
+        dst: *mut u8,
+        dst_cap: usize,
+    ) -> usize;
     fn manta_cpp_f64_sum(arr: *const f64, len: usize) -> f64;
+    fn manta_cpp_f64_dot(a: *const f64, b: *const f64, len: usize) -> f64;
     fn manta_cpp_f64_scale_add(
         dst: *mut f64,
         src: *const f64,
@@ -41,6 +61,7 @@ extern "C" {
         scale: f64,
         bias: f64,
     );
+    fn manta_cpp_f64_sort(arr: *mut f64, len: usize);
     fn manta_cpp_fast_compress(
         src: *const u8,
         src_len: usize,
@@ -105,7 +126,11 @@ pub fn scan_html_delim(bytes: &[u8], start: usize) -> usize {
     unsafe { manta_cpp_scan_html_delim(bytes.as_ptr(), bytes.len(), start) }
 }
 
-/// SIMD-accelerated substring search for JS `String.prototype.indexOf` / `includes`.
+#[inline]
+pub fn hash_bytes(bytes: &[u8]) -> u64 {
+    unsafe { manta_cpp_hash_bytes(bytes.as_ptr(), bytes.len()) }
+}
+
 #[inline]
 pub fn find_substr(hay: &str, needle: &str, start: usize) -> Option<usize> {
     let hb = hay.as_bytes();
@@ -121,7 +146,6 @@ pub fn find_substr(hay: &str, needle: &str, start: usize) -> Option<usize> {
     }
 }
 
-/// Bounded ReDoS-safe C++ RegExp matcher returning byte offsets `(start, end)`.
 pub fn regex_find(pattern: &str, flags: &str, text: &str, start_byte: usize) -> Option<(usize, usize)> {
     let mut m_start: usize = 0;
     let mut m_end: usize = 0;
@@ -145,7 +169,54 @@ pub fn regex_find(pattern: &str, flags: &str, text: &str, start_byte: usize) -> 
     }
 }
 
-/// Fast C++ 4-way unrolled summation for JS numeric arrays & `Float64Array`.
+pub fn base64_encode(input: &[u8]) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let cap = ((input.len() + 2) / 3) * 4;
+    let mut out = vec![0u8; cap];
+    let written = unsafe {
+        manta_cpp_base64_encode(
+            input.as_ptr(),
+            input.len(),
+            out.as_mut_ptr() as *mut c_char,
+            cap,
+        )
+    };
+    out.truncate(written);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+pub fn base64_decode(input: &str) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let cap = (input.len() * 3) / 4 + 4;
+    let mut out = vec![0u8; cap];
+    let written = unsafe {
+        manta_cpp_base64_decode(
+            input.as_ptr() as *const c_char,
+            input.len(),
+            out.as_mut_ptr(),
+            cap,
+        )
+    };
+    out.truncate(written);
+    out
+}
+
+pub fn json_escape_str(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let bytes = input.as_bytes();
+    let cap = bytes.len() * 6 + 4;
+    let mut dst = vec![0u8; cap];
+    let written = unsafe { manta_cpp_json_escape(bytes.as_ptr(), bytes.len(), dst.as_mut_ptr(), cap) };
+    dst.truncate(written);
+    String::from_utf8(dst).unwrap_or_default()
+}
+
 #[inline]
 pub fn fast_f64_sum(arr: &[f64]) -> f64 {
     if arr.is_empty() {
@@ -155,10 +226,26 @@ pub fn fast_f64_sum(arr: &[f64]) -> f64 {
 }
 
 #[inline]
+pub fn fast_f64_dot(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    unsafe { manta_cpp_f64_dot(a.as_ptr(), b.as_ptr(), n) }
+}
+
+#[inline]
 pub fn fast_f64_scale_add(dst: &mut [f64], src: &[f64], scale: f64, bias: f64) {
     let n = dst.len().min(src.len());
     if n > 0 {
         unsafe { manta_cpp_f64_scale_add(dst.as_mut_ptr(), src.as_ptr(), n, scale, bias) }
+    }
+}
+
+#[inline]
+pub fn fast_f64_sort(arr: &mut [f64]) {
+    if arr.len() > 1 {
+        unsafe { manta_cpp_f64_sort(arr.as_mut_ptr(), arr.len()) }
     }
 }
 
@@ -453,7 +540,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cpp_simd_substr_regex_and_numeric_accel() {
+    fn test_cpp_simd_substr_regex_sort_base64_and_json_escape() {
         let html = b"Hello world this is plain text with <div>tags</div> &amp; entities";
         assert_eq!(scan_html_delim(html, 0), 36);
         assert_eq!(
@@ -466,5 +553,16 @@ mod tests {
         );
         let nums = [1.5, 2.5, 3.0, 4.0, 5.0];
         assert!((fast_f64_sum(&nums) - 16.0).abs() < 1e-9);
+        assert!((fast_f64_dot(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]) - 32.0).abs() < 1e-9);
+
+        let mut unsorted = [9.0, -3.0, 42.0, 1.5, 0.0, 12.0, 7.0, 3.0, 8.0, 2.0, 5.0, 11.0, 6.0, 4.0, 10.0, -1.0, 20.0];
+        fast_f64_sort(&mut unsorted);
+        assert_eq!(unsorted[0], -3.0);
+        assert_eq!(unsorted[unsorted.len() - 1], 42.0);
+
+        let enc = base64_encode(b"Manta Core");
+        assert_eq!(enc, "TWFudGEgQ29yZQ==");
+        assert_eq!(&base64_decode(&enc), b"Manta Core");
+        assert_eq!(json_escape_str("hi \"manta\"\n"), "hi \\\"manta\\\"\\n");
     }
 }

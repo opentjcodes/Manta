@@ -5,9 +5,11 @@ use crate::css_engine::MicroCssEngine;
 use crate::dom_arena::{NodeId, ZeroCopyDomArena};
 use crate::downloads_engine::MantaDownloadManager;
 use crate::html_tokenizer::StreamingHtmlTokenizer;
-use crate::input_forms::SerializedFormSubmission;
+use crate::input_forms::{FormControlKind, SerializedFormSubmission};
 use crate::js_vm::MantaJsSandbox;
+use crate::media_stream::resolve_relative_url;
 use crate::module_bus::ModuleBus;
+use crate::net_stream::StreamingNetworkPipe;
 use crate::ram_vault::VolatileRamVault;
 use crate::render_list::DisplayListFrame;
 use crate::site_isolation::OriginKey;
@@ -16,9 +18,6 @@ use crate::tab_compressor::TabCompressor;
 
 pub type TabId = u32;
 
-/// 3-Tier Non-Destructive Active Tab Lifecycle:
-/// Open tabs are **NEVER killed or deleted**; background tabs automatically trim GPU DisplayLists
-/// and compress cold state snapshots via C++ SIMD LZ+RLE to cut device RAM by 3x–8x.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabLifecycleState {
     ActiveForeground,
@@ -26,7 +25,15 @@ pub enum TabLifecycleState {
     ActiveBackgroundCompacted,
 }
 
-/// Isolated per-tab sandbox bound to a canonical `OriginKey`.
+/// Complete fetched page + external subresources bundle fetched off-lock over Keep-Alive.
+pub struct FetchedPageBundle {
+    pub final_url: String,
+    pub html_bytes: Vec<u8>,
+    pub external_styles: Vec<String>,
+    pub external_scripts: Vec<String>,
+    pub set_cookies: Vec<String>,
+}
+
 pub struct TabSandbox {
     pub id: TabId,
     pub current_url: String,
@@ -73,7 +80,6 @@ impl TabSandbox {
         self.cached_frame_gen = 0;
     }
 
-    /// Reclaims transient render & OS slab pages on background compaction without destroying live DOM/inputs.
     pub fn compact_background_memory(&mut self, vault: &mut VolatileRamVault) {
         self.state = TabLifecycleState::ActiveBackgroundCompacted;
         self.is_hibernated = false;
@@ -101,11 +107,6 @@ impl TabSandbox {
     }
 }
 
-/// **3-Tier Non-Destructive Hot-Active Tab Multiplexer (`TabManager`)**:
-/// - Keeps all open tabs active and instantaneously restorable (never killed while open!).
-/// - Keeps foreground + top 3 warm background tabs ready, while compacting older background tabs
-///   with C++ LZ+RLE + OS `madvise(MADV_DONTNEED)` and evicting offscreen GPU DisplayLists.
-/// - Caches culled `DisplayListFrame`s with dirty generation tracking to cut CPU/GPU recomputations.
 pub struct TabManager {
     tabs: HashMap<TabId, TabSandbox>,
     active_tab_id: Option<TabId>,
@@ -165,7 +166,6 @@ impl TabManager {
         id
     }
 
-    /// Switches to `target_id` and enforces the 3-tier memory policy on older background tabs.
     pub fn switch_to_tab(&mut self, target_id: TabId, vault: &mut VolatileRamVault) -> bool {
         if !self.tabs.contains_key(&target_id) {
             return false;
@@ -203,7 +203,6 @@ impl TabManager {
             return;
         }
 
-        // Most recently accessed first
         bg_tabs.sort_by(|a, b| b.1.cmp(&a.1));
         for (idx, (tid, _)) in bg_tabs.into_iter().enumerate() {
             if idx >= self.warm_background_limit {
@@ -214,6 +213,120 @@ impl TabManager {
                 }
             }
         }
+    }
+
+    /// Standalone lock-free HTTP/HTTPS page + external CSS/JS subresource fetcher using Keep-Alive.
+    pub fn fetch_page_bundle(
+        url: &str,
+        cookie_header: &str,
+        modules: &ModuleBus,
+        max_page_bytes: usize,
+    ) -> Result<FetchedPageBundle, String> {
+        let mut req_headers = HashMap::new();
+        if !cookie_header.is_empty() {
+            req_headers.insert("Cookie".to_string(), cookie_header.to_string());
+        }
+        let mut html_bytes = Vec::with_capacity(16384);
+        let outcome = StreamingNetworkPipe::stream_http(
+            "GET",
+            url,
+            req_headers,
+            modules,
+            max_page_bytes,
+            |chunk, _| html_bytes.extend_from_slice(chunk),
+        )?;
+
+        let mut set_cookies = Vec::new();
+        for (k, v) in &outcome.headers {
+            if k.eq_ignore_ascii_case("Set-Cookie") {
+                set_cookies.push(v.clone());
+            }
+        }
+
+        // Pre-scan HTML for external <link rel="stylesheet"> and <script src="..."> URLs
+        let mut temp_tok = StreamingHtmlTokenizer::new();
+        let mut temp_dom = ZeroCopyDomArena::new(max_page_bytes);
+        temp_tok.feed_chunk(&html_bytes, true, |t| temp_dom.ingest_token(t));
+
+        let base = temp_dom
+            .base_href
+            .as_deref()
+            .unwrap_or(&outcome.final_url);
+
+        let mut external_styles = Vec::new();
+        for css_href in temp_dom.external_stylesheets.iter().take(6) {
+            let resolved = resolve_relative_url(base, css_href);
+            let mut css_buf = Vec::new();
+            let mut sub_hdrs = HashMap::new();
+            sub_hdrs.insert("Origin".to_string(), outcome.final_url.clone());
+            if StreamingNetworkPipe::stream_http(
+                "GET",
+                &resolved,
+                sub_hdrs,
+                modules,
+                1024 * 1024,
+                |c, _| css_buf.extend_from_slice(c),
+            )
+            .is_ok()
+            {
+                external_styles.push(String::from_utf8_lossy(&css_buf).into_owned());
+            }
+        }
+
+        let mut external_scripts = Vec::new();
+        for js_src in temp_dom.external_scripts.iter().take(8) {
+            let resolved = resolve_relative_url(base, js_src);
+            let mut js_buf = Vec::new();
+            let mut sub_hdrs = HashMap::new();
+            sub_hdrs.insert("Origin".to_string(), outcome.final_url.clone());
+            if StreamingNetworkPipe::stream_http(
+                "GET",
+                &resolved,
+                sub_hdrs,
+                modules,
+                1024 * 1024,
+                |c, _| js_buf.extend_from_slice(c),
+            )
+            .is_ok()
+            {
+                external_scripts.push(String::from_utf8_lossy(&js_buf).into_owned());
+            }
+        }
+
+        Ok(FetchedPageBundle {
+            final_url: outcome.final_url,
+            html_bytes,
+            external_styles,
+            external_scripts,
+            set_cookies,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_fetched_page_bundle(
+        &mut self,
+        tab_id: TabId,
+        bundle: FetchedPageBundle,
+        modules: &mut ModuleBus,
+        vault: &mut VolatileRamVault,
+        storage: &mut MantaStorageEngine,
+        downloads: &mut MantaDownloadManager,
+    ) -> Result<DisplayListFrame, &'static str> {
+        for cookie_hdr in &bundle.set_cookies {
+            storage.set_cookie_from_header(&bundle.final_url, cookie_hdr);
+        }
+        self.load_stream_chunk_with_externals(
+            tab_id,
+            &bundle.final_url,
+            &bundle.html_bytes,
+            true,
+            &bundle.external_styles,
+            &bundle.external_scripts,
+            modules,
+            vault,
+            storage,
+            downloads,
+        )
     }
 
     pub fn focus_node(&mut self, tab_id: TabId, node_id: NodeId) -> bool {
@@ -359,7 +472,8 @@ impl TabManager {
             }
         }
 
-        let frame = DisplayListFrame::build_culled(&tab.dom, &tab.css, viewport_w, scroll_y, viewport_h);
+        let frame =
+            DisplayListFrame::build_culled(&tab.dom, &tab.css, viewport_w, scroll_y, viewport_h);
         tab.cached_frame = Some(frame.clone());
         tab.cached_frame_gen = tab.dom.generation;
         tab.cached_frame_scroll = scroll_i;
@@ -423,6 +537,34 @@ impl TabManager {
         storage: &mut MantaStorageEngine,
         downloads: &mut MantaDownloadManager,
     ) -> Result<DisplayListFrame, &'static str> {
+        self.load_stream_chunk_with_externals(
+            tab_id,
+            url,
+            chunk,
+            is_eof,
+            &[],
+            &[],
+            modules,
+            vault,
+            storage,
+            downloads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_stream_chunk_with_externals(
+        &mut self,
+        tab_id: TabId,
+        url: &str,
+        chunk: &[u8],
+        is_eof: bool,
+        external_styles: &[String],
+        external_scripts: &[String],
+        modules: &mut ModuleBus,
+        vault: &mut VolatileRamVault,
+        storage: &mut MantaStorageEngine,
+        downloads: &mut MantaDownloadManager,
+    ) -> Result<DisplayListFrame, &'static str> {
         self.monotonic_tick += 1;
         let tick = self.monotonic_tick;
         let tab = self.tabs.get_mut(&tab_id).ok_or("Invalid TabId")?;
@@ -454,15 +596,62 @@ impl TabManager {
 
         if is_eof {
             storage.record_history_visit(url, &tab.dom.page_title);
+            storage.save_tab_session_state(tab_id, url, &tab.dom.page_title, tab.scroll_y);
 
+            // Auto-hydrate saved non-sensitive form drafts into native DOM inputs!
+            let total_nodes = tab.dom.nodes().len() as u32;
+            for nid in 0..total_nodes {
+                let draft_info = tab.dom.forms.get_control(nid).and_then(|ctrl| {
+                    let is_safe = match &ctrl.kind {
+                        FormControlKind::TextInput { input_type } => {
+                            input_type != "password" && input_type != "hidden"
+                        }
+                        FormControlKind::TextArea => true,
+                        _ => false,
+                    };
+                    if !is_safe || !ctrl.value.is_empty() {
+                        return None;
+                    }
+                    let key = if !ctrl.name.is_empty() {
+                        ctrl.name.clone()
+                    } else if let Some(id_attr) = tab.dom.node_id_attr(nid) {
+                        id_attr.to_string()
+                    } else {
+                        return None;
+                    };
+                    storage.get_form_draft(url, &key)
+                });
+                if let Some(saved_val) = draft_info {
+                    let _ = tab.dom.forms.set_value(nid, &saved_val);
+                }
+            }
+
+            // Parse external stylesheets first, then inline <style> blocks
+            for ext_css in external_styles {
+                tab.css.parse_stylesheet(ext_css);
+            }
             let styles = std::mem::take(&mut tab.dom.collected_styles);
             for stylesheet in &styles {
                 tab.css.parse_stylesheet(stylesheet);
             }
             drop(styles);
 
-            let scripts = std::mem::take(&mut tab.dom.collected_scripts);
+            // Execute external scripts, then inline <script> blocks
             let mut temp_clipboard = ClipboardSandbox::new(64 * 1024);
+            for ext_js in external_scripts {
+                let mut script = ext_js.clone();
+                if modules.dispatch_before_script(url, &mut script) {
+                    let _ = tab.js_vm.execute_script_full(
+                        &script,
+                        url,
+                        &mut tab.dom,
+                        &mut temp_clipboard,
+                        storage,
+                        downloads,
+                    );
+                }
+            }
+            let scripts = std::mem::take(&mut tab.dom.collected_scripts);
             for mut script in scripts {
                 if modules.dispatch_before_script(url, &mut script) {
                     let _ = tab.js_vm.execute_script_full(
@@ -476,7 +665,6 @@ impl TabManager {
                 }
             }
 
-            // Reclaim raw CSS/JS sources & unused OS slab pages immediately!
             tab.dom.release_transient_sources_and_compact();
             modules.dispatch_dom_ready(tab_id, url);
         }

@@ -7,6 +7,7 @@ use crate::module_bus::ModuleBus;
 use crate::net_stream::{register_host_net_transport, MantaNetFetchCallback};
 use crate::page_compiler::PageRuntimeCompiler;
 use crate::site_isolation::SiteIsolationModule;
+use crate::tab_manager::TabManager;
 use crate::MantaEngine;
 
 unsafe fn cstr_to_rust(ptr: *const c_char) -> String {
@@ -77,6 +78,7 @@ pub extern "C" fn manta_abi_close_tab(tab_id: u32) -> bool {
     let engine_ref = &mut *engine;
     let closed = engine_ref.tabs.close_tab(tab_id, &mut engine_ref.vault);
     engine_ref.controls.remove_tab(tab_id);
+    engine_ref.storage.remove_tab_session_state(tab_id);
     engine_ref.modules.dispatch_tab_closed(tab_id);
     closed
 }
@@ -117,6 +119,60 @@ pub unsafe extern "C" fn manta_abi_compile_kernel_script(origin_url: *const c_ch
         &engine.controls.settings,
     );
     rust_to_cstr(&script)
+}
+
+/// Lock-free end-to-end site navigation: fetches HTML + external CSS/JS over Keep-Alive
+/// outside `MantaEngine::global().lock()`, then renders & returns the `DisplayListFrame`.
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_navigate_url(
+    tab_id: u32,
+    url: *const c_char,
+) -> *mut c_char {
+    let raw_url = unsafe { cstr_to_rust(url) };
+    let (resolved_url, cookie_hdr, max_bytes) = {
+        let Ok(engine) = MantaEngine::global().lock() else {
+            return rust_to_cstr("MANTA_ERR|Engine Lock Poisoned");
+        };
+        let resolved = engine.controls.settings.resolve_omnibox_input(&raw_url);
+        let cookies = engine.storage.get_cookie_header_for_url(&resolved, true);
+        (resolved, cookies, engine.config.per_tab_ram_ceiling_bytes)
+    };
+
+    let mut standalone_modules = ModuleBus::new();
+    standalone_modules.register(Box::new(SiteIsolationModule::new()));
+
+    let bundle = match TabManager::fetch_page_bundle(
+        &resolved_url,
+        &cookie_hdr,
+        &standalone_modules,
+        max_bytes,
+    ) {
+        Ok(b) => b,
+        Err(e) => return rust_to_cstr(&format!("MANTA_ERR|{}", e)),
+    };
+
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("MANTA_ERR|Engine Lock Poisoned");
+    };
+    let engine_ref = &mut *engine;
+    let final_url = bundle.final_url.clone();
+    match engine_ref.tabs.apply_fetched_page_bundle(
+        tab_id,
+        bundle,
+        &mut engine_ref.modules,
+        &mut engine_ref.vault,
+        &mut engine_ref.storage,
+        &mut engine_ref.downloads,
+    ) {
+        Ok(frame) => {
+            engine_ref
+                .controls
+                .ensure_tab_state(tab_id)
+                .record_navigation(&final_url, &frame.page_title);
+            rust_to_cstr(&frame.to_compact_wire_string())
+        }
+        Err(e) => rust_to_cstr(&format!("MANTA_ERR|{}", e)),
+    }
 }
 
 #[no_mangle]
@@ -698,6 +754,43 @@ pub unsafe extern "C" fn manta_abi_vfs_save_file(
         return false;
     };
     engine.storage.save_vfs_file(&orig, &vpath, &mime, slice)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_save_page_offline(
+    url: *const c_char,
+    html_text: *const c_char,
+) -> bool {
+    let u = unsafe { cstr_to_rust(url) };
+    let h = unsafe { cstr_to_rust(html_text) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    engine
+        .storage
+        .save_offline_page_snapshot(&u, h.as_bytes())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_load_page_offline(url: *const c_char) -> *mut c_char {
+    let u = unsafe { cstr_to_rust(url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
+    };
+    let html = engine
+        .storage
+        .load_offline_page_snapshot(&u)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    rust_to_cstr(&html)
+}
+
+#[no_mangle]
+pub extern "C" fn manta_abi_list_saved_tabs_json() -> *mut c_char {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("[]");
+    };
+    rust_to_cstr(&engine.storage.export_saved_tabs_json())
 }
 
 #[no_mangle]

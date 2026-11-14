@@ -1,8 +1,9 @@
-use crate::css_engine::{ComputedStyle, DisplayMode, FlexDir, MicroCssEngine};
+use crate::css_engine::{
+    ComputedStyle, DisplayMode, FlexDir, JustifyContent, MicroCssEngine, TextAlign,
+};
 use crate::dom_arena::{NodeId, NodeKind, ZeroCopyDomArena, NO_NODE};
 use crate::input_forms::FormControlKind;
 
-/// Hardware-friendly draw command emitted by Manta's layout pass.
 #[derive(Debug, Clone)]
 pub enum PaintCommand {
     FillRect {
@@ -32,9 +33,18 @@ pub enum PaintCommand {
         is_focused: bool,
         is_checked: bool,
     },
+    DrawMediaBox {
+        node_id: NodeId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        label: String,
+        media_src: String,
+        is_video: bool,
+    },
 }
 
-/// Complete frame output for a tab, with viewport culling to slash GPU draw calls on long pages.
 #[derive(Debug, Clone)]
 pub struct DisplayListFrame {
     pub page_title: String,
@@ -173,6 +183,28 @@ impl DisplayListFrame {
                         display_text.replace('\n', " ").replace('|', " ")
                     ));
                 }
+                PaintCommand::DrawMediaBox {
+                    node_id,
+                    x,
+                    y,
+                    width,
+                    height,
+                    label,
+                    media_src,
+                    is_video,
+                } => {
+                    out.push_str(&format!(
+                        "MEDIA|{}|{:.1}|{:.1}|{:.1}|{:.1}|{}|{}|{}\n",
+                        node_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                        u8::from(*is_video),
+                        media_src.replace('|', ""),
+                        label.replace('\n', " ").replace('|', " ")
+                    ));
+                }
             }
         }
         out
@@ -182,6 +214,142 @@ impl DisplayListFrame {
 #[inline]
 fn is_visible_band(y: f32, h: f32, cull_min_y: f32, cull_max_y: f32) -> bool {
     y + h >= cull_min_y && y <= cull_max_y
+}
+
+struct InlineSegment {
+    text: String,
+    color_argb: u32,
+    font_size_sp: f32,
+    bold: bool,
+    line_height_mult: f32,
+    link_href: Option<String>,
+}
+
+fn collect_inline_segments(
+    node_id: NodeId,
+    dom: &ZeroCopyDomArena,
+    css: &MicroCssEngine,
+    parent_style: &ComputedStyle,
+    inherited_link: Option<String>,
+    out: &mut Vec<InlineSegment>,
+) {
+    let Some(node) = dom.nodes().get(node_id as usize) else {
+        return;
+    };
+    if let Some(text) = dom.node_text(node_id) {
+        if !text.is_empty() {
+            out.push(InlineSegment {
+                text: text.to_string(),
+                color_argb: parent_style.text_color,
+                font_size_sp: parent_style.font_size_sp,
+                bold: parent_style.font_weight_bold,
+                line_height_mult: parent_style.line_height_mult,
+                link_href: inherited_link,
+            });
+        }
+        return;
+    }
+    let style = css.compute_style_with_parent(dom, node_id, Some(parent_style));
+    if style.display == DisplayMode::None || style.opacity <= 0.0 {
+        return;
+    }
+    let mut link = inherited_link;
+    if dom.node_tag(node_id) == Some("a") {
+        if let Some(href) = dom.get_attribute(node_id, "href") {
+            link = Some(href);
+        }
+    }
+    let mut child = node.first_child;
+    while child != NO_NODE {
+        collect_inline_segments(child, dom, css, &style, link.clone(), out);
+        child = dom.nodes()[child as usize].next_sibling;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_inline_segments(
+    segments: Vec<InlineSegment>,
+    base_x: f32,
+    avail_width: f32,
+    text_align: TextAlign,
+    cursor_y: &mut f32,
+    visibility_hidden: bool,
+    cull_min_y: f32,
+    cull_max_y: f32,
+    commands: &mut Vec<PaintCommand>,
+) {
+    if segments.is_empty() {
+        return;
+    }
+    let mut line_x = base_x;
+    let mut max_line_h = 0.0f32;
+
+    for seg in segments {
+        let char_w = seg.font_size_sp * 0.54;
+        let line_h = seg.font_size_sp * seg.line_height_mult + 2.0;
+        if line_h > max_line_h {
+            max_line_h = line_h;
+        }
+        let words: Vec<&str> = seg.text.split_whitespace().collect();
+        let mut current_chunk = String::new();
+        let chunk_start_x = line_x;
+
+        for (w_idx, word) in words.iter().enumerate() {
+            let word_w = (word.chars().count() as f32 + 1.0) * char_w;
+            if line_x > base_x && line_x + word_w > base_x + avail_width {
+                if !current_chunk.is_empty() && !visibility_hidden {
+                    if is_visible_band(*cursor_y, max_line_h, cull_min_y, cull_max_y) {
+                        commands.push(PaintCommand::DrawText {
+                            x: chunk_start_x,
+                            y: *cursor_y,
+                            text: std::mem::take(&mut current_chunk),
+                            color_argb: seg.color_argb,
+                            font_size_sp: seg.font_size_sp,
+                            bold: seg.bold,
+                            link_href: seg.link_href.clone(),
+                        });
+                    } else {
+                        current_chunk.clear();
+                    }
+                }
+                *cursor_y += max_line_h;
+                line_x = base_x;
+            }
+            if !current_chunk.is_empty() || (w_idx > 0 && line_x > base_x) {
+                if !current_chunk.is_empty() {
+                    current_chunk.push(' ');
+                }
+            }
+            current_chunk.push_str(word);
+            line_x += word_w;
+        }
+
+        if !current_chunk.is_empty() && !visibility_hidden {
+            let text_w = (current_chunk.chars().count() as f32) * char_w;
+            let aligned_x = if chunk_start_x == base_x && line_x <= base_x + avail_width {
+                match text_align {
+                    TextAlign::Center => base_x + ((avail_width - text_w) * 0.5).max(0.0),
+                    TextAlign::Right => base_x + (avail_width - text_w).max(0.0),
+                    TextAlign::Left => chunk_start_x,
+                }
+            } else {
+                chunk_start_x
+            };
+            if is_visible_band(*cursor_y, max_line_h, cull_min_y, cull_max_y) {
+                commands.push(PaintCommand::DrawText {
+                    x: aligned_x,
+                    y: *cursor_y,
+                    text: current_chunk,
+                    color_argb: seg.color_argb,
+                    font_size_sp: seg.font_size_sp,
+                    bold: seg.bold,
+                    link_href: seg.link_href,
+                });
+            }
+        }
+    }
+
+    *cursor_y += max_line_h.max(18.0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -244,6 +412,34 @@ fn layout_node_recursive(
             return;
         }
 
+        // Media & Image elements (`<img>`, `<video>`, `<audio>`)
+        if matches!(tag, "img" | "video" | "audio") {
+            *cursor_y += style.margin_top;
+            let default_h = if tag == "audio" { 48.0 } else { 180.0 };
+            let box_w = style.explicit_width.unwrap_or(avail_width).min(avail_width);
+            let box_h = style.explicit_height.unwrap_or(default_h);
+            let src = dom.get_attribute(node_id, "src").unwrap_or_default();
+            let label = dom
+                .get_attribute(node_id, "alt")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("<{}>", tag));
+            if is_visible_band(*cursor_y, box_h, cull_min_y, cull_max_y) && !style.visibility_hidden
+            {
+                commands.push(PaintCommand::DrawMediaBox {
+                    node_id,
+                    x,
+                    y: *cursor_y,
+                    width: box_w,
+                    height: box_h,
+                    label,
+                    media_src: src,
+                    is_video: tag == "video",
+                });
+            }
+            *cursor_y += box_h + style.margin_bottom + 6.0;
+            return;
+        }
+
         if let Some(ctrl) = dom.control_for_node(node_id) {
             if ctrl.kind != FormControlKind::Hidden {
                 *cursor_y += style.margin_top;
@@ -277,7 +473,9 @@ fn layout_node_recursive(
                     }
                 };
 
-                if is_visible_band(*cursor_y, box_h, cull_min_y, cull_max_y) && !style.visibility_hidden {
+                if is_visible_band(*cursor_y, box_h, cull_min_y, cull_max_y)
+                    && !style.visibility_hidden
+                {
                     commands.push(PaintCommand::DrawInputBox {
                         node_id,
                         x,
@@ -296,13 +494,20 @@ fn layout_node_recursive(
 
         *cursor_y += style.margin_top;
         let box_start_y = *cursor_y;
-        let bg_cmd_idx = if (style.background_color != 0 || style.border_width > 0.0) && tag != "body" {
+        let mut resolved_w = style.explicit_width.unwrap_or(avail_width).min(avail_width);
+        if let Some(mw) = style.max_width {
+            resolved_w = resolved_w.min(mw);
+        }
+
+        let bg_cmd_idx = if (style.background_color != 0 || style.border_width > 0.0)
+            && tag != "body"
+        {
             let idx = commands.len();
             if style.border_width > 0.0 && style.border_color != 0 {
                 commands.push(PaintCommand::FillRect {
                     x,
                     y: box_start_y,
-                    width: style.explicit_width.unwrap_or(avail_width).min(avail_width),
+                    width: resolved_w,
                     height: 0.0,
                     color_argb: style.border_color,
                     corner_radius: style.corner_radius,
@@ -312,9 +517,7 @@ fn layout_node_recursive(
                 commands.push(PaintCommand::FillRect {
                     x: x + style.border_width,
                     y: box_start_y + style.border_width,
-                    width: (style.explicit_width.unwrap_or(avail_width).min(avail_width)
-                        - style.border_width * 2.0)
-                        .max(8.0),
+                    width: (resolved_w - style.border_width * 2.0).max(8.0),
                     height: 0.0,
                     color_argb: style.background_color,
                     corner_radius: (style.corner_radius - style.border_width).max(0.0),
@@ -327,14 +530,53 @@ fn layout_node_recursive(
 
         *cursor_y += style.padding_top;
         let inner_x = x + style.padding_left + style.border_width;
-        let inner_w = (style.explicit_width.unwrap_or(avail_width).min(avail_width)
-            - style.padding_left
-            - style.padding_right
-            - style.border_width * 2.0)
-            .max(40.0);
+        let inner_w =
+            (resolved_w - style.padding_left - style.padding_right - style.border_width * 2.0)
+                .max(40.0);
 
-        // Flexbox Row Layout
-        if style.display == DisplayMode::Flex && style.flex_direction == FlexDir::Row {
+        if style.display == DisplayMode::Grid && style.grid_columns >= 2 {
+            let cols = style.grid_columns as usize;
+            let mut grid_children = Vec::new();
+            let mut ch = node.first_child;
+            while ch != NO_NODE {
+                let is_ignorable_ws = dom
+                    .node_text(ch)
+                    .map(|t| t.trim().is_empty())
+                    .unwrap_or(false);
+                if !is_ignorable_ws {
+                    grid_children.push(ch);
+                }
+                ch = dom.nodes()[ch as usize].next_sibling;
+            }
+            let total_gap = style.gap * (cols.saturating_sub(1) as f32);
+            let col_w = ((inner_w - total_gap) / cols as f32).max(32.0);
+            for row_chunk in grid_children.chunks(cols) {
+                let row_y = *cursor_y;
+                let mut tallest = row_y;
+                for (c_idx, &child_id) in row_chunk.iter().enumerate() {
+                    let mut cy = row_y;
+                    let cx = inner_x + (c_idx as f32) * (col_w + style.gap);
+                    layout_node_recursive(
+                        child_id,
+                        dom,
+                        css,
+                        &style,
+                        cx,
+                        col_w,
+                        &mut cy,
+                        page_bg,
+                        current_link.clone(),
+                        cull_min_y,
+                        cull_max_y,
+                        commands,
+                    );
+                    if cy > tallest {
+                        tallest = cy;
+                    }
+                }
+                *cursor_y = tallest + style.gap;
+            }
+        } else if style.display == DisplayMode::Flex && style.flex_direction == FlexDir::Row {
             let mut flex_children = Vec::new();
             let mut ch = node.first_child;
             while ch != NO_NODE {
@@ -352,12 +594,23 @@ fn layout_node_recursive(
                 let count = flex_children.len() as f32;
                 let total_gap = style.gap * (flex_children.len().saturating_sub(1) as f32);
                 let item_w = ((inner_w - total_gap) / count).max(40.0);
+                let start_offset = match style.justify_content {
+                    JustifyContent::Center => {
+                        let used = count * item_w + total_gap;
+                        ((inner_w - used) * 0.5).max(0.0)
+                    }
+                    JustifyContent::FlexEnd => {
+                        let used = count * item_w + total_gap;
+                        (inner_w - used).max(0.0)
+                    }
+                    _ => 0.0,
+                };
                 let row_start_y = *cursor_y;
                 let mut tallest_bottom = row_start_y;
 
                 for (idx, child_id) in flex_children.into_iter().enumerate() {
                     let mut child_y = row_start_y;
-                    let child_x = inner_x + (idx as f32) * (item_w + style.gap);
+                    let child_x = inner_x + start_offset + (idx as f32) * (item_w + style.gap);
                     layout_node_recursive(
                         child_id,
                         dom,
@@ -379,32 +632,78 @@ fn layout_node_recursive(
                 *cursor_y = tallest_bottom;
             }
         } else {
+            // Flow layout with mixed inline-run consolidation!
+            let mut inline_run: Vec<InlineSegment> = Vec::new();
             let mut child = node.first_child;
             while child != NO_NODE {
-                layout_node_recursive(
-                    child,
-                    dom,
-                    css,
-                    &style,
+                let is_inline_child = if dom.node_text(child).is_some() {
+                    true
+                } else {
+                    let c_style = css.compute_style_with_parent(dom, child, Some(&style));
+                    c_style.display == DisplayMode::Inline && dom.control_for_node(child).is_none()
+                };
+
+                if is_inline_child {
+                    collect_inline_segments(
+                        child,
+                        dom,
+                        css,
+                        &style,
+                        current_link.clone(),
+                        &mut inline_run,
+                    );
+                } else {
+                    if !inline_run.is_empty() {
+                        flush_inline_segments(
+                            std::mem::take(&mut inline_run),
+                            inner_x,
+                            inner_w,
+                            style.text_align,
+                            cursor_y,
+                            style.visibility_hidden,
+                            cull_min_y,
+                            cull_max_y,
+                            commands,
+                        );
+                    }
+                    layout_node_recursive(
+                        child,
+                        dom,
+                        css,
+                        &style,
+                        inner_x,
+                        inner_w,
+                        cursor_y,
+                        page_bg,
+                        current_link.clone(),
+                        cull_min_y,
+                        cull_max_y,
+                        commands,
+                    );
+                }
+                child = dom.nodes()[child as usize].next_sibling;
+            }
+            if !inline_run.is_empty() {
+                flush_inline_segments(
+                    inline_run,
                     inner_x,
                     inner_w,
+                    style.text_align,
                     cursor_y,
-                    page_bg,
-                    current_link.clone(),
+                    style.visibility_hidden,
                     cull_min_y,
                     cull_max_y,
                     commands,
                 );
-                child = dom.nodes()[child as usize].next_sibling;
             }
         }
 
         *cursor_y += style.padding_bottom;
         let measured_h = (*cursor_y - box_start_y)
-            .max(style.explicit_height.unwrap_or(0.0));
+            .max(style.explicit_height.unwrap_or(0.0))
+            .max(style.min_height.unwrap_or(0.0));
         *cursor_y = box_start_y + measured_h + style.margin_bottom;
 
-        // Back-patch background/border rectangle height or cull if offscreen
         if let Some(start_idx) = bg_cmd_idx {
             let visible = is_visible_band(box_start_y, measured_h, cull_min_y, cull_max_y)
                 && !style.visibility_hidden
@@ -412,20 +711,27 @@ fn layout_node_recursive(
             if visible {
                 let has_border = style.border_width > 0.0 && style.border_color != 0;
                 if has_border {
-                    if let Some(PaintCommand::FillRect { height, .. }) = commands.get_mut(start_idx) {
+                    if let Some(PaintCommand::FillRect { height, .. }) = commands.get_mut(start_idx)
+                    {
                         *height = measured_h;
                     }
                     if style.background_color != 0 {
-                        if let Some(PaintCommand::FillRect { height, .. }) = commands.get_mut(start_idx + 1) {
+                        if let Some(PaintCommand::FillRect { height, .. }) =
+                            commands.get_mut(start_idx + 1)
+                        {
                             *height = (measured_h - style.border_width * 2.0).max(0.0);
                         }
                     }
-                } else if let Some(PaintCommand::FillRect { height, .. }) = commands.get_mut(start_idx) {
+                } else if let Some(PaintCommand::FillRect { height, .. }) =
+                    commands.get_mut(start_idx)
+                {
                     *height = measured_h;
                 }
             } else {
-                // Evict invisible culled placeholder rect(s) cleanly
-                if style.border_width > 0.0 && style.border_color != 0 && style.background_color != 0 {
+                if style.border_width > 0.0
+                    && style.border_color != 0
+                    && style.background_color != 0
+                {
                     if start_idx + 1 < commands.len() {
                         commands.remove(start_idx + 1);
                     }
@@ -451,7 +757,7 @@ fn layout_node_recursive(
                 format!("{}{}", prefix, text)
             };
 
-            let chars_per_line = (avail_width / (parent_style.font_size_sp * 0.55)).max(12.0);
+            let chars_per_line = (avail_width / (parent_style.font_size_sp * 0.54)).max(12.0);
             let lines = ((full_text.chars().count() as f32) / chars_per_line)
                 .ceil()
                 .max(1.0);
@@ -476,7 +782,6 @@ fn layout_node_recursive(
         return;
     }
 
-    // Document root traversal
     let mut child = node.first_child;
     while child != NO_NODE {
         layout_node_recursive(
@@ -503,11 +808,11 @@ mod tests {
     use crate::html_tokenizer::StreamingHtmlTokenizer;
 
     #[test]
-    fn test_flexbox_row_and_viewport_culling() {
+    fn test_inline_flow_grid_and_flexbox_layout() {
         let mut dom = ZeroCopyDomArena::new(64 * 1024);
         let mut tok = StreamingHtmlTokenizer::new();
         tok.feed_chunk(
-            b"<div id=\"row\" style=\"display: flex; gap: 10px;\"><div>Left</div><div>Right</div></div>",
+            b"<p>Click <a href=\"https://manta.dev\">here</a> now</p><div id=\"row\" style=\"display: flex; gap: 10px;\"><div>Left</div><div>Right</div></div>",
             true,
             |t| dom.ingest_token(t),
         );
@@ -521,9 +826,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(texts.len(), 2);
-        // Flex row aligns both items on the same Y coordinate with Left < Right on X
-        assert!((texts[0].1 - texts[1].1).abs() < 8.0);
+        // Inline segments inside <p>: "Click", "here", "now" share same horizontal line!
+        assert!(texts.len() >= 5);
+        assert!((texts[0].1 - texts[1].1).abs() < 1.0);
         assert!(texts[1].0 > texts[0].0);
+
+        // Flex row places Left & Right side by side
+        let left = texts.iter().find(|t| t.2 == "Left").unwrap();
+        let right = texts.iter().find(|t| t.2 == "Right").unwrap();
+        assert!((left.1 - right.1).abs() < 8.0);
+        assert!(right.0 > left.0);
     }
 }

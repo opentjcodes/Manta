@@ -3,7 +3,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cpp_bridge::CppTlsStream;
 use crate::deflate::decompress_http_encoding;
@@ -12,8 +12,9 @@ use crate::site_isolation::{is_private_or_reserved_ip, OriginKey};
 
 pub const STREAM_CHUNK_SIZE: usize = 4096;
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const KEEP_ALIVE_MAX_CONNS: usize = 8;
+const KEEP_ALIVE_TTL_SECS: u64 = 15;
 
-/// Optional C-ABI pluggable host network callback (e.g., Android OkHttp/Cronet or Desktop transport).
 pub type MantaNetFetchCallback = extern "C" fn(
     method: *const c_char,
     url: *const c_char,
@@ -62,6 +63,11 @@ impl ChunkedTransferDecoder {
             skip_crlf_bytes: 0,
             done: false,
         }
+    }
+
+    #[inline]
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 
     pub fn decode_bytes(&mut self, input: &[u8], out: &mut Vec<u8>) {
@@ -122,7 +128,9 @@ enum TransportStream {
 impl TransportStream {
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
         match self {
-            TransportStream::Plain(s) => s.write_all(data).map_err(|e| format!("Socket write error: {}", e)),
+            TransportStream::Plain(s) => {
+                s.write_all(data).map_err(|e| format!("Socket write error: {}", e))
+            }
             TransportStream::Tls(t) => t.write_all_tls(data).map_err(|e| e.to_string()),
         }
     }
@@ -131,6 +139,55 @@ impl TransportStream {
         match self {
             TransportStream::Plain(s) => s.read(buf).map_err(|e| format!("Stream read error: {}", e)),
             TransportStream::Tls(t) => t.read_tls(buf).map_err(|e| e.to_string()),
+        }
+    }
+}
+
+struct PooledConn {
+    key: String,
+    stream: TransportStream,
+    expires_at: Instant,
+}
+
+static KEEP_ALIVE_POOL: OnceLock<Mutex<Vec<PooledConn>>> = OnceLock::new();
+
+fn pool_take(key: &str) -> Option<TransportStream> {
+    let lock = KEEP_ALIVE_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut pool) = lock.lock() else {
+        return None;
+    };
+    let now = Instant::now();
+    pool.retain(|c| c.expires_at > now);
+    if let Some(pos) = pool.iter().position(|c| c.key == key) {
+        Some(pool.remove(pos).stream)
+    } else {
+        None
+    }
+}
+
+fn pool_put(key: String, stream: TransportStream) {
+    let lock = KEEP_ALIVE_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut pool) = lock.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    pool.retain(|c| c.expires_at > now);
+    if pool.len() >= KEEP_ALIVE_MAX_CONNS {
+        pool.remove(0);
+    }
+    pool.push(PooledConn {
+        key,
+        stream,
+        expires_at: now + Duration::from_secs(KEEP_ALIVE_TTL_SECS),
+    });
+}
+
+/// Immediately drops and closes all idle pooled TCP/TLS connections (called on shred/wipe).
+pub fn clear_keep_alive_pool() {
+    if let Some(lock) = KEEP_ALIVE_POOL.get() {
+        if let Ok(mut pool) = lock.lock() {
+            pool.clear();
+            pool.shrink_to_fit();
         }
     }
 }
@@ -182,12 +239,16 @@ extern "C" fn host_on_chunk(ctx: *mut c_void, ptr: *const u8, len: u32, is_eof: 
         unsafe { std::slice::from_raw_parts(ptr, len as usize) }
     };
     if state.is_compressed {
-        let allowed = slice.len().min(state.max_bytes.saturating_sub(state.compressed_buf.len()));
+        let allowed = slice
+            .len()
+            .min(state.max_bytes.saturating_sub(state.compressed_buf.len()));
         state.compressed_buf.extend_from_slice(&slice[..allowed]);
         if is_eof && !state.compressed_buf.is_empty() {
-            if let Ok(decoded) =
-                decompress_http_encoding(&state.encoding_val, &state.compressed_buf, state.max_bytes)
-            {
+            if let Ok(decoded) = decompress_http_encoding(
+                &state.encoding_val,
+                &state.compressed_buf,
+                state.max_bytes,
+            ) {
                 state.total_bytes = decoded.len();
                 (state.on_chunk)(&decoded, true);
             } else {
@@ -203,12 +264,6 @@ extern "C" fn host_on_chunk(ctx: *mut c_void, ptr: *const u8, len: u32, is_eof: 
     }
 }
 
-/// Pure-Rust + C++ OpenSSL zero-cache HTTP/1.1 & HTTPS streaming client:
-/// - Verified TLS 1.2+ with SNI & peer certificate validation (via C++ `libssl.so.3` or host transport hook).
-/// - Post-DNS resolved IP SSRF protection (blocks DNS rebinding to `127.0.0.1` / `169.254.169.254`).
-/// - Strict CRLF header injection guard & 64 KB header cap.
-/// - Cross-origin redirect credential stripping & `301`/`302`/`303` POST->GET downgrade.
-/// - Transparent RFC 1951/1952 `gzip` & `deflate` streaming decompression with zip-bomb cap.
 pub struct StreamingNetworkPipe;
 
 impl StreamingNetworkPipe {
@@ -259,7 +314,6 @@ impl StreamingNetworkPipe {
                 ModuleDecision::Proceed => {}
             }
 
-            // Use registered host transport callback if provided (e.g., Android OkHttp/Cronet)
             if let Some(host_cb) = get_host_net_transport() {
                 let mut hdr_raw = String::new();
                 for (k, v) in &req.headers {
@@ -302,50 +356,12 @@ impl StreamingNetworkPipe {
             }
 
             let parsed = ParsedUrl::parse(&req.url)?;
-            let addr_str = format!("{}:{}", parsed.host, parsed.port);
-            let addrs: Vec<SocketAddr> = addr_str
-                .to_socket_addrs()
-                .map_err(|e| format!("DNS resolution failed: {}", e))?
-                .collect();
-
-            if addrs.is_empty() {
-                return Err("No socket address resolved".to_string());
-            }
-
-            // Post-DNS SSRF / DNS-rebinding defense!
-            let initiator_is_public = req
-                .headers
-                .get("Origin")
-                .or_else(|| req.headers.get("Referer"))
-                .map(|s| !OriginKey::from_url(s).is_private_or_loopback_network())
-                .unwrap_or(!initial_origin.is_private_or_loopback_network());
-
-            let safe_addr = addrs
-                .into_iter()
-                .find(|a| {
-                    if initiator_is_public {
-                        !is_private_or_reserved_ip(a.ip())
-                    } else {
-                        true
-                    }
-                })
-                .ok_or_else(|| {
-                    "Blocked resolved private/loopback/metadata IP (DNS rebinding SSRF guard)"
-                        .to_string()
-                })?;
-
-            let tcp = TcpStream::connect_timeout(&safe_addr, Duration::from_secs(6))
-                .map_err(|e| format!("Connect error: {}", e))?;
-            let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
-            let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
-
-            let mut stream = if parsed.is_https {
-                let tls = CppTlsStream::connect(tcp, &parsed.host)
-                    .map_err(|e| format!("HTTPS TLS error: {}", e))?;
-                TransportStream::Tls(tls)
-            } else {
-                TransportStream::Plain(tcp)
-            };
+            let pool_key = format!(
+                "{}:{}:{}",
+                if parsed.is_https { "https" } else { "http" },
+                parsed.host,
+                parsed.port
+            );
 
             let host_header = if (parsed.is_https && parsed.port == 443)
                 || (!parsed.is_https && parsed.port == 80)
@@ -356,7 +372,7 @@ impl StreamingNetworkPipe {
             };
 
             let mut raw_request = format!(
-                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Manta/3.0\r\nConnection: close\r\nAccept-Encoding: gzip, deflate\r\n",
+                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Manta/3.0\r\nConnection: keep-alive\r\nAccept-Encoding: gzip, deflate\r\n",
                 req.method, parsed.path_and_query, host_header
             );
             for (k, v) in &req.headers {
@@ -369,141 +385,243 @@ impl StreamingNetworkPipe {
             }
             raw_request.push_str("\r\n");
 
-            stream.write_all(raw_request.as_bytes())?;
+            let mut attempt_pooled = true;
+            let (response_meta, total_body_bytes, redirect_target) = loop {
+                let (mut stream, was_pooled) = if attempt_pooled {
+                    if let Some(s) = pool_take(&pool_key) {
+                        (s, true)
+                    } else {
+                        attempt_pooled = false;
+                        (open_fresh_transport(&parsed, &req, &initial_origin)?, false)
+                    }
+                } else {
+                    (open_fresh_transport(&parsed, &req, &initial_origin)?, false)
+                };
 
-            let mut buf = [0u8; STREAM_CHUNK_SIZE];
-            let mut header_accum = Vec::with_capacity(1024);
-            let mut headers_parsed = false;
-            let mut is_chunked = false;
-            let mut content_encoding = String::new();
-            let mut compressed_accum = Vec::new();
-            let mut chunk_decoder = ChunkedTransferDecoder::new();
-            let mut decoded_scratch = Vec::with_capacity(STREAM_CHUNK_SIZE);
-            let mut total_body_bytes = 0usize;
-            let mut redirect_target: Option<(u16, String)> = None;
+                if stream.write_all(raw_request.as_bytes()).is_err() {
+                    if was_pooled {
+                        attempt_pooled = false;
+                        continue;
+                    }
+                    return Err("Socket write error".to_string());
+                }
 
-            let mut response_meta = InterceptedResponse {
-                status_code: 200,
-                headers: HashMap::new(),
-                synthetic_body: None,
-            };
+                let mut buf = [0u8; STREAM_CHUNK_SIZE];
+                let mut header_accum = Vec::with_capacity(1024);
+                let mut headers_parsed = false;
+                let mut is_chunked = false;
+                let mut expected_len: Option<usize> = None;
+                let mut server_keep_alive = true;
+                let mut raw_body_received = 0usize;
+                let mut content_encoding = String::new();
+                let mut compressed_accum = Vec::new();
+                let mut chunk_decoder = ChunkedTransferDecoder::new();
+                let mut decoded_scratch = Vec::with_capacity(STREAM_CHUNK_SIZE);
+                let mut total_body = 0usize;
+                let mut redir: Option<(u16, String)> = None;
+                let mut body_complete_clean = false;
+                let mut retry_fresh = false;
 
-            loop {
-                let n = stream.read(&mut buf)?;
-                if n == 0 {
+                let mut meta = InterceptedResponse {
+                    status_code: 200,
+                    headers: HashMap::new(),
+                    synthetic_body: None,
+                };
+
+                loop {
+                    let read_res = stream.read(&mut buf);
+                    let n = match read_res {
+                        Ok(0) => {
+                            if !headers_parsed && was_pooled && header_accum.is_empty() {
+                                retry_fresh = true;
+                            }
+                            break;
+                        }
+                        Ok(k) => k,
+                        Err(e) => {
+                            if !headers_parsed && was_pooled && header_accum.is_empty() {
+                                retry_fresh = true;
+                                break;
+                            }
+                            return Err(e);
+                        }
+                    };
+
+                    if !headers_parsed {
+                        if header_accum.len() + n > MAX_HTTP_HEADER_BYTES {
+                            return Err("HTTP response headers exceeded 64 KB cap".to_string());
+                        }
+                        header_accum.extend_from_slice(&buf[..n]);
+                        if let Some(split_pos) = find_double_crlf(&header_accum) {
+                            let header_bytes = &header_accum[..split_pos];
+                            let body_remainder = &header_accum[split_pos + 4..];
+
+                            let (status, hdrs) = parse_http_headers(header_bytes);
+                            meta.status_code = status;
+                            meta.headers = hdrs;
+                            modules.dispatch_response_headers(&req, &mut meta);
+                            headers_parsed = true;
+
+                            if matches!(status, 301 | 302 | 303 | 307 | 308) && redirects_left > 0
+                            {
+                                if let Some(loc) = meta
+                                    .headers
+                                    .iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("Location"))
+                                    .map(|(_, v)| v.clone())
+                                {
+                                    redir = Some((status, loc));
+                                    break;
+                                }
+                            }
+
+                            is_chunked = meta.headers.iter().any(|(k, v)| {
+                                k.eq_ignore_ascii_case("Transfer-Encoding")
+                                    && v.to_ascii_lowercase().contains("chunked")
+                            });
+                            expected_len = meta
+                                .headers
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+                                .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+                            server_keep_alive = !meta.headers.iter().any(|(k, v)| {
+                                k.eq_ignore_ascii_case("Connection")
+                                    && v.to_ascii_lowercase().contains("close")
+                            });
+                            content_encoding = meta
+                                .headers
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("Content-Encoding"))
+                                .map(|(_, v)| v.to_ascii_lowercase())
+                                .filter(|v| v.contains("gzip") || v.contains("deflate"))
+                                .unwrap_or_default();
+
+                            if matches!(status, 204 | 304) || req.method == "HEAD" {
+                                body_complete_clean = true;
+                                break;
+                            }
+
+                            if !body_remainder.is_empty() {
+                                raw_body_received += body_remainder.len();
+                                let payload: &[u8] = if is_chunked {
+                                    decoded_scratch.clear();
+                                    chunk_decoder
+                                        .decode_bytes(body_remainder, &mut decoded_scratch);
+                                    &decoded_scratch
+                                } else {
+                                    body_remainder
+                                };
+                                if !content_encoding.is_empty() {
+                                    if compressed_accum.len() + payload.len() > max_bytes {
+                                        return Err(
+                                            "Compressed stream exceeded max allowed bytes"
+                                                .to_string(),
+                                        );
+                                    }
+                                    compressed_accum.extend_from_slice(payload);
+                                } else {
+                                    let allowed = payload.len().min(max_bytes);
+                                    total_body += allowed;
+                                    on_chunk(&payload[..allowed], false);
+                                }
+                            }
+
+                            header_accum.clear();
+                            header_accum.shrink_to_fit();
+
+                            if (is_chunked && chunk_decoder.is_done())
+                                || expected_len
+                                    .map(|len| raw_body_received >= len)
+                                    .unwrap_or(false)
+                            {
+                                body_complete_clean = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        raw_body_received += n;
+                        let payload_slice: &[u8] = if is_chunked {
+                            decoded_scratch.clear();
+                            chunk_decoder.decode_bytes(&buf[..n], &mut decoded_scratch);
+                            &decoded_scratch
+                        } else {
+                            &buf[..n]
+                        };
+
+                        if !content_encoding.is_empty() {
+                            if compressed_accum.len() + payload_slice.len() > max_bytes {
+                                return Err(
+                                    "Compressed stream exceeded max allowed bytes".to_string(),
+                                );
+                            }
+                            compressed_accum.extend_from_slice(payload_slice);
+                        } else {
+                            if total_body + payload_slice.len() > max_bytes {
+                                let remaining = max_bytes.saturating_sub(total_body);
+                                if remaining > 0 {
+                                    total_body += remaining;
+                                    on_chunk(&payload_slice[..remaining], true);
+                                }
+                                break;
+                            }
+                            total_body += payload_slice.len();
+                            if !payload_slice.is_empty() {
+                                on_chunk(payload_slice, false);
+                            }
+                        }
+
+                        if (is_chunked && chunk_decoder.is_done())
+                            || expected_len
+                                .map(|len| raw_body_received >= len)
+                                .unwrap_or(false)
+                        {
+                            body_complete_clean = true;
+                            break;
+                        }
+                    }
+                }
+
+                if retry_fresh {
+                    attempt_pooled = false;
+                    continue;
+                }
+
+                if redir.is_none() {
                     if !content_encoding.is_empty() && !compressed_accum.is_empty() {
-                        let dec =
-                            decompress_http_encoding(&content_encoding, &compressed_accum, max_bytes)?;
-                        total_body_bytes = dec.len();
+                        let dec = decompress_http_encoding(
+                            &content_encoding,
+                            &compressed_accum,
+                            max_bytes,
+                        )?;
+                        total_body = dec.len();
                         on_chunk(&dec, true);
                     } else {
                         on_chunk(&[], true);
                     }
-                    break;
-                }
 
-                if !headers_parsed {
-                    if header_accum.len() + n > MAX_HTTP_HEADER_BYTES {
-                        return Err("HTTP response headers exceeded 64 KB cap".to_string());
-                    }
-                    header_accum.extend_from_slice(&buf[..n]);
-                    if let Some(split_pos) = find_double_crlf(&header_accum) {
-                        let header_bytes = &header_accum[..split_pos];
-                        let body_remainder = &header_accum[split_pos + 4..];
-
-                        let (status, hdrs) = parse_http_headers(header_bytes);
-                        response_meta.status_code = status;
-                        response_meta.headers = hdrs;
-                        modules.dispatch_response_headers(&req, &mut response_meta);
-                        headers_parsed = true;
-
-                        if matches!(status, 301 | 302 | 303 | 307 | 308) && redirects_left > 0 {
-                            if let Some(loc) = response_meta
-                                .headers
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("Location"))
-                                .map(|(_, v)| v.clone())
-                            {
-                                redirect_target = Some((status, loc));
-                                break;
-                            }
-                        }
-
-                        is_chunked = response_meta.headers.iter().any(|(k, v)| {
-                            k.eq_ignore_ascii_case("Transfer-Encoding")
-                                && v.to_ascii_lowercase().contains("chunked")
-                        });
-                        content_encoding = response_meta
-                            .headers
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Encoding"))
-                            .map(|(_, v)| v.to_ascii_lowercase())
-                            .filter(|v| v.contains("gzip") || v.contains("deflate"))
-                            .unwrap_or_default();
-
-                        if !body_remainder.is_empty() {
-                            let payload: &[u8] = if is_chunked {
-                                decoded_scratch.clear();
-                                chunk_decoder.decode_bytes(body_remainder, &mut decoded_scratch);
-                                &decoded_scratch
-                            } else {
-                                body_remainder
-                            };
-                            if !content_encoding.is_empty() {
-                                if compressed_accum.len() + payload.len() > max_bytes {
-                                    return Err("Compressed stream exceeded max allowed bytes".to_string());
-                                }
-                                compressed_accum.extend_from_slice(payload);
-                            } else {
-                                let allowed = payload.len().min(max_bytes);
-                                total_body_bytes += allowed;
-                                on_chunk(&payload[..allowed], false);
-                            }
-                        }
-                        header_accum.clear();
-                        header_accum.shrink_to_fit();
-                    }
-                } else {
-                    let payload_slice: &[u8] = if is_chunked {
-                        decoded_scratch.clear();
-                        chunk_decoder.decode_bytes(&buf[..n], &mut decoded_scratch);
-                        &decoded_scratch
-                    } else {
-                        &buf[..n]
-                    };
-
-                    if !content_encoding.is_empty() {
-                        if compressed_accum.len() + payload_slice.len() > max_bytes {
-                            return Err("Compressed stream exceeded max allowed bytes".to_string());
-                        }
-                        compressed_accum.extend_from_slice(payload_slice);
-                    } else {
-                        if total_body_bytes + payload_slice.len() > max_bytes {
-                            let remaining = max_bytes.saturating_sub(total_body_bytes);
-                            if remaining > 0 {
-                                total_body_bytes += remaining;
-                                on_chunk(&payload_slice[..remaining], true);
-                            }
-                            break;
-                        }
-                        total_body_bytes += payload_slice.len();
-                        if !payload_slice.is_empty() {
-                            on_chunk(payload_slice, false);
-                        }
+                    if body_complete_clean && server_keep_alive {
+                        pool_put(pool_key.clone(), stream);
                     }
                 }
-            }
+
+                break (meta, total_body, redir);
+            };
 
             if let Some((status, next_loc)) = redirect_target {
                 if has_crlf_or_nul(&next_loc) {
                     return Err("Rejected redirect with CRLF/NUL".to_string());
                 }
                 redirects_left -= 1;
-                let resolved = if next_loc.starts_with("http://") || next_loc.starts_with("https://")
+                let resolved = if next_loc.starts_with("http://")
+                    || next_loc.starts_with("https://")
                 {
                     next_loc
                 } else if next_loc.starts_with("//") {
-                    format!("{}:{}", if parsed.is_https { "https" } else { "http" }, next_loc)
+                    format!(
+                        "{}:{}",
+                        if parsed.is_https { "https" } else { "http" },
+                        next_loc
+                    )
                 } else if next_loc.starts_with('/') {
                     format!(
                         "{}://{}:{}{}",
@@ -522,7 +640,6 @@ impl StreamingNetworkPipe {
                     )
                 };
 
-                // Strip sensitive headers across cross-origin redirects!
                 let prev_origin = OriginKey::from_url(&current_url);
                 let next_origin = OriginKey::from_url(&resolved);
                 if !prev_origin.is_same_origin(&next_origin) {
@@ -533,7 +650,6 @@ impl StreamingNetworkPipe {
                     });
                 }
 
-                // RFC 9110: 301/302/303 downgrade POST -> GET on redirect
                 if matches!(status, 301 | 302 | 303) && current_method == "POST" {
                     current_method = "GET".to_string();
                 }
@@ -549,6 +665,55 @@ impl StreamingNetworkPipe {
                 total_bytes_streamed: total_body_bytes,
             });
         }
+    }
+}
+
+fn open_fresh_transport(
+    parsed: &ParsedUrl,
+    req: &InterceptedRequest,
+    initial_origin: &OriginKey,
+) -> Result<TransportStream, String> {
+    let addr_str = format!("{}:{}", parsed.host, parsed.port);
+    let addrs: Vec<SocketAddr> = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed: {}", e))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err("No socket address resolved".to_string());
+    }
+
+    let initiator_is_public = req
+        .headers
+        .get("Origin")
+        .or_else(|| req.headers.get("Referer"))
+        .map(|s| !OriginKey::from_url(s).is_private_or_loopback_network())
+        .unwrap_or(!initial_origin.is_private_or_loopback_network());
+
+    let safe_addr = addrs
+        .into_iter()
+        .find(|a| {
+            if initiator_is_public {
+                !is_private_or_reserved_ip(a.ip())
+            } else {
+                true
+            }
+        })
+        .ok_or_else(|| {
+            "Blocked resolved private/loopback/metadata IP (DNS rebinding SSRF guard)".to_string()
+        })?;
+
+    let tcp = TcpStream::connect_timeout(&safe_addr, Duration::from_secs(6))
+        .map_err(|e| format!("Connect error: {}", e))?;
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
+
+    if parsed.is_https {
+        let tls = CppTlsStream::connect(tcp, &parsed.host)
+            .map_err(|e| format!("HTTPS TLS error: {}", e))?;
+        Ok(TransportStream::Tls(tls))
+    } else {
+        Ok(TransportStream::Plain(tcp))
     }
 }
 
@@ -576,7 +741,6 @@ impl ParsedUrl {
             None => (rest, "/"),
         };
 
-        // Strip fragment #... from wire request
         let no_frag = raw_tail.split('#').next().unwrap_or("/");
         let path_and_query = if no_frag.starts_with('/') {
             no_frag.to_string()

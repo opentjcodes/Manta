@@ -37,22 +37,13 @@ use crate::config::MantaConfig;
 use crate::downloads_engine::MantaDownloadManager;
 use crate::media_stream::MantaMediaManager;
 use crate::module_bus::ModuleBus;
+use crate::net_stream::clear_keep_alive_pool;
 use crate::ram_vault::VolatileRamVault;
 use crate::site_isolation::{SiteIsolationEngine, SiteIsolationModule};
 use crate::storage_engine::MantaStorageEngine;
 use crate::tab_manager::TabManager;
 use crate::worker_pool::MantaWorkerPool;
 
-/// Global singleton holding the **Manta Core v3.0 (Default Base Flavour)** Engine.
-///
-/// Combines Safe Rust architecture with C++17 SIMD, `mmap`/`madvise`, lock-free SPSC media ring
-/// buffers, and verified OpenSSL TLS:
-/// - **3x–8x Lower Device RAM**: 48-byte interned `DomNode`s, `mmap` slab page release, DisplayList
-///   eviction, and C++ Hash-LZ + RLE background tab compaction with zero tab killing.
-/// - **Encrypted Append-Only WAL Storage**: `MANTADB4` + ChaCha20/HMAC-SHA256 `.wal` persistence
-///   with strictly volatile RAM-only `sessionStorage` and zero permanent HTTP/media disk caching.
-/// - **Low-Latency Video/Audio Streaming**: Adaptive bitrate HLS/DASH/Range over bounded volatile
-///   C++ ring buffers.
 pub struct MantaEngine {
     pub config: MantaConfig,
     pub vault: VolatileRamVault,
@@ -166,6 +157,7 @@ impl MantaEngine {
     }
 
     pub fn clear_all_custom_storage_and_ram(&mut self) {
+        clear_keep_alive_pool();
         self.tabs.close_all();
         self.media.clear_all();
         self.vault.clear_all();
@@ -190,7 +182,6 @@ mod tests {
         cfg.custom_storage_file_path = String::from(test_db);
         let mut engine = MantaEngine::new(cfg);
 
-        // Open 20 tabs: older background tabs compact cleanly with C++ LZ+RLE, NEVER killed!
         let mut tab_ids = Vec::new();
         for i in 0..20 {
             let tid = engine.tabs.create_tab();
@@ -215,7 +206,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Background tiering compacted older tabs while keeping all 20 open and non-hibernated
         assert!(engine.tabs.compacted_tab_count() >= 15);
         for (i, &tid) in tab_ids.iter().enumerate() {
             assert!(engine.tabs.switch_to_tab(tid, &mut engine.vault));
@@ -225,7 +215,6 @@ mod tests {
             assert_eq!(t.dom.text_content(hdr_id), format!("Active {}", i));
         }
 
-        // Persist user input on Tab 1 via encrypted WAL
         let tab1 = tab_ids[0];
         let input_id = engine
             .tabs
@@ -246,7 +235,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        // Session storage stays active in memory during session
         assert_eq!(
             engine
                 .storage
@@ -254,7 +242,6 @@ mod tests {
             Some("sv_0".to_string())
         );
 
-        // Create second engine instance loading from encrypted WAL + vault key
         let mut cfg2 = MantaConfig::default();
         cfg2.custom_storage_file_path = String::from(test_db);
         let mut restored_engine = MantaEngine::new(cfg2);
@@ -264,7 +251,6 @@ mod tests {
                 .get_local_storage("https://site0.manta.dev", "k_0"),
             Some("v_0".to_string())
         );
-        // sessionStorage strictly never written to permanent disk!
         assert_eq!(
             restored_engine
                 .storage
@@ -276,6 +262,44 @@ mod tests {
                 .storage
                 .get_form_draft("https://site0.manta.dev", "field"),
             Some("persisted_user_data".to_string())
+        );
+
+        // Native form draft auto-hydration on fresh page load!
+        let restored_tab = restored_engine.tabs.create_tab();
+        let form_html = b"<form><input id=\"field\" name=\"field\" type=\"text\" /></form>";
+        {
+            let re = &mut restored_engine;
+            re.tabs
+                .load_stream_chunk(
+                    restored_tab,
+                    "https://site0.manta.dev/app",
+                    form_html,
+                    true,
+                    &mut re.modules,
+                    &mut re.vault,
+                    &mut re.storage,
+                    &mut re.downloads,
+                )
+                .unwrap();
+        }
+        let f_nid = restored_engine
+            .tabs
+            .get_tab(restored_tab)
+            .unwrap()
+            .dom
+            .find_by_id("field")
+            .unwrap();
+        assert_eq!(
+            restored_engine
+                .tabs
+                .get_tab(restored_tab)
+                .unwrap()
+                .dom
+                .forms
+                .get_control(f_nid)
+                .unwrap()
+                .value,
+            "persisted_user_data"
         );
 
         restored_engine.clear_all_custom_storage_and_ram();

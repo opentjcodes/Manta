@@ -21,7 +21,8 @@ void     manta_cpp_arena_free(void* ptr, size_t bytes);
 /* SIMD-accelerated HTML/XML delimiter scanner ('<' or '&') */
 size_t   manta_cpp_scan_html_delim(const uint8_t* data, size_t len, size_t start);
 
-/* SIMD-accelerated substring & bounded ReDoS-safe RegExp engine for JS VM */
+/* SIMD-accelerated substring, hashing, JSON escaping, Base64 & ReDoS-safe RegExp for JS VM */
+uint64_t manta_cpp_hash_bytes(const uint8_t* data, size_t len);
 int64_t  manta_cpp_find_substr(const uint8_t* hay, size_t hay_len,
                                const uint8_t* needle, size_t needle_len, size_t start);
 int32_t  manta_cpp_regex_match(const char* pattern, size_t pat_len,
@@ -29,10 +30,15 @@ int32_t  manta_cpp_regex_match(const char* pattern, size_t pat_len,
                                const char* text, size_t text_len,
                                size_t start_pos,
                                size_t* out_match_start, size_t* out_match_end);
+size_t   manta_cpp_base64_encode(const uint8_t* src, size_t src_len, char* dst, size_t dst_cap);
+size_t   manta_cpp_base64_decode(const char* src, size_t src_len, uint8_t* dst, size_t dst_cap);
+size_t   manta_cpp_json_escape(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap);
 
-/* Fast C++ Numeric Vector / TypedArray acceleration for JS loops */
+/* Fast C++ Numeric Vector / Array Sort & SIMD Math for JS loops */
 double   manta_cpp_f64_sum(const double* arr, size_t len);
+double   manta_cpp_f64_dot(const double* a, const double* b, size_t len);
 void     manta_cpp_f64_scale_add(double* dst, const double* src, size_t len, double scale, double bias);
+void     manta_cpp_f64_sort(double* arr, size_t len);
 
 /* Fast Hash-LZ + RLE block compressor/decompressor for tab & asset snapshots */
 size_t   manta_cpp_fast_compress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap);
