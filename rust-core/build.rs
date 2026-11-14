@@ -16,14 +16,56 @@ fn main() {
         "cargo:rerun-if-changed={}",
         cpp_inc.join("manta_accel.h").display()
     );
+    for env_key in [
+        format!("CXX_{}", target_under),
+        format!("CXX_{}", target),
+        format!("CXXFLAGS_{}", target_under),
+        format!("CXXFLAGS_{}", target),
+        "CXX".to_string(),
+        "CXXFLAGS".to_string(),
+        "ANDROID_NDK_HOME".to_string(),
+        "ANDROID_NDK_ROOT".to_string(),
+    ] {
+        println!("cargo:rerun-if-env-changed={}", env_key);
+    }
 
     let cxx = resolve_cxx(&target, &target_under);
     let ar = resolve_ar(&target, &target_under);
+    let extra_flags = collect_cxxflags(&target, &target_under);
 
     let obj_path = out_dir.join("manta_accel.o");
     let lib_path = out_dir.join("libmanta_cpp.a");
 
     let mut compile_cmd = Command::new(&cxx);
+    for flag in &extra_flags {
+        compile_cmd.arg(flag);
+    }
+
+    // Ensure Android builds always pass an explicit `--target=<triple><api>` when using generic NDK clang++
+    if target.contains("android") {
+        let cxx_name = Path::new(&cxx)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let has_target_in_name = cxx_name.contains("android");
+        let has_target_in_flags = extra_flags
+            .iter()
+            .any(|f| f == "--target" || f.starts_with("--target="));
+
+        if !has_target_in_name && !has_target_in_flags {
+            let api = env::var("CARGO_NDK_ANDROID_PLATFORM")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| String::from("21"));
+            let clang_triple = if target.starts_with("armv7") {
+                "armv7a-linux-androideabi"
+            } else {
+                target.as_str()
+            };
+            compile_cmd.arg(format!("--target={}{}", clang_triple, api.trim()));
+        }
+    }
+
     compile_cmd
         .arg("-std=c++17")
         .arg("-O3")
@@ -40,7 +82,7 @@ fn main() {
         .arg("-o")
         .arg(&obj_path);
 
-    if target.contains("armv7") {
+    if target.contains("armv7") && !extra_flags.iter().any(|f| f == "-mthumb") {
         compile_cmd.arg("-mthumb");
     }
 
@@ -73,11 +115,43 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=manta_cpp");
-    if target.contains("linux") && !target.contains("android") {
-        println!("cargo:rustc-link-lib=dl");
-    } else if target.contains("android") {
+    if target.contains("linux") || target.contains("android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn collect_cxxflags(target: &str, target_under: &str) -> Vec<String> {
+    for key in [
+        format!("CXXFLAGS_{}", target_under),
+        format!("CXXFLAGS_{}", target),
+        "TARGET_CXXFLAGS".to_string(),
+        "CXXFLAGS".to_string(),
+    ] {
+        if let Ok(val) = env::var(&key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.split_whitespace().map(|s| s.to_string()).collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn ndk_prebuilt_bin_dir() -> Option<PathBuf> {
+    for ndk_var in ["ANDROID_NDK_ROOT", "ANDROID_NDK_HOME"] {
+        if let Ok(ndk_home) = env::var(ndk_var) {
+            let prebuilt = Path::new(&ndk_home).join("toolchains/llvm/prebuilt");
+            if let Ok(entries) = std::fs::read_dir(&prebuilt) {
+                for entry in entries.flatten() {
+                    let bin = entry.path().join("bin");
+                    if bin.is_dir() {
+                        return Some(bin);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn resolve_cxx(target: &str, target_under: &str) -> String {
@@ -88,13 +162,14 @@ fn resolve_cxx(target: &str, target_under: &str) -> String {
         "CXX".to_string(),
     ] {
         if let Ok(val) = env::var(&key) {
-            if !val.trim().is_empty() {
-                return val;
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && !(target.contains("android") && matches!(trimmed, "c++" | "g++"))
+            {
+                return trimmed.to_string();
             }
         }
     }
 
-    // If cargo-ndk or environment set CC_* (e.g. aarch64-linux-android21-clang), derive clang++
     for key in [
         format!("CC_{}", target_under),
         format!("CC_{}", target),
@@ -106,16 +181,14 @@ fn resolve_cxx(target: &str, target_under: &str) -> String {
             if trimmed.ends_with("clang") {
                 return format!("{}++", trimmed);
             }
-            if trimmed.ends_with("gcc") {
+            if trimmed.ends_with("gcc") && !target.contains("android") {
                 return format!("{}++", &trimmed[..trimmed.len() - 3]);
             }
         }
     }
 
-    // Fallback to ANDROID_NDK_HOME toolchain
     if target.contains("android") {
-        if let Ok(ndk_home) = env::var("ANDROID_NDK_HOME") {
-            let bin_dir = Path::new(&ndk_home).join("toolchains/llvm/prebuilt/linux-x86_64/bin");
+        if let Some(bin_dir) = ndk_prebuilt_bin_dir() {
             let prefix = if target.starts_with("armv7") {
                 "armv7a-linux-androideabi"
             } else {
@@ -126,6 +199,10 @@ fn resolve_cxx(target: &str, target_under: &str) -> String {
                 if candidate.exists() {
                     return candidate.to_string_lossy().into_owned();
                 }
+            }
+            let generic_clangxx = bin_dir.join("clang++");
+            if generic_clangxx.exists() {
+                return generic_clangxx.to_string_lossy().into_owned();
             }
         }
     }
@@ -147,16 +224,16 @@ fn resolve_ar(target: &str, target_under: &str) -> String {
         "AR".to_string(),
     ] {
         if let Ok(val) = env::var(&key) {
-            if !val.trim().is_empty() {
-                return val;
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
             }
         }
     }
 
     if target.contains("android") {
-        if let Ok(ndk_home) = env::var("ANDROID_NDK_HOME") {
-            let candidate =
-                Path::new(&ndk_home).join("toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar");
+        if let Some(bin_dir) = ndk_prebuilt_bin_dir() {
+            let candidate = bin_dir.join("llvm-ar");
             if candidate.exists() {
                 return candidate.to_string_lossy().into_owned();
             }

@@ -32,14 +32,18 @@ jobs:
 
       - name: Locate or Install Android NDK for Mobile Targets
         run: |
-          if [ -d "$ANDROID_HOME/ndk" ]; then
+          if [ -n "$ANDROID_NDK_ROOT" ] && [ -d "$ANDROID_NDK_ROOT" ]; then
+            NDK_PATH="$ANDROID_NDK_ROOT"
+          elif [ -d "$ANDROID_HOME/ndk" ]; then
             NDK_VER=$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -n 1)
+            NDK_PATH="$ANDROID_HOME/ndk/$NDK_VER"
           fi
-          if [ -z "$NDK_VER" ]; then
+          if [ -z "$NDK_PATH" ]; then
             yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018"
-            NDK_VER="27.2.12479018"
+            NDK_PATH="$ANDROID_HOME/ndk/27.2.12479018"
           fi
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VER" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$NDK_PATH" >> $GITHUB_ENV
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@v2
