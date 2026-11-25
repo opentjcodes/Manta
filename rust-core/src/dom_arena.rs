@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::cpp_bridge::CppMmapSlab;
-use crate::html_tokenizer::HtmlToken;
+use crate::html_tokenizer::{HtmlToken, StreamingHtmlTokenizer};
 use crate::input_forms::{FormControlData, FormControlKind, MantaFormEngine};
 
 pub type NodeId = u32;
@@ -131,9 +131,7 @@ impl StringInterner {
 /// Contiguous Data-Oriented DOM Arena (`ZeroCopyDomArena`):
 /// - String-interned tags, classes, IDs, and attribute keys (`SymId`).
 /// - C++ OS `mmap`-backed contiguous byte slab (`CppMmapSlab`) with `madvise(MADV_DONTNEED)` release.
-/// - HTML5 implicit end-tag auto-closing (`<p>`, `<li>`, `<dt>`, `<dd>`, `<td>`, `<th>`, `<tr>`, `<option>`).
-/// - Full DOM manipulation (`createElement`, `appendChild`, `removeChild`, `classList`, `querySelectorAll`).
-/// - Tracks `<video>`/`<audio>` media elements, `<link rel="stylesheet">`, `<script src>`, and `<base href>`.
+/// - HTML5 implicit end-tag auto-closing & real `innerHTML` HTML-fragment parsing.
 pub struct ZeroCopyDomArena {
     nodes: Vec<DomNode>,
     open_stack: Vec<NodeId>,
@@ -157,7 +155,7 @@ pub struct ZeroCopyDomArena {
 
 impl ZeroCopyDomArena {
     pub fn new(max_bytes: usize) -> Self {
-        let slab_init = (max_bytes / 8).clamp(8192, 256 * 1024);
+        let slab_init = (max_bytes / 8).clamp(8192, 192 * 1024);
         let mut arena = Self {
             nodes: Vec::with_capacity(128),
             open_stack: Vec::with_capacity(16),
@@ -301,6 +299,59 @@ impl ZeroCopyDomArena {
         }
     }
 
+    pub fn find_first_tag(&self, tag_name: &str) -> Option<NodeId> {
+        let target = tag_name.to_ascii_lowercase();
+        for node in &self.nodes {
+            if self.node_tag(node.id) == Some(target.as_str()) {
+                return Some(node.id);
+            }
+        }
+        None
+    }
+
+    pub fn element_children(&self, parent_id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let Some(node) = self.nodes.get(parent_id as usize) else {
+            return out;
+        };
+        let mut cur = node.first_child;
+        while cur != NO_NODE {
+            if matches!(self.nodes[cur as usize].kind, NodeKind::Element { .. }) {
+                out.push(cur);
+            }
+            cur = self.nodes[cur as usize].next_sibling;
+        }
+        out
+    }
+
+    /// Parses an HTML fragment (e.g. `el.innerHTML = "<div class='row'>Hi</div>"`) directly
+    /// into real DOM nodes attached under `parent_id`.
+    pub fn parse_html_fragment_into(&mut self, parent_id: NodeId, html: &str) -> bool {
+        let p_idx = parent_id as usize;
+        if p_idx >= self.nodes.len() {
+            return false;
+        }
+        let mut child = self.nodes[p_idx].first_child;
+        while child != NO_NODE {
+            let next = self.nodes[child as usize].next_sibling;
+            self.nodes[child as usize].parent = NO_NODE;
+            self.nodes[child as usize].next_sibling = NO_NODE;
+            child = next;
+        }
+        self.nodes[p_idx].first_child = NO_NODE;
+        self.nodes[p_idx].last_child = NO_NODE;
+
+        let saved_stack = std::mem::take(&mut self.open_stack);
+        self.open_stack.push(parent_id);
+
+        let mut tok = StreamingHtmlTokenizer::new();
+        tok.feed_chunk(html.as_bytes(), true, |t| self.ingest_token(t));
+
+        self.open_stack = saved_stack;
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+
     fn alloc_span(&mut self, text: &str) -> TextSpan {
         if text.is_empty() {
             return TextSpan { offset: 0, len: 0 };
@@ -327,11 +378,9 @@ impl ZeroCopyDomArena {
                 attributes,
                 self_closing,
             } => {
-                // HTML5 implicit end-tag auto-closing for broken/minimal markup
                 self.auto_close_implicit_for_start(&name);
                 let current_parent = *self.open_stack.last().unwrap_or(&0);
 
-                // Extract <base>, <link rel="stylesheet">, <script src="...">, <video>/<audio>
                 if name == "base" {
                     if let Some((_, href)) = attributes.iter().find(|(k, _)| k == "href") {
                         self.base_href = Some(href.clone());
@@ -450,8 +499,11 @@ impl ZeroCopyDomArena {
                     if let Some(parent_tag) = self.node_tag(current_parent) {
                         if parent_tag == "video" || parent_tag == "audio" {
                             if let Some((_, src)) = attributes.iter().find(|(k, _)| k == "src") {
-                                if let Some(last_media) =
-                                    self.media_elements.iter_mut().rev().find(|m| m.node_id == current_parent)
+                                if let Some(last_media) = self
+                                    .media_elements
+                                    .iter_mut()
+                                    .rev()
+                                    .find(|m| m.node_id == current_parent)
                                 {
                                     if last_media.src.is_empty() {
                                         last_media.src = src.clone();
@@ -687,7 +739,6 @@ impl ZeroCopyDomArena {
         if p >= self.nodes.len() || c >= self.nodes.len() || parent_id == child_id {
             return false;
         }
-        // Detach from old parent first if already attached
         let old_parent = self.nodes[c].parent;
         if old_parent != NO_NODE {
             let _ = self.remove_child(old_parent, child_id);
@@ -786,7 +837,6 @@ impl ZeroCopyDomArena {
             let _ = self.forms.set_value(node_id, value);
         }
 
-        // Rebuild element's attribute slice cleanly
         let key_sym = self.interner.intern(&attr_key);
         let val_span = self.alloc_span(value);
 
@@ -950,7 +1000,6 @@ impl ZeroCopyDomArena {
             .unwrap_or_default()
     }
 
-    /// Collects bubbling event path `[target, parent, ..., document]` for event dispatch.
     pub fn event_bubbling_path(&self, target_id: NodeId) -> Vec<NodeId> {
         let mut path = Vec::with_capacity(16);
         let mut cur = target_id;
@@ -1000,7 +1049,6 @@ impl ZeroCopyDomArena {
         self.forms.get_control(node_id)
     }
 
-    /// Searches DOM text nodes case-insensitively for Find-in-Page.
     pub fn find_text_matches(&self, query: &str) -> Vec<NodeId> {
         let q = query.trim().to_ascii_lowercase();
         if q.is_empty() {
@@ -1017,7 +1065,6 @@ impl ZeroCopyDomArena {
         matches
     }
 
-    /// Extracts clean readable article text for Reader Mode (skipping nav/footer/aside).
     pub fn extract_reader_text(&self) -> String {
         let mut out = String::with_capacity(1024);
         self.collect_reader_recursive(0, &mut out);
@@ -1072,7 +1119,6 @@ impl ZeroCopyDomArena {
         }
     }
 
-    /// Drops transient raw style/script sources and returns unused OS pages via `madvise`.
     pub fn release_transient_sources_and_compact(&mut self) {
         self.collected_styles.clear();
         self.collected_styles.shrink_to_fit();
@@ -1086,7 +1132,6 @@ impl ZeroCopyDomArena {
         self.text_slab.release_unused_pages();
     }
 
-    /// Fast O(1) arena reset and memory release when a tab is explicitly closed.
     pub fn clear_and_shrink(&mut self) {
         self.nodes.clear();
         self.nodes.shrink_to_fit();
@@ -1140,7 +1185,6 @@ impl ZeroCopyDomArena {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html_tokenizer::StreamingHtmlTokenizer;
 
     #[test]
     fn test_flat_dom_arena_memory_efficiency_and_implicit_closing() {
@@ -1159,5 +1203,10 @@ mod tests {
         assert!(dom.node_has_class(box_id, "active"));
         assert_eq!(dom.text_content(box_id), "Inside");
         assert!(!dom.find_text_matches("inside").is_empty());
+
+        // Real innerHTML fragment parsing
+        assert!(dom.parse_html_fragment_into(box_id, "<span id=\"dyn\">Dynamic</span>"));
+        let dyn_id = dom.find_by_id("dyn").unwrap();
+        assert_eq!(dom.text_content(dyn_id), "Dynamic");
     }
 }

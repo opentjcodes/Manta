@@ -372,7 +372,7 @@ impl StreamingNetworkPipe {
             };
 
             let mut raw_request = format!(
-                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Manta/3.0\r\nConnection: keep-alive\r\nAccept-Encoding: gzip, deflate\r\n",
+                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Manta/3.1\r\nConnection: keep-alive\r\nAccept-Encoding: gzip, deflate\r\n",
                 req.method, parsed.path_and_query, host_header
             );
             for (k, v) in &req.headers {
@@ -387,15 +387,13 @@ impl StreamingNetworkPipe {
 
             let mut attempt_pooled = true;
             let (response_meta, total_body_bytes, redirect_target) = loop {
-                let (mut stream, was_pooled) = if attempt_pooled {
-                    if let Some(s) = pool_take(&pool_key) {
-                        (s, true)
-                    } else {
-                        attempt_pooled = false;
-                        (open_fresh_transport(&parsed, &req, &initial_origin)?, false)
-                    }
+                let (mut stream, was_pooled) = match if attempt_pooled {
+                    pool_take(&pool_key)
                 } else {
-                    (open_fresh_transport(&parsed, &req, &initial_origin)?, false)
+                    None
+                } {
+                    Some(s) => (s, true),
+                    None => (open_fresh_transport(&parsed, &req, &initial_origin)?, false),
                 };
 
                 if stream.write_all(raw_request.as_bytes()).is_err() {
@@ -496,7 +494,10 @@ impl StreamingNetworkPipe {
                                 .filter(|v| v.contains("gzip") || v.contains("deflate"))
                                 .unwrap_or_default();
 
-                            if matches!(status, 204 | 304) || req.method == "HEAD" {
+                            if matches!(status, 204 | 304)
+                                || req.method == "HEAD"
+                                || expected_len == Some(0)
+                            {
                                 body_complete_clean = true;
                                 break;
                             }

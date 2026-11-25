@@ -6,6 +6,7 @@
 #if defined(__unix__) || defined(__linux__) || defined(__ANDROID__)
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #define MANTA_HAS_POSIX 1
 #else
@@ -406,6 +407,17 @@ bool match_seq(RegexCtx& ctx, size_t p_start, size_t p_end, size_t t_pos, size_t
 
 extern "C" {
 
+uint64_t manta_cpp_now_us(void) {
+#if MANTA_HAS_POSIX
+    struct timespec ts;
+    if (::clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL +
+               static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
+    }
+#endif
+    return 0ULL;
+}
+
 void manta_cpp_secure_zero(void* ptr, size_t len) {
     if (!ptr || len == 0) return;
     volatile uint8_t* p = static_cast<volatile uint8_t*>(ptr);
@@ -500,6 +512,95 @@ size_t manta_cpp_scan_html_delim(const uint8_t* data, size_t len, size_t start) 
         ++i;
     }
     return len;
+}
+
+int32_t manta_cpp_ascii_casecmp(const uint8_t* a, const uint8_t* b, size_t len) {
+    if (a == b || len == 0) return 1;
+    if (!a || !b) return 0;
+    for (size_t i = 0; i < len; ++i) {
+        if (ascii_lower(a[i]) != ascii_lower(b[i])) return 0;
+    }
+    return 1;
+}
+
+uint32_t manta_cpp_wrap_text_lines(const uint8_t* text, size_t len,
+                                   float char_w, float max_w,
+                                   uint32_t* out_starts, uint32_t* out_lens,
+                                   uint32_t max_lines) {
+    if (!text || len == 0 || !out_starts || !out_lens || max_lines == 0) return 0;
+    const float safe_cw = (char_w > 1.0f) ? char_w : 6.0f;
+    const float safe_mw = (max_w > safe_cw) ? max_w : safe_cw;
+    uint32_t max_chars = static_cast<uint32_t>(safe_mw / safe_cw);
+    if (max_chars < 4u) max_chars = 4u;
+
+    uint32_t line_count = 0;
+    size_t line_start = 0;
+    size_t last_space = 0;
+    bool has_space = false;
+    uint32_t cur_chars = 0;
+
+    for (size_t i = 0; i < len && line_count < max_lines; ++i) {
+        uint8_t b = text[i];
+        if (b == '\n') {
+            size_t end = i;
+            if (end > line_start && text[end - 1] == '\r') --end;
+            out_starts[line_count] = static_cast<uint32_t>(line_start);
+            out_lens[line_count] = static_cast<uint32_t>(end - line_start);
+            ++line_count;
+            line_start = i + 1;
+            has_space = false;
+            cur_chars = 0;
+            continue;
+        }
+        // Only count UTF-8 lead bytes (not continuation bytes 10xxxxxx)
+        if ((b & 0xC0u) == 0x80u) {
+            continue;
+        }
+        if (b == ' ' || b == '\t') {
+            last_space = i;
+            has_space = true;
+        }
+        if (cur_chars >= max_chars) {
+            if (has_space && last_space > line_start) {
+                out_starts[line_count] = static_cast<uint32_t>(line_start);
+                out_lens[line_count] = static_cast<uint32_t>(last_space - line_start);
+                ++line_count;
+                size_t next_start = last_space + 1;
+                while (next_start < len && (text[next_start] == ' ' || text[next_start] == '\t')) {
+                    ++next_start;
+                }
+                line_start = next_start;
+                has_space = false;
+                cur_chars = 0;
+                for (size_t k = line_start; k < i; ++k) {
+                    if ((text[k] & 0xC0u) != 0x80u) ++cur_chars;
+                }
+                if (i < line_start) {
+                    i = line_start - 1;
+                    continue;
+                }
+            } else {
+                out_starts[line_count] = static_cast<uint32_t>(line_start);
+                out_lens[line_count] = static_cast<uint32_t>(i - line_start);
+                ++line_count;
+                line_start = i;
+                has_space = false;
+                cur_chars = 0;
+            }
+        }
+        ++cur_chars;
+    }
+
+    if (line_count < max_lines && line_start < len) {
+        size_t end = len;
+        while (end > line_start && (text[end - 1] == '\r' || text[end - 1] == '\n')) --end;
+        if (end > line_start) {
+            out_starts[line_count] = static_cast<uint32_t>(line_start);
+            out_lens[line_count] = static_cast<uint32_t>(end - line_start);
+            ++line_count;
+        }
+    }
+    return line_count;
 }
 
 uint64_t manta_cpp_hash_bytes(const uint8_t* data, size_t len) {
@@ -735,6 +836,24 @@ double manta_cpp_f64_dot(const double* a, const double* b, size_t len) {
         total += a[i] * b[i];
     }
     return total;
+}
+
+double manta_cpp_f64_min(const double* arr, size_t len) {
+    if (!arr || len == 0) return 0.0;
+    double m = arr[0];
+    for (size_t i = 1; i < len; ++i) {
+        if (arr[i] < m) m = arr[i];
+    }
+    return m;
+}
+
+double manta_cpp_f64_max(const double* arr, size_t len) {
+    if (!arr || len == 0) return 0.0;
+    double m = arr[0];
+    for (size_t i = 1; i < len; ++i) {
+        if (arr[i] > m) m = arr[i];
+    }
+    return m;
 }
 
 void manta_cpp_f64_scale_add(double* dst, const double* src, size_t len, double scale, double bias) {

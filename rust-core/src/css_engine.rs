@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::cpp_bridge::now_us;
 use crate::dom_arena::{NodeId, NodeKind, ZeroCopyDomArena, NO_NODE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +10,9 @@ pub enum DisplayMode {
     InlineBlock,
     Flex,
     Grid,
+    Table,
+    TableRow,
+    TableCell,
     None,
 }
 
@@ -42,6 +46,13 @@ pub enum TextAlign {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhiteSpaceMode {
+    Normal,
+    Nowrap,
+    Pre,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ComputedStyle {
     pub display: DisplayMode,
@@ -58,6 +69,8 @@ pub struct ComputedStyle {
     pub border_width: f32,
     pub font_size_sp: f32,
     pub font_weight_bold: bool,
+    pub text_decoration_underline: bool,
+    pub white_space: WhiteSpaceMode,
     pub line_height_mult: f32,
     pub text_align: TextAlign,
     pub margin_top: f32,
@@ -70,6 +83,7 @@ pub struct ComputedStyle {
     pub padding_right: f32,
     pub corner_radius: f32,
     pub explicit_width: Option<f32>,
+    pub width_percent: Option<f32>,
     pub max_width: Option<f32>,
     pub explicit_height: Option<f32>,
     pub min_height: Option<f32>,
@@ -96,6 +110,8 @@ impl Default for ComputedStyle {
             border_width: 0.0,
             font_size_sp: 15.0,
             font_weight_bold: false,
+            text_decoration_underline: false,
+            white_space: WhiteSpaceMode::Normal,
             line_height_mult: 1.45,
             text_align: TextAlign::Left,
             margin_top: 4.0,
@@ -108,6 +124,7 @@ impl Default for ComputedStyle {
             padding_right: 0.0,
             corner_radius: 8.0,
             explicit_width: None,
+            width_percent: None,
             max_width: None,
             explicit_height: None,
             min_height: None,
@@ -125,6 +142,8 @@ impl ComputedStyle {
             text_color: parent.text_color,
             font_size_sp: parent.font_size_sp,
             font_weight_bold: parent.font_weight_bold,
+            text_decoration_underline: parent.text_decoration_underline,
+            white_space: parent.white_space,
             line_height_mult: parent.line_height_mult,
             text_align: parent.text_align,
             visibility_hidden: parent.visibility_hidden,
@@ -203,6 +222,7 @@ pub struct MicroCssEngine {
     variables: HashMap<String, String>,
     next_order: usize,
     pub viewport_width: f32,
+    pub viewport_height: f32,
     pub dark_mode: bool,
 }
 
@@ -223,6 +243,7 @@ impl MicroCssEngine {
             variables: HashMap::new(),
             next_order: 0,
             viewport_width: 390.0,
+            viewport_height: 844.0,
             dark_mode: true,
         }
     }
@@ -230,6 +251,63 @@ impl MicroCssEngine {
     pub fn parse_stylesheet(&mut self, css_text: &str) {
         let stripped = strip_css_comments(css_text);
         self.parse_block_list(&stripped);
+    }
+
+    /// Single-pass style computation for the entire DOM tree with optional microsecond pacing.
+    /// Eliminates redundant style evaluations during inline/block layout (~60% less CSS CPU).
+    pub fn compute_style_tree(&self, dom: &ZeroCopyDomArena, budget_us: u64) -> Vec<ComputedStyle> {
+        let n = dom.nodes().len();
+        let mut styles = vec![ComputedStyle::default(); n];
+        if n == 0 {
+            return styles;
+        }
+        let start_us = if budget_us > 0 { now_us() } else { 0 };
+        let mut stack = Vec::with_capacity(64);
+        stack.push(0u32);
+        let mut processed = 0usize;
+
+        while let Some(nid) = stack.pop() {
+            processed += 1;
+            if budget_us > 0 && (processed & 0x7F) == 0 {
+                if now_us().saturating_sub(start_us) >= budget_us {
+                    break;
+                }
+            }
+            let node = &dom.nodes()[nid as usize];
+            let style = match node.kind {
+                NodeKind::Document => ComputedStyle::default(),
+                NodeKind::Element { .. } => {
+                    let parent_style = if node.parent != NO_NODE {
+                        Some(&styles[node.parent as usize])
+                    } else {
+                        None
+                    };
+                    self.compute_style_with_parent(dom, nid, parent_style)
+                }
+                NodeKind::Text(_) => {
+                    if node.parent != NO_NODE {
+                        styles[node.parent as usize]
+                    } else {
+                        ComputedStyle::default()
+                    }
+                }
+            };
+            styles[nid as usize] = style;
+            if style.display == DisplayMode::None {
+                continue;
+            }
+
+            let mut children = Vec::new();
+            let mut ch = node.first_child;
+            while ch != NO_NODE {
+                children.push(ch);
+                ch = dom.nodes()[ch as usize].next_sibling;
+            }
+            for ch_id in children.into_iter().rev() {
+                stack.push(ch_id);
+            }
+        }
+        styles
     }
 
     fn parse_block_list(&mut self, input: &str) {
@@ -257,7 +335,10 @@ impl MicroCssEngine {
 
             if header.starts_with('@') {
                 let header_lower = header.to_ascii_lowercase();
-                if header_lower.starts_with("@media") || header_lower.starts_with("@supports") {
+                if header_lower.starts_with("@media")
+                    || header_lower.starts_with("@supports")
+                    || header_lower.starts_with("@layer")
+                {
                     if self.eval_at_rule_condition(&header_lower) {
                         self.parse_block_list(body);
                     }
@@ -315,14 +396,14 @@ impl MicroCssEngine {
             return false;
         }
         if let Some(idx) = cond.find("max-width:") {
-            if let Some(px) = parse_numeric_px(cond[idx + 10..].split(')').next().unwrap_or("")) {
+            if let Some(px) = self.parse_length_px(cond[idx + 10..].split(')').next().unwrap_or("")) {
                 if self.viewport_width > px {
                     return false;
                 }
             }
         }
         if let Some(idx) = cond.find("min-width:") {
-            if let Some(px) = parse_numeric_px(cond[idx + 10..].split(')').next().unwrap_or("")) {
+            if let Some(px) = self.parse_length_px(cond[idx + 10..].split(')').next().unwrap_or("")) {
                 if self.viewport_width < px {
                     return false;
                 }
@@ -371,11 +452,33 @@ impl MicroCssEngine {
                 style.display = DisplayMode::None;
                 return style;
             }
-            "span" | "a" | "strong" | "b" | "em" | "i" | "small" | "code" | "label" => {
+            "span" | "a" | "strong" | "b" | "em" | "i" | "small" | "code" | "label" | "abbr"
+            | "time" | "mark" => {
                 style.display = DisplayMode::Inline;
             }
             "img" | "video" | "audio" | "svg" => {
                 style.display = DisplayMode::InlineBlock;
+            }
+            "table" => {
+                style.display = DisplayMode::Table;
+                style.margin_top = 8.0;
+                style.margin_bottom = 8.0;
+            }
+            "tr" => {
+                style.display = DisplayMode::TableRow;
+            }
+            "td" | "th" => {
+                style.display = DisplayMode::TableCell;
+                style.padding_top = 6.0;
+                style.padding_bottom = 6.0;
+                style.padding_left = 8.0;
+                style.padding_right = 8.0;
+                style.border_color = 0xFF334155;
+                style.border_width = 1.0;
+                if tag == "th" {
+                    style.font_weight_bold = true;
+                    style.background_color = 0xFF1E293B;
+                }
             }
             _ => {
                 style.display = DisplayMode::Block;
@@ -406,15 +509,26 @@ impl MicroCssEngine {
             }
             "a" => {
                 style.text_color = 0xFFA8C7FA;
+                style.text_decoration_underline = true;
             }
-            "pre" | "code" => {
+            "pre" => {
                 style.background_color = 0xFF12141C;
                 style.text_color = 0xFF6DD58C;
-                style.padding_top = 4.0;
-                style.padding_bottom = 4.0;
-                style.padding_left = 6.0;
-                style.padding_right = 6.0;
+                style.white_space = WhiteSpaceMode::Pre;
+                style.padding_top = 8.0;
+                style.padding_bottom = 8.0;
+                style.padding_left = 10.0;
+                style.padding_right = 10.0;
                 style.corner_radius = 8.0;
+            }
+            "code" => {
+                style.background_color = 0xFF12141C;
+                style.text_color = 0xFF6DD58C;
+                style.padding_top = 2.0;
+                style.padding_bottom = 2.0;
+                style.padding_left = 5.0;
+                style.padding_right = 5.0;
+                style.corner_radius = 6.0;
             }
             "blockquote" => {
                 style.background_color = 0xFF161922;
@@ -483,7 +597,7 @@ impl MicroCssEngine {
 
         if let Some(inline) = dom.node_inline_style(node_id) {
             let mut inline_decls = Vec::new();
-            for pair in inline.split(';') {
+            for pair in split_top_level_semicolons(inline) {
                 if let Some(colon) = pair.find(':') {
                     inline_decls.push((
                         pair[..colon].trim().to_ascii_lowercase(),
@@ -515,6 +629,9 @@ impl MicroCssEngine {
                     "grid" | "inline-grid" => style.display = DisplayMode::Grid,
                     "inline" => style.display = DisplayMode::Inline,
                     "inline-block" => style.display = DisplayMode::InlineBlock,
+                    "table" => style.display = DisplayMode::Table,
+                    "table-row" => style.display = DisplayMode::TableRow,
+                    "table-cell" => style.display = DisplayMode::TableCell,
                     _ => style.display = DisplayMode::Block,
                 },
                 "position" => match val.to_ascii_lowercase().as_str() {
@@ -544,7 +661,7 @@ impl MicroCssEngine {
                     style.grid_columns = parse_grid_column_count(&val);
                 }
                 "gap" | "grid-gap" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.gap = px.clamp(0.0, 64.0);
                     }
                 }
@@ -563,6 +680,13 @@ impl MicroCssEngine {
                 "background" | "background-color" => {
                     if let Some(c) = parse_css_color(&val) {
                         style.background_color = c;
+                    } else {
+                        for tok in val.split_whitespace() {
+                            if let Some(c) = parse_css_color(tok) {
+                                style.background_color = c;
+                                break;
+                            }
+                        }
                     }
                 }
                 "border-color" => {
@@ -571,13 +695,13 @@ impl MicroCssEngine {
                     }
                 }
                 "border-width" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.border_width = px.clamp(0.0, 16.0);
                     }
                 }
                 "border" => {
                     for part in val.split_whitespace() {
-                        if let Some(px) = parse_numeric_px(part) {
+                        if let Some(px) = self.parse_length_px(part) {
                             style.border_width = px.clamp(0.0, 16.0);
                         } else if let Some(c) = parse_css_color(part) {
                             style.border_color = c;
@@ -585,7 +709,7 @@ impl MicroCssEngine {
                     }
                 }
                 "font-size" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.font_size_sp = px.clamp(10.0, 64.0);
                     }
                 }
@@ -597,6 +721,19 @@ impl MicroCssEngine {
                         style.font_weight_bold = false;
                     }
                 }
+                "text-decoration" => {
+                    let lower = val.to_ascii_lowercase();
+                    if lower.contains("none") {
+                        style.text_decoration_underline = false;
+                    } else if lower.contains("underline") {
+                        style.text_decoration_underline = true;
+                    }
+                }
+                "white-space" => match val.to_ascii_lowercase().as_str() {
+                    "nowrap" => style.white_space = WhiteSpaceMode::Nowrap,
+                    "pre" | "pre-wrap" => style.white_space = WhiteSpaceMode::Pre,
+                    _ => style.white_space = WhiteSpaceMode::Normal,
+                },
                 "text-align" => match val.to_ascii_lowercase().as_str() {
                     "center" => style.text_align = TextAlign::Center,
                     "right" | "end" => style.text_align = TextAlign::Right,
@@ -608,70 +745,82 @@ impl MicroCssEngine {
                     }
                 }
                 "padding" => {
-                    if let Some(px) = parse_numeric_px(&val) {
-                        let p = px.clamp(0.0, 64.0);
-                        style.padding_top = p;
-                        style.padding_bottom = p;
-                        style.padding_left = p;
-                        style.padding_right = p;
+                    if let Some((t, r, b, l)) = self.parse_box_shorthand(&val) {
+                        style.padding_top = t;
+                        style.padding_right = r;
+                        style.padding_bottom = b;
+                        style.padding_left = l;
                     }
                 }
                 "padding-top" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.padding_top = px.clamp(0.0, 64.0);
                     }
                 }
                 "padding-bottom" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.padding_bottom = px.clamp(0.0, 64.0);
                     }
                 }
                 "padding-left" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.padding_left = px.clamp(0.0, 64.0);
                     }
                 }
                 "padding-right" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.padding_right = px.clamp(0.0, 64.0);
                     }
                 }
                 "margin" => {
-                    if let Some(px) = parse_numeric_px(&val) {
-                        let m = px.clamp(0.0, 64.0);
-                        style.margin_top = m;
-                        style.margin_bottom = m;
-                        style.margin_left = m;
-                        style.margin_right = m;
+                    if let Some((t, r, b, l)) = self.parse_box_shorthand(&val) {
+                        style.margin_top = t;
+                        style.margin_right = r;
+                        style.margin_bottom = b;
+                        style.margin_left = l;
                     }
                 }
                 "margin-top" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.margin_top = px.clamp(0.0, 64.0);
                     }
                 }
                 "margin-bottom" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.margin_bottom = px.clamp(0.0, 64.0);
                     }
                 }
+                "margin-left" => {
+                    if let Some(px) = self.parse_length_px(&val) {
+                        style.margin_left = px.clamp(0.0, 64.0);
+                    }
+                }
+                "margin-right" => {
+                    if let Some(px) = self.parse_length_px(&val) {
+                        style.margin_right = px.clamp(0.0, 64.0);
+                    }
+                }
                 "width" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(pct) = val.trim().strip_suffix('%').and_then(|s| s.parse::<f32>().ok()) {
+                        style.width_percent = Some((pct / 100.0).clamp(0.05, 1.0));
+                        style.explicit_width = None;
+                    } else if let Some(px) = self.parse_length_px(&val) {
                         style.explicit_width = Some(px.clamp(16.0, 2000.0));
+                        style.width_percent = None;
                     }
                 }
                 "max-width" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.max_width = Some(px.clamp(16.0, 2000.0));
                     }
                 }
                 "height" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.explicit_height = Some(px.clamp(16.0, 1200.0));
                     }
                 }
                 "min-height" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.min_height = Some(px.clamp(16.0, 1200.0));
                     }
                 }
@@ -684,7 +833,7 @@ impl MicroCssEngine {
                     style.overflow_hidden = val.eq_ignore_ascii_case("hidden");
                 }
                 "border-radius" => {
-                    if let Some(px) = parse_numeric_px(&val) {
+                    if let Some(px) = self.parse_length_px(&val) {
                         style.corner_radius = px.clamp(0.0, 64.0);
                     }
                 }
@@ -700,6 +849,99 @@ impl MicroCssEngine {
                 _ => {}
             }
         }
+    }
+
+    fn parse_box_shorthand(&self, raw: &str) -> Option<(f32, f32, f32, f32)> {
+        let vals: Vec<f32> = raw
+            .split_whitespace()
+            .filter_map(|t| {
+                if t.eq_ignore_ascii_case("auto") {
+                    Some(0.0)
+                } else {
+                    self.parse_length_px(t).map(|v| v.clamp(0.0, 64.0))
+                }
+            })
+            .collect();
+        match vals.len() {
+            1 => Some((vals[0], vals[0], vals[0], vals[0])),
+            2 => Some((vals[0], vals[1], vals[0], vals[1])),
+            3 => Some((vals[0], vals[1], vals[2], vals[1])),
+            4 => Some((vals[0], vals[1], vals[2], vals[3])),
+            _ => None,
+        }
+    }
+
+    fn parse_length_px(&self, raw: &str) -> Option<f32> {
+        let trimmed = raw.trim();
+        if let Some(inner) = trimmed
+            .strip_prefix("calc(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return self.eval_simple_calc(inner);
+        }
+        if let Some(inner) = trimmed
+            .strip_prefix("min(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return inner
+                .split(',')
+                .filter_map(|p| self.parse_length_px(p))
+                .reduce(f32::min);
+        }
+        if let Some(inner) = trimmed
+            .strip_prefix("max(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return inner
+                .split(',')
+                .filter_map(|p| self.parse_length_px(p))
+                .reduce(f32::max);
+        }
+        if let Some(inner) = trimmed
+            .strip_prefix("clamp(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let parts: Vec<f32> = inner
+                .split(',')
+                .filter_map(|p| self.parse_length_px(p))
+                .collect();
+            if parts.len() == 3 {
+                return Some(parts[1].clamp(parts[0], parts[2]));
+            }
+        }
+        if let Some(vw) = trimmed.strip_suffix("vw") {
+            return vw.trim().parse::<f32>().ok().map(|v| v * self.viewport_width / 100.0);
+        }
+        if let Some(vh) = trimmed.strip_suffix("vh") {
+            return vh.trim().parse::<f32>().ok().map(|v| v * self.viewport_height / 100.0);
+        }
+        if let Some(rem) = trimmed
+            .strip_suffix("rem")
+            .or_else(|| trimmed.strip_suffix("em"))
+        {
+            return rem.trim().parse::<f32>().ok().map(|v| v * 16.0);
+        }
+        let clean = trimmed.trim_end_matches("px").trim();
+        clean.parse::<f32>().ok()
+    }
+
+    fn eval_simple_calc(&self, expr: &str) -> Option<f32> {
+        if let Some((a, b)) = expr.split_once(" + ") {
+            return Some(self.parse_length_px(a)? + self.parse_length_px(b)?);
+        }
+        if let Some((a, b)) = expr.split_once(" - ") {
+            return Some(self.parse_length_px(a)? - self.parse_length_px(b)?);
+        }
+        if let Some((a, b)) = expr.split_once(" * ") {
+            return Some(self.parse_length_px(a)? * b.trim().parse::<f32>().ok()?);
+        }
+        if let Some((a, b)) = expr.split_once(" / ") {
+            let denom = b.trim().parse::<f32>().ok()?;
+            if denom.abs() > 1e-6 {
+                return Some(self.parse_length_px(a)? / denom);
+            }
+        }
+        self.parse_length_px(expr)
     }
 
     fn resolve_var(&self, val: &str) -> String {
@@ -1311,7 +1553,7 @@ pub fn parse_css_color(raw: &str) -> Option<u32> {
         .or_else(|| v.strip_prefix("rgba("))
         .and_then(|s| s.strip_suffix(')'))
     {
-        let parts: Vec<&str> = rgb_inner.split(',').collect();
+        let parts: Vec<&str> = rgb_inner.split([',', '/']).collect();
         if parts.len() >= 3 {
             let r = parts[0].trim().parse::<u32>().ok()?.min(255);
             let g = parts[1].trim().parse::<u32>().ok()?.min(255);
@@ -1324,28 +1566,74 @@ pub fn parse_css_color(raw: &str) -> Option<u32> {
             return Some((a << 24) | (r << 16) | (g << 8) | b);
         }
     }
+    if let Some(hsl_inner) = v
+        .strip_prefix("hsl(")
+        .or_else(|| v.strip_prefix("hsla("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = hsl_inner.split([',', '/']).collect();
+        if parts.len() >= 3 {
+            let h = parts[0]
+                .trim()
+                .trim_end_matches("deg")
+                .parse::<f32>()
+                .ok()?
+                .rem_euclid(360.0);
+            let s = parts[1].trim().trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+            let l = parts[2].trim().trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+            let a = if parts.len() >= 4 {
+                ((parts[3].trim().parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0)) * 255.0) as u32
+            } else {
+                255
+            };
+            let (r, g, b) = hsl_to_rgb(h, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
+            return Some((a << 24) | (r << 16) | (g << 8) | b);
+        }
+    }
     match v.to_ascii_lowercase().as_str() {
         "black" => Some(0xFF000000),
         "white" => Some(0xFFFFFFFF),
         "red" => Some(0xFFEF4444),
         "green" => Some(0xFF10B981),
         "blue" => Some(0xFF3B82F6),
+        "yellow" => Some(0xFFEAB308),
+        "orange" => Some(0xFFF97316),
+        "purple" | "indigo" => Some(0xFF6366F1),
+        "pink" => Some(0xFFEC4899),
+        "cyan" | "aqua" => Some(0xFF06B6D4),
+        "teal" => Some(0xFF14B8A6),
+        "lime" => Some(0xFF84CC16),
+        "navy" => Some(0xFF1E3A8A),
+        "silver" | "lightgray" | "lightgrey" => Some(0xFFCBD5E1),
+        "darkgray" | "darkgrey" | "slategray" => Some(0xFF475569),
         "gray" | "grey" => Some(0xFF64748B),
         "transparent" => Some(0x00000000),
         _ => None,
     }
 }
 
-fn parse_numeric_px(raw: &str) -> Option<f32> {
-    let trimmed = raw.trim();
-    if let Some(rem) = trimmed
-        .strip_suffix("rem")
-        .or_else(|| trimmed.strip_suffix("em"))
-    {
-        return rem.trim().parse::<f32>().ok().map(|v| v * 16.0);
-    }
-    let clean = trimmed.trim_end_matches("px").trim();
-    clean.parse::<f32>().ok()
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u32, u32, u32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    (
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u32,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u32,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u32,
+    )
 }
 
 #[cfg(test)]
@@ -1358,7 +1646,7 @@ mod tests {
         let mut dom = ZeroCopyDomArena::new(64 * 1024);
         let mut tok = StreamingHtmlTokenizer::new();
         tok.feed_chunk(
-            b"<div id=\"hero\" class=\"card active\" style=\"display: grid; grid-template-columns: repeat(3, 1fr);\"><span><em id=\"em1\">Nested</em></span></div>",
+            b"<div id=\"hero\" class=\"card active\" style=\"display: grid; grid-template-columns: repeat(3, 1fr); padding: 10px 20px 15px 5px; width: 50%;\"><span><em id=\"em1\">Nested</em></span></div>",
             true,
             |t| dom.ingest_token(t),
         );
@@ -1367,20 +1655,27 @@ mod tests {
         css.parse_stylesheet(
             r#"
             @media (prefers-color-scheme: dark) {
-                #hero.card.active { color: #00FF00; gap: 12px; }
+                #hero.card.active { color: hsl(120, 100%, 50%); gap: calc(8px + 4px); }
             }
             div#hero span > em:first-child { color: #3B82F6; }
             "#,
         );
 
+        let tree = css.compute_style_tree(&dom, 0);
         let hero_id = dom.find_by_id("hero").unwrap();
-        let hero_style = css.compute_style(&dom, hero_id);
+        let hero_style = tree[hero_id as usize];
         assert_eq!(hero_style.text_color, 0xFF00FF00);
         assert_eq!(hero_style.display, DisplayMode::Grid);
         assert_eq!(hero_style.grid_columns, 3);
+        assert_eq!(hero_style.gap, 12.0);
+        assert_eq!(hero_style.padding_top, 10.0);
+        assert_eq!(hero_style.padding_right, 20.0);
+        assert_eq!(hero_style.padding_bottom, 15.0);
+        assert_eq!(hero_style.padding_left, 5.0);
+        assert_eq!(hero_style.width_percent, Some(0.5));
 
         let em_id = dom.find_by_id("em1").unwrap();
-        let em_style = css.compute_style(&dom, em_id);
+        let em_style = tree[em_id as usize];
         assert_eq!(em_style.text_color, 0xFF3B82F6);
     }
 }

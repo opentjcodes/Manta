@@ -4,13 +4,12 @@ use crate::storage_engine::MantaStorageEngine;
 /// **High-Level Custom Kernel Scripts Engine (`kernel_scripts.rs`)**:
 ///
 /// Injects lightweight `document-start` kernel hooks delivering:
-/// 1. **Zero Data Loss Persistence Kernel**: Write-through `localStorage`, volatile-only `sessionStorage`,
-///    `document.cookie`, `indexedDB`, and live form drafts (`MantaStorageEngine` encrypted WAL).
-/// 2. **CPU/GPU Saver & Background Tab Throttler**:
+/// 1. **Transparent File Persistence Kernel**: Write-through `localStorage`, volatile-only `sessionStorage`,
+///    `document.cookie`, `indexedDB`, and live form drafts saved directly to user device files.
+/// 2. **Fixed-Latency CPU/GPU Saver & Background Tab Throttler**:
 ///    - Coalesces and throttles `requestAnimationFrame` on hidden/background tabs (`document.hidden`)
 ///      so inactive tabs burn near-zero CPU & GPU battery.
 ///    - Promotes scroll-blocking touch/wheel listeners to `{ passive: true }` for lock-free scrolling.
-///    - Enables `content-visibility: auto` containment on large offscreen containers.
 ///    - Pre-warms DNS/TCP on link hover/touchstart.
 ///    - Tunes HTML5 `<video>` / `<audio>` buffer preload & low-latency MSE hints.
 pub struct MantaKernelScripts;
@@ -35,8 +34,8 @@ impl MantaKernelScripts {
 
         format!(
             r#"(function() {{
-    if (window.__mantaKernelV30) return;
-    window.__mantaKernelV30 = true;
+    if (window.__mantaKernelV31) return;
+    window.__mantaKernelV31 = true;
 
     const MANTA_LOCAL_INIT = {local_json};
     const MANTA_SESSION_INIT = {session_json};
@@ -44,7 +43,7 @@ impl MantaKernelScripts {
     const MANTA_IDB_INIT = {idb_json};
     const MANTA_FORM_DRAFTS = {drafts_json};
 
-    /* 1. TRANSACTIONAL STORAGE KERNEL */
+    /* 1. TRANSPARENT FILE-BACKED STORAGE KERNEL */
     try {{
         const origSetItem = Storage.prototype.setItem;
         const origRemoveItem = Storage.prototype.removeItem;
@@ -310,7 +309,6 @@ impl MantaKernelScripts {
 
     if ({layout_accel}) {{
         try {{
-            /* Throttle requestAnimationFrame on background tabs to cut CPU/GPU drain */
             if (typeof window.requestAnimationFrame === 'function') {{
                 const origRaf = window.requestAnimationFrame;
                 window.requestAnimationFrame = function(cb) {{
@@ -322,7 +320,6 @@ impl MantaKernelScripts {
                     return origRaf.call(window, cb);
                 }};
             }}
-            /* Fast low-latency video playback hints without permanent disk buffering */
             document.addEventListener('play', function(ev) {{
                 const media = ev.target;
                 if (media && (media.tagName === 'VIDEO' || media.tagName === 'AUDIO')) {{
@@ -388,7 +385,7 @@ mod tests {
         storage.set_local_storage(origin, "auth_token", "jwt_123");
         storage.set_session_storage(origin, "step", "2");
         storage.set_cookie_from_header(origin, "sid=xyz987; Path=/");
-        storage.db.put_object(origin, "todos", "1", "{\"task\":\"Ship Manta\"}");
+        storage.put_idb_object(origin, "todos", "1", "{\"task\":\"Ship Manta\"}");
         storage.save_form_draft(origin, "/checkout::input::email", "user@manta.dev");
 
         let kernel_js = MantaKernelScripts::compile_origin_kernel(origin, &storage, &settings);

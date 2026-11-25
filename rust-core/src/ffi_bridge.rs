@@ -27,10 +27,10 @@ fn rust_to_cstr(s: &str) -> *mut c_char {
 
 #[no_mangle]
 pub unsafe extern "C" fn manta_abi_init_engine(
-    storage_path: *const c_char,
+    storage_dir: *const c_char,
     download_dir: *const c_char,
 ) -> u32 {
-    let sp = unsafe { cstr_to_rust(storage_path) };
+    let sp = unsafe { cstr_to_rust(storage_dir) };
     let dd = unsafe { cstr_to_rust(download_dir) };
     let Ok(mut engine) = MantaEngine::global().lock() else {
         return 1;
@@ -121,8 +121,6 @@ pub unsafe extern "C" fn manta_abi_compile_kernel_script(origin_url: *const c_ch
     rust_to_cstr(&script)
 }
 
-/// Lock-free end-to-end site navigation: fetches HTML + external CSS/JS over Keep-Alive
-/// outside `MantaEngine::global().lock()`, then renders & returns the `DisplayListFrame`.
 #[no_mangle]
 pub unsafe extern "C" fn manta_abi_navigate_url(
     tab_id: u32,
@@ -418,13 +416,17 @@ pub unsafe extern "C" fn manta_abi_submit_form_bytes(
 ) -> *mut u8 {
     let Ok(engine) = MantaEngine::global().lock() else {
         if !out_len.is_null() {
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
         }
         return ptr::null_mut();
     };
     let Ok(sub) = engine.tabs.submit_form(tab_id, form_or_control_node_id) else {
         if !out_len.is_null() {
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
         }
         return ptr::null_mut();
     };
@@ -438,7 +440,9 @@ pub unsafe extern "C" fn manta_abi_submit_form_bytes(
     let ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
     if !out_len.is_null() {
-        unsafe { *out_len = len; }
+        unsafe {
+            *out_len = len;
+        }
     }
     ptr
 }
@@ -468,7 +472,13 @@ pub unsafe extern "C" fn manta_abi_get_form_draft(
     let Ok(engine) = MantaEngine::global().lock() else {
         return rust_to_cstr("");
     };
-    rust_to_cstr(engine.storage.get_form_draft(&orig, &fk).as_deref().unwrap_or(""))
+    rust_to_cstr(
+        engine
+            .storage
+            .get_form_draft(&orig, &fk)
+            .as_deref()
+            .unwrap_or(""),
+    )
 }
 
 #[no_mangle]
@@ -592,13 +602,34 @@ pub extern "C" fn manta_abi_set_ephemeral_mode(enabled: bool) -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn manta_abi_set_vault_passphrase(passphrase: *const c_char) -> bool {
-    let p = unsafe { cstr_to_rust(passphrase) };
-    let Ok(mut engine) = MantaEngine::global().lock() else {
-        return false;
+pub extern "C" fn manta_abi_get_storage_dir() -> *mut c_char {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
     };
-    engine.storage.set_vault_passphrase(&p);
-    true
+    rust_to_cstr(engine.storage.storage_dir().as_deref().unwrap_or(""))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_locate_origin_dir(origin_url: *const c_char) -> *mut c_char {
+    let orig = unsafe { cstr_to_rust(origin_url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
+    };
+    rust_to_cstr(
+        engine
+            .storage
+            .locate_origin_dir(&orig)
+            .as_deref()
+            .unwrap_or(""),
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn manta_abi_list_storage_files_json() -> *mut c_char {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("[]");
+    };
+    rust_to_cstr(&engine.storage.list_all_saved_files_json())
 }
 
 #[no_mangle]
@@ -712,8 +743,7 @@ pub unsafe extern "C" fn manta_abi_idb_get(
     rust_to_cstr(
         engine
             .storage
-            .db
-            .get_object(&orig, &store, &k)
+            .get_idb_object(&orig, &store, &k)
             .as_deref()
             .unwrap_or(""),
     )
@@ -808,6 +838,24 @@ pub unsafe extern "C" fn manta_abi_clear_origin_data(origin_url: *const c_char) 
         return false;
     };
     engine.storage.clear_origin(&orig)
+}
+
+#[no_mangle]
+pub extern "C" fn manta_abi_clear_history() -> bool {
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    engine.storage.clear_history();
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn manta_abi_clear_bookmarks() -> bool {
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    engine.storage.clear_bookmarks();
+    true
 }
 
 #[no_mangle]

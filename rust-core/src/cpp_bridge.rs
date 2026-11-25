@@ -10,11 +10,22 @@ pub struct MantaRingBuffer {
 }
 
 extern "C" {
+    fn manta_cpp_now_us() -> u64;
     fn manta_cpp_secure_zero(ptr: *mut c_void, len: usize);
     fn manta_cpp_arena_alloc(bytes: usize) -> *mut u8;
     fn manta_cpp_arena_release_pages(ptr: *mut u8, offset: usize, len: usize);
     fn manta_cpp_arena_free(ptr: *mut u8, bytes: usize);
     fn manta_cpp_scan_html_delim(data: *const u8, len: usize, start: usize) -> usize;
+    fn manta_cpp_ascii_casecmp(a: *const u8, b: *const u8, len: usize) -> i32;
+    fn manta_cpp_wrap_text_lines(
+        text: *const u8,
+        len: usize,
+        char_w: f32,
+        max_w: f32,
+        out_starts: *mut u32,
+        out_lens: *mut u32,
+        max_lines: u32,
+    ) -> u32;
     fn manta_cpp_hash_bytes(data: *const u8, len: usize) -> u64;
     fn manta_cpp_find_substr(
         hay: *const u8,
@@ -54,6 +65,8 @@ extern "C" {
     ) -> usize;
     fn manta_cpp_f64_sum(arr: *const f64, len: usize) -> f64;
     fn manta_cpp_f64_dot(a: *const f64, b: *const f64, len: usize) -> f64;
+    fn manta_cpp_f64_min(arr: *const f64, len: usize) -> f64;
+    fn manta_cpp_f64_max(arr: *const f64, len: usize) -> f64;
     fn manta_cpp_f64_scale_add(
         dst: *mut f64,
         src: *const f64,
@@ -99,6 +112,11 @@ extern "C" {
 }
 
 #[inline]
+pub fn now_us() -> u64 {
+    unsafe { manta_cpp_now_us() }
+}
+
+#[inline]
 pub fn secure_zero_slice(buf: &mut [u8]) {
     if !buf.is_empty() {
         unsafe {
@@ -124,6 +142,40 @@ pub fn scan_html_delim(bytes: &[u8], start: usize) -> usize {
         return bytes.len();
     }
     unsafe { manta_cpp_scan_html_delim(bytes.as_ptr(), bytes.len(), start) }
+}
+
+#[inline]
+pub fn ascii_casecmp(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    unsafe { manta_cpp_ascii_casecmp(a.as_ptr(), b.as_ptr(), a.len()) == 1 }
+}
+
+#[inline]
+pub fn wrap_text_lines(
+    text: &str,
+    char_w: f32,
+    max_w: f32,
+    out_starts: &mut [u32],
+    out_lens: &mut [u32],
+) -> usize {
+    let max_lines = out_starts.len().min(out_lens.len()).min(u32::MAX as usize) as u32;
+    if text.is_empty() || max_lines == 0 {
+        return 0;
+    }
+    let bytes = text.as_bytes();
+    unsafe {
+        manta_cpp_wrap_text_lines(
+            bytes.as_ptr(),
+            bytes.len(),
+            char_w,
+            max_w,
+            out_starts.as_mut_ptr(),
+            out_lens.as_mut_ptr(),
+            max_lines,
+        ) as usize
+    }
 }
 
 #[inline]
@@ -232,6 +284,22 @@ pub fn fast_f64_dot(a: &[f64], b: &[f64]) -> f64 {
         return 0.0;
     }
     unsafe { manta_cpp_f64_dot(a.as_ptr(), b.as_ptr(), n) }
+}
+
+#[inline]
+pub fn fast_f64_min(arr: &[f64]) -> f64 {
+    if arr.is_empty() {
+        return 0.0;
+    }
+    unsafe { manta_cpp_f64_min(arr.as_ptr(), arr.len()) }
+}
+
+#[inline]
+pub fn fast_f64_max(arr: &[f64]) -> f64 {
+    if arr.is_empty() {
+        return 0.0;
+    }
+    unsafe { manta_cpp_f64_max(arr.as_ptr(), arr.len()) }
 }
 
 #[inline]
@@ -540,9 +608,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cpp_simd_substr_regex_sort_base64_and_json_escape() {
+    fn test_cpp_simd_substr_regex_sort_wrap_and_clock() {
         let html = b"Hello world this is plain text with <div>tags</div> &amp; entities";
         assert_eq!(scan_html_delim(html, 0), 36);
+        assert!(ascii_casecmp("Content-Type", "content-type"));
+        assert!(!ascii_casecmp("Content-Type", "content-len"));
+        assert!(now_us() > 0);
+
+        // Zero-allocation C++ UTF-8 word wrapping
+        let sample = "Manta fixed-latency engine wraps UTF-8 text — cleanly across multiple lines!";
+        let mut starts = [0u32; 16];
+        let mut lens = [0u32; 16];
+        let n_lines = wrap_text_lines(sample, 8.0, 160.0, &mut starts, &mut lens);
+        assert!(n_lines >= 3);
+        for i in 0..n_lines {
+            let s = starts[i] as usize;
+            let e = s + lens[i] as usize;
+            assert!(sample.get(s..e).is_some());
+        }
+
         assert_eq!(
             find_substr("Manta high-velocity browser core", "velocity", 0),
             Some(11)
@@ -553,6 +637,8 @@ mod tests {
         );
         let nums = [1.5, 2.5, 3.0, 4.0, 5.0];
         assert!((fast_f64_sum(&nums) - 16.0).abs() < 1e-9);
+        assert!((fast_f64_min(&nums) - 1.5).abs() < 1e-9);
+        assert!((fast_f64_max(&nums) - 5.0).abs() < 1e-9);
         assert!((fast_f64_dot(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]) - 32.0).abs() < 1e-9);
 
         let mut unsorted = [9.0, -3.0, 42.0, 1.5, 0.0, 12.0, 7.0, 3.0, 8.0, 2.0, 5.0, 11.0, 6.0, 4.0, 10.0, -1.0, 20.0];

@@ -10,6 +10,9 @@ extern "C" {
 
 typedef struct MantaRingBuffer MantaRingBuffer;
 
+/* Monotonic microsecond clock for fixed-latency compute budget pacing */
+uint64_t manta_cpp_now_us(void);
+
 /* Compiler-proof volatile memory zeroing for keys, tokens, and shredded tabs */
 void     manta_cpp_secure_zero(void* ptr, size_t len);
 
@@ -18,8 +21,15 @@ void*    manta_cpp_arena_alloc(size_t bytes);
 void     manta_cpp_arena_release_pages(void* ptr, size_t offset, size_t len);
 void     manta_cpp_arena_free(void* ptr, size_t bytes);
 
-/* SIMD-accelerated HTML/XML delimiter scanner ('<' or '&') */
+/* SIMD-accelerated HTML/XML delimiter scanner ('<' or '&') & ASCII compare */
 size_t   manta_cpp_scan_html_delim(const uint8_t* data, size_t len, size_t start);
+int32_t  manta_cpp_ascii_casecmp(const uint8_t* a, const uint8_t* b, size_t len);
+
+/* Zero-allocation UTF-8-safe text word wrapper for ultra-fast layout */
+uint32_t manta_cpp_wrap_text_lines(const uint8_t* text, size_t len,
+                                   float char_w, float max_w,
+                                   uint32_t* out_starts, uint32_t* out_lens,
+                                   uint32_t max_lines);
 
 /* SIMD-accelerated substring, hashing, JSON escaping, Base64 & ReDoS-safe RegExp for JS VM */
 uint64_t manta_cpp_hash_bytes(const uint8_t* data, size_t len);
@@ -37,6 +47,8 @@ size_t   manta_cpp_json_escape(const uint8_t* src, size_t src_len, uint8_t* dst,
 /* Fast C++ Numeric Vector / Array Sort & SIMD Math for JS loops */
 double   manta_cpp_f64_sum(const double* arr, size_t len);
 double   manta_cpp_f64_dot(const double* a, const double* b, size_t len);
+double   manta_cpp_f64_min(const double* arr, size_t len);
+double   manta_cpp_f64_max(const double* arr, size_t len);
 void     manta_cpp_f64_scale_add(double* dst, const double* src, size_t len, double scale, double bias);
 void     manta_cpp_f64_sort(double* arr, size_t len);
 

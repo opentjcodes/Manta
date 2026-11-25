@@ -54,7 +54,15 @@ pub struct TabSandbox {
 }
 
 impl TabSandbox {
-    pub fn new(id: TabId, max_ram_bytes: usize, tick: u64) -> Self {
+    pub fn new(
+        id: TabId,
+        max_ram_bytes: usize,
+        js_max_fuel: u32,
+        js_time_budget_us: u64,
+        tick: u64,
+    ) -> Self {
+        let mut js_vm = MantaJsSandbox::new(js_max_fuel);
+        js_vm.set_time_budget_us(js_time_budget_us);
         Self {
             id,
             current_url: String::from("manta://start"),
@@ -67,7 +75,7 @@ impl TabSandbox {
             tokenizer: StreamingHtmlTokenizer::new(),
             dom: ZeroCopyDomArena::new(max_ram_bytes),
             css: MicroCssEngine::new(),
-            js_vm: MantaJsSandbox::new(1_000_000),
+            js_vm,
             cached_frame: None,
             cached_frame_gen: 0,
             cached_frame_scroll: -1,
@@ -116,10 +124,31 @@ pub struct TabManager {
     #[allow(dead_code)]
     global_ram_ceiling: usize,
     warm_background_limit: usize,
+    frame_layout_budget_us: u64,
+    js_max_fuel: u32,
+    js_time_budget_us: u64,
 }
 
 impl TabManager {
     pub fn new(per_tab_ram_ceiling: usize, global_ram_ceiling: usize) -> Self {
+        Self::new_with_budgets(
+            per_tab_ram_ceiling,
+            global_ram_ceiling,
+            2,
+            6_000,
+            500_000,
+            12_000,
+        )
+    }
+
+    pub fn new_with_budgets(
+        per_tab_ram_ceiling: usize,
+        global_ram_ceiling: usize,
+        warm_background_limit: usize,
+        frame_layout_budget_us: u64,
+        js_max_fuel: u32,
+        js_time_budget_us: u64,
+    ) -> Self {
         Self {
             tabs: HashMap::new(),
             active_tab_id: None,
@@ -127,7 +156,10 @@ impl TabManager {
             monotonic_tick: 1,
             per_tab_ram_ceiling,
             global_ram_ceiling,
-            warm_background_limit: 3,
+            warm_background_limit,
+            frame_layout_budget_us,
+            js_max_fuel,
+            js_time_budget_us,
         }
     }
 
@@ -160,7 +192,13 @@ impl TabManager {
                 prev_tab.cached_frame = None;
             }
         }
-        let sandbox = TabSandbox::new(id, self.per_tab_ram_ceiling, self.monotonic_tick);
+        let sandbox = TabSandbox::new(
+            id,
+            self.per_tab_ram_ceiling,
+            self.js_max_fuel,
+            self.js_time_budget_us,
+            self.monotonic_tick,
+        );
         self.tabs.insert(id, sandbox);
         self.active_tab_id = Some(id);
         id
@@ -243,7 +281,6 @@ impl TabManager {
             }
         }
 
-        // Pre-scan HTML for external <link rel="stylesheet"> and <script src="..."> URLs
         let mut temp_tok = StreamingHtmlTokenizer::new();
         let mut temp_dom = ZeroCopyDomArena::new(max_page_bytes);
         temp_tok.feed_chunk(&html_bytes, true, |t| temp_dom.ingest_token(t));
@@ -264,7 +301,7 @@ impl TabManager {
                 &resolved,
                 sub_hdrs,
                 modules,
-                1024 * 1024,
+                512 * 1024,
                 |c, _| css_buf.extend_from_slice(c),
             )
             .is_ok()
@@ -284,7 +321,7 @@ impl TabManager {
                 &resolved,
                 sub_hdrs,
                 modules,
-                1024 * 1024,
+                512 * 1024,
                 |c, _| js_buf.extend_from_slice(c),
             )
             .is_ok()
@@ -458,9 +495,11 @@ impl TabManager {
         scroll_y: f32,
         viewport_h: f32,
     ) -> Option<DisplayListFrame> {
+        let layout_budget = self.frame_layout_budget_us;
         let tab = self.tabs.get_mut(&tab_id)?;
         tab.scroll_y = scroll_y as i32;
         tab.css.viewport_width = viewport_w;
+        tab.css.viewport_height = viewport_h.max(240.0);
 
         let scroll_i = scroll_y as i32;
         if tab.cached_frame_gen == tab.dom.generation
@@ -472,8 +511,14 @@ impl TabManager {
             }
         }
 
-        let frame =
-            DisplayListFrame::build_culled(&tab.dom, &tab.css, viewport_w, scroll_y, viewport_h);
+        let frame = DisplayListFrame::build_paced(
+            &tab.dom,
+            &tab.css,
+            viewport_w,
+            scroll_y,
+            viewport_h,
+            layout_budget,
+        );
         tab.cached_frame = Some(frame.clone());
         tab.cached_frame_gen = tab.dom.generation;
         tab.cached_frame_scroll = scroll_i;
@@ -567,6 +612,7 @@ impl TabManager {
     ) -> Result<DisplayListFrame, &'static str> {
         self.monotonic_tick += 1;
         let tick = self.monotonic_tick;
+        let layout_budget = self.frame_layout_budget_us;
         let tab = self.tabs.get_mut(&tab_id).ok_or("Invalid TabId")?;
         tab.last_access_tick = tick;
         tab.is_hibernated = false;
@@ -598,7 +644,6 @@ impl TabManager {
             storage.record_history_visit(url, &tab.dom.page_title);
             storage.save_tab_session_state(tab_id, url, &tab.dom.page_title, tab.scroll_y);
 
-            // Auto-hydrate saved non-sensitive form drafts into native DOM inputs!
             let total_nodes = tab.dom.nodes().len() as u32;
             for nid in 0..total_nodes {
                 let draft_info = tab.dom.forms.get_control(nid).and_then(|ctrl| {
@@ -626,7 +671,6 @@ impl TabManager {
                 }
             }
 
-            // Parse external stylesheets first, then inline <style> blocks
             for ext_css in external_styles {
                 tab.css.parse_stylesheet(ext_css);
             }
@@ -636,7 +680,6 @@ impl TabManager {
             }
             drop(styles);
 
-            // Execute external scripts, then inline <script> blocks
             let mut temp_clipboard = ClipboardSandbox::new(64 * 1024);
             for ext_js in external_scripts {
                 let mut script = ext_js.clone();
@@ -669,7 +712,14 @@ impl TabManager {
             modules.dispatch_dom_ready(tab_id, url);
         }
 
-        let frame = DisplayListFrame::build(&tab.dom, &tab.css, 390.0);
+        let frame = DisplayListFrame::build_paced(
+            &tab.dom,
+            &tab.css,
+            390.0,
+            0.0,
+            f32::INFINITY,
+            layout_budget,
+        );
         if is_eof {
             let tab_ref = self.tabs.get_mut(&tab_id).unwrap();
             tab_ref.cached_frame = Some(frame.clone());

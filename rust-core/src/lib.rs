@@ -15,7 +15,6 @@ pub mod input_forms;
 pub mod jni_bridge;
 pub mod js_vm;
 pub mod kernel_scripts;
-pub mod manta_db;
 pub mod media_stream;
 pub mod module_bus;
 pub mod net_stream;
@@ -72,12 +71,10 @@ impl MantaEngine {
             config.per_origin_storage_quota_bytes,
             config.total_custom_storage_ceiling_bytes,
         );
-        storage.auto_commit_on_write = config.instant_storage_commit;
-        storage.wal_compact_threshold = config.wal_compact_threshold;
         storage.ephemeral_only = config.ephemeral_zero_trace_mode;
 
-        if !config.ephemeral_zero_trace_mode && !config.custom_storage_file_path.trim().is_empty() {
-            storage.set_backing_file(&config.custom_storage_file_path);
+        if !config.ephemeral_zero_trace_mode && !config.user_data_directory.trim().is_empty() {
+            storage.set_storage_dir(&config.user_data_directory);
             let _ = storage.load_from_backing_file();
         }
 
@@ -87,6 +84,15 @@ impl MantaEngine {
         );
         let media = MantaMediaManager::new(config.media_ring_buffer_bytes);
 
+        let tabs = TabManager::new_with_budgets(
+            per_tab_limit,
+            vault_limit,
+            config.warm_background_tab_count,
+            config.frame_layout_budget_us,
+            config.js_max_fuel_instructions,
+            config.js_time_budget_us,
+        );
+
         Self {
             config,
             vault: VolatileRamVault::new(vault_limit),
@@ -95,7 +101,7 @@ impl MantaEngine {
             media,
             isolation: SiteIsolationEngine::new(),
             controls: MantaControlsManager::new(),
-            tabs: TabManager::new(per_tab_limit, vault_limit),
+            tabs,
             modules,
             clipboard: ClipboardSandbox::new(256 * 1024),
             workers: MantaWorkerPool::new(0),
@@ -106,19 +112,19 @@ impl MantaEngine {
         ENGINE_INSTANCE.get_or_init(|| Mutex::new(MantaEngine::new(MantaConfig::default())))
     }
 
-    pub fn init_with_paths(&mut self, custom_storage_path: &str, download_dir: &str) -> u32 {
-        let resolved_storage_path = if !custom_storage_path.trim().is_empty() {
-            custom_storage_path.trim().to_string()
-        } else if !self.config.custom_storage_file_path.trim().is_empty() {
-            self.config.custom_storage_file_path.trim().to_string()
+    pub fn init_with_paths(&mut self, user_data_dir: &str, download_dir: &str) -> u32 {
+        let resolved_storage_dir = if !user_data_dir.trim().is_empty() {
+            user_data_dir.trim().to_string()
+        } else if !self.config.user_data_directory.trim().is_empty() {
+            self.config.user_data_directory.trim().to_string()
         } else {
-            String::from("./manta_vault.db")
+            String::from("./manta_user_data")
         };
 
-        self.config.custom_storage_file_path = resolved_storage_path;
+        self.config.user_data_directory = resolved_storage_dir;
         if !self.storage.ephemeral_only {
             self.storage
-                .set_backing_file(&self.config.custom_storage_file_path);
+                .set_storage_dir(&self.config.user_data_directory);
             let _ = self.storage.load_from_backing_file();
         }
 
@@ -145,14 +151,23 @@ impl MantaEngine {
     }
 
     pub fn memory_stats_json(&self) -> String {
+        let sdir = self
+            .storage
+            .storage_dir()
+            .unwrap_or_default()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         format!(
-            "{{\"tab_arena_bytes\":{},\"ram_vault_bytes\":{},\"storage_ram_bytes\":{},\"open_tabs\":{},\"compacted_tabs\":{},\"active_streams\":{}}}",
+            "{{\"tab_arena_bytes\":{},\"ram_vault_bytes\":{},\"storage_ram_bytes\":{},\"open_tabs\":{},\"compacted_tabs\":{},\"active_streams\":{},\"layout_budget_us\":{},\"js_budget_us\":{},\"storage_dir\":\"{}\"}}",
             self.tabs.total_allocated_bytes(),
             self.vault.used_bytes(),
             self.storage.used_bytes(),
             self.tabs.open_tab_count(),
             self.tabs.compacted_tab_count(),
-            self.media.active_stream_count()
+            self.media.active_stream_count(),
+            self.config.frame_layout_budget_us,
+            self.config.js_time_budget_us,
+            sdir
         )
     }
 
@@ -172,14 +187,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_full_manta_v30_engine_tiered_active_tabs_encrypted_wal_and_media() {
-        let test_db = "./test_manta_v30_vault.db";
-        let _ = std::fs::remove_file(test_db);
-        let _ = std::fs::remove_file(format!("{}.wal", test_db));
-        let _ = std::fs::remove_file(format!("{}.key", test_db));
+    fn test_full_manta_v31_engine_tiered_tabs_paced_render_and_device_files() {
+        let test_dir = "./test_manta_v31_user_data";
+        let _ = std::fs::remove_dir_all(test_dir);
 
         let mut cfg = MantaConfig::default();
-        cfg.custom_storage_file_path = String::from(test_db);
+        cfg.user_data_directory = String::from(test_dir);
         let mut engine = MantaEngine::new(cfg);
 
         let mut tab_ids = Vec::new();
@@ -206,7 +219,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(engine.tabs.compacted_tab_count() >= 15);
+        assert!(engine.tabs.compacted_tab_count() >= 17);
         for (i, &tid) in tab_ids.iter().enumerate() {
             assert!(engine.tabs.switch_to_tab(tid, &mut engine.vault));
             let t = engine.tabs.get_tab(tid).unwrap();
@@ -242,8 +255,9 @@ mod tests {
             Some("sv_0".to_string())
         );
 
+        // Restart engine from the user device folder and verify full transparent read-back
         let mut cfg2 = MantaConfig::default();
-        cfg2.custom_storage_file_path = String::from(test_db);
+        cfg2.user_data_directory = String::from(test_dir);
         let mut restored_engine = MantaEngine::new(cfg2);
         assert_eq!(
             restored_engine
@@ -264,7 +278,7 @@ mod tests {
             Some("persisted_user_data".to_string())
         );
 
-        // Native form draft auto-hydration on fresh page load!
+        // Native form draft auto-hydration on fresh page load
         let restored_tab = restored_engine.tabs.create_tab();
         let form_html = b"<form><input id=\"field\" name=\"field\" type=\"text\" /></form>";
         {
@@ -304,5 +318,6 @@ mod tests {
 
         restored_engine.clear_all_custom_storage_and_ram();
         assert_eq!(restored_engine.storage.used_bytes(), 0);
+        assert!(!std::path::Path::new(test_dir).exists());
     }
 }

@@ -1,18 +1,9 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use crate::cpp_bridge::{fast_compress, fast_decompress, secure_zero_slice};
-use crate::crypto_vault::{
-    generate_nonce_12, generate_volatile_entropy_32, open_record, pbkdf2_hmac_sha256, seal_record,
-};
-use crate::manta_db::{DbValue, MantaDatabaseEngine, RelationalTable, VirtualFileEntry};
 use crate::site_isolation::OriginKey;
-
-const STORAGE_MAGIC_V2: &[u8; 8] = b"MANTADB2";
-const STORAGE_MAGIC_V3: &[u8; 8] = b"MANTADB3";
-const STORAGE_MAGIC_V4: &[u8; 8] = b"MANTADB4";
-const WAL_RECORD_MAGIC: &[u8; 4] = b"MWAL";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCookie {
@@ -31,6 +22,9 @@ pub struct OriginStorageBucket {
     pub session_storage: HashMap<String, String>,
     pub cookies: HashMap<String, StoredCookie>,
     pub form_drafts: HashMap<String, String>,
+    pub object_stores: HashMap<String, HashMap<String, String>>,
+    /// Maps sanitized virtual path -> (mime_type, byte_len, optional in-RAM fallback when ephemeral/no disk dir)
+    pub saved_files_meta: HashMap<String, (String, usize, Option<Vec<u8>>)>,
     pub used_bytes: usize,
 }
 
@@ -55,82 +49,36 @@ pub struct SavedTabSession {
     pub scroll_y: i32,
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalOp {
-    SetLocal = 1,
-    RemoveLocal = 2,
-    ClearLocal = 3,
-    SaveFormDraft = 4,
-    SetCookie = 5,
-    RecordHistory = 6,
-    ClearHistory = 7,
-    ToggleBookmark = 8,
-    IdbPut = 9,
-    IdbDelete = 10,
-    VfsSave = 11,
-    ClearOrigin = 12,
-    DbCreateTable = 13,
-    DbInsertRow = 14,
-    DbDropTable = 15,
-    SaveTabSession = 16,
-    RemoveTabSession = 17,
-}
-
-impl WalOp {
-    fn from_u8(b: u8) -> Option<Self> {
-        match b {
-            1 => Some(WalOp::SetLocal),
-            2 => Some(WalOp::RemoveLocal),
-            3 => Some(WalOp::ClearLocal),
-            4 => Some(WalOp::SaveFormDraft),
-            5 => Some(WalOp::SetCookie),
-            6 => Some(WalOp::RecordHistory),
-            7 => Some(WalOp::ClearHistory),
-            8 => Some(WalOp::ToggleBookmark),
-            9 => Some(WalOp::IdbPut),
-            10 => Some(WalOp::IdbDelete),
-            11 => Some(WalOp::VfsSave),
-            12 => Some(WalOp::ClearOrigin),
-            13 => Some(WalOp::DbCreateTable),
-            14 => Some(WalOp::DbInsertRow),
-            15 => Some(WalOp::DbDropTable),
-            16 => Some(WalOp::SaveTabSession),
-            17 => Some(WalOp::RemoveTabSession),
-            _ => None,
-        }
-    }
-}
-
-/// **Manta Encrypted Append-Only WAL + Site/Session Vault (`storage_engine.rs`)**:
-/// - Encrypted `MANTADB4` + append-only `.wal` (`ChaCha20 + HMAC-SHA256`).
-/// - Persists `localStorage`, `cookies`, `form_drafts`, `bookmarks`, `history`, `IndexedDB`,
-///   `MantaDB` relational SQL tables, `OPFS` virtual files, **open tab sessions**, and **offline page snapshots**.
-/// - `sessionStorage` stays strictly in volatile RAM and is NEVER persisted to disk.
+/// **Transparent User-Accessible Device File Storage (`storage_engine.rs`)**:
+///
+/// Replaces hidden binary databases with clean, inspectable, 100%-deletable standard files
+/// directly in the user's device storage folder (`<storage_dir>/`):
+/// - `manta_index.json`                       (manifest + exact file paths)
+/// - `bookmarks.json`                         (user bookmarks)
+/// - `history.json`                           (browsing history)
+/// - `tabs_session.json`                      (active tabs & scroll positions)
+/// - `offline_pages/<slug>.html`              (readable offline HTML pages)
+/// - `sites/<origin_slug>/meta.json`          (exact origin URL)
+/// - `sites/<origin_slug>/local_storage.json`
+/// - `sites/<origin_slug>/cookies.json`
+/// - `sites/<origin_slug>/form_drafts.json`
+/// - `sites/<origin_slug>/indexeddb/<store>.json`
+/// - `sites/<origin_slug>/files/<path>`       (lazy read from disk = ~0 RAM overhead)
+///
+/// `sessionStorage` remains strictly in volatile RAM and is NEVER written to disk.
 pub struct MantaStorageEngine {
     origins: HashMap<String, OriginStorageBucket>,
     bookmarks: Vec<BookmarkEntry>,
     history: Vec<HistoryVisitEntry>,
     saved_tabs: HashMap<u32, SavedTabSession>,
-    pub db: MantaDatabaseEngine,
+    offline_mem_fallback: HashMap<String, Vec<u8>>,
     per_origin_quota_bytes: usize,
     total_ceiling_bytes: usize,
-    kv_cookie_used_bytes: usize,
-    backing_file_path: Option<String>,
-    wal_file_path: Option<String>,
-    key_file_path: Option<String>,
-    vault_key: [u8; 32],
-    nonce_counter: u64,
-    wal_pending_ops: usize,
-    pub wal_compact_threshold: usize,
+    total_used_bytes: usize,
+    storage_dir_path: Option<PathBuf>,
+    suppress_disk_write: bool,
     pub auto_commit_on_write: bool,
     pub ephemeral_only: bool,
-}
-
-impl Drop for MantaStorageEngine {
-    fn drop(&mut self) {
-        secure_zero_slice(&mut self.vault_key);
-    }
 }
 
 impl MantaStorageEngine {
@@ -140,178 +88,378 @@ impl MantaStorageEngine {
             bookmarks: Vec::new(),
             history: Vec::new(),
             saved_tabs: HashMap::new(),
-            db: MantaDatabaseEngine::new(per_origin_quota_bytes, total_ceiling_bytes),
+            offline_mem_fallback: HashMap::new(),
             per_origin_quota_bytes,
             total_ceiling_bytes,
-            kv_cookie_used_bytes: 0,
-            backing_file_path: None,
-            wal_file_path: None,
-            key_file_path: None,
-            vault_key: generate_volatile_entropy_32(),
-            nonce_counter: 1,
-            wal_pending_ops: 0,
-            wal_compact_threshold: 64,
+            total_used_bytes: 0,
+            storage_dir_path: None,
+            suppress_disk_write: false,
             auto_commit_on_write: true,
             ephemeral_only: false,
         }
     }
 
-    pub fn set_backing_file(&mut self, path: &str) {
+    /// Configures the user-accessible device folder where all browsing files live.
+    /// If a legacy `.db` file path is passed, converts it cleanly into a folder sibling.
+    pub fn set_storage_dir(&mut self, path: &str) {
         let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            self.backing_file_path = Some(trimmed.to_string());
-            self.wal_file_path = Some(format!("{}.wal", trimmed));
-            self.key_file_path = Some(format!("{}.key", trimmed));
-            self.ensure_or_load_key_file();
+        if trimmed.is_empty() {
+            return;
         }
+        let dir_path = if trimmed.ends_with(".db") {
+            PathBuf::from(trimmed.trim_end_matches(".db"))
+        } else {
+            PathBuf::from(trimmed)
+        };
+        if !self.ephemeral_only {
+            let _ = ensure_dir_readable(&dir_path);
+        }
+        self.storage_dir_path = Some(dir_path);
     }
 
-    pub fn backing_file(&self) -> Option<&str> {
-        self.backing_file_path.as_deref()
+    pub fn set_backing_file(&mut self, path: &str) {
+        self.set_storage_dir(path);
+    }
+
+    pub fn storage_dir(&self) -> Option<String> {
+        self.storage_dir_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    pub fn locate_origin_dir(&self, origin_url: &str) -> Option<String> {
+        let root = self.storage_dir_path.as_ref()?;
+        let origin = OriginKey::from_url(origin_url);
+        if origin.is_opaque {
+            return None;
+        }
+        let slug = origin_to_folder_slug(&origin.serialize());
+        Some(root.join("sites").join(slug).to_string_lossy().into_owned())
     }
 
     pub fn set_ephemeral_mode(&mut self, enabled: bool) {
         self.ephemeral_only = enabled;
     }
 
-    pub fn set_vault_passphrase(&mut self, passphrase: &str) {
-        let salt = b"MantaVaultV4::PBKDF2::Salt::2026";
-        self.vault_key = pbkdf2_hmac_sha256(passphrase.as_bytes(), salt, 10_000);
-    }
-
-    fn ensure_or_load_key_file(&mut self) {
-        if self.ephemeral_only {
-            return;
-        }
-        let Some(ref kpath) = self.key_file_path else {
-            return;
-        };
-        if let Ok(mut f) = fs::File::open(kpath) {
-            let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_ok() && buf.len() == 32 {
-                self.vault_key.copy_from_slice(&buf);
-                secure_zero_slice(&mut buf);
-                return;
-            }
-            secure_zero_slice(&mut buf);
-        }
-        if let Ok(mut f) = fs::File::create(kpath) {
-            let _ = f.write_all(&self.vault_key);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(kpath, fs::Permissions::from_mode(0o600));
-            }
-        }
-    }
-
     #[inline]
     pub fn used_bytes(&self) -> usize {
-        self.kv_cookie_used_bytes + self.db.total_used_bytes
+        self.total_used_bytes
     }
 
     #[inline]
     pub fn origin_count(&self) -> usize {
-        let mut all_origins: Vec<&String> = self.origins.keys().collect();
-        for k in self.db.partitions.keys() {
-            if !all_origins.contains(&k) {
-                all_origins.push(k);
-            }
-        }
-        all_origins.len()
+        self.origins.len()
     }
 
-    fn append_wal_op(&mut self, op: WalOp, fields: &[&[u8]]) {
-        if self.ephemeral_only || !self.auto_commit_on_write || self.wal_file_path.is_none() {
+    fn site_dir(&self, serialized_origin: &str) -> Option<PathBuf> {
+        if self.ephemeral_only || self.suppress_disk_write {
+            return None;
+        }
+        let root = self.storage_dir_path.as_ref()?;
+        Some(root.join("sites").join(origin_to_folder_slug(serialized_origin)))
+    }
+
+    fn site_dir_readonly(&self, serialized_origin: &str) -> Option<PathBuf> {
+        let root = self.storage_dir_path.as_ref()?;
+        Some(root.join("sites").join(origin_to_folder_slug(serialized_origin)))
+    }
+
+    fn persist_origin_meta(&self, serialized_origin: &str) {
+        if let Some(dir) = self.site_dir(serialized_origin) {
+            let meta_path = dir.join("meta.json");
+            if !meta_path.exists() {
+                let json = format!("{{\"origin\":\"{}\"}}\n", escape_json_str(serialized_origin));
+                let _ = atomic_write_file(&meta_path, json.as_bytes());
+            }
+        }
+    }
+
+    fn persist_origin_local_storage(&self, serialized_origin: &str) {
+        let Some(dir) = self.site_dir(serialized_origin) else {
+            return;
+        };
+        let path = dir.join("local_storage.json");
+        if let Some(bucket) = self.origins.get(serialized_origin) {
+            if bucket.local_storage.is_empty() {
+                let _ = fs::remove_file(&path);
+            } else {
+                self.persist_origin_meta(serialized_origin);
+                let json = map_to_pretty_json(&bucket.local_storage);
+                let _ = atomic_write_file(&path, json.as_bytes());
+            }
+        }
+        self.write_index_manifest();
+    }
+
+    fn persist_origin_form_drafts(&self, serialized_origin: &str) {
+        let Some(dir) = self.site_dir(serialized_origin) else {
+            return;
+        };
+        let path = dir.join("form_drafts.json");
+        if let Some(bucket) = self.origins.get(serialized_origin) {
+            if bucket.form_drafts.is_empty() {
+                let _ = fs::remove_file(&path);
+            } else {
+                self.persist_origin_meta(serialized_origin);
+                let json = map_to_pretty_json(&bucket.form_drafts);
+                let _ = atomic_write_file(&path, json.as_bytes());
+            }
+        }
+        self.write_index_manifest();
+    }
+
+    fn persist_origin_cookies(&self, serialized_origin: &str) {
+        let Some(dir) = self.site_dir(serialized_origin) else {
+            return;
+        };
+        let path = dir.join("cookies.json");
+        if let Some(bucket) = self.origins.get(serialized_origin) {
+            if bucket.cookies.is_empty() {
+                let _ = fs::remove_file(&path);
+            } else {
+                self.persist_origin_meta(serialized_origin);
+                let mut cookies: Vec<&StoredCookie> = bucket.cookies.values().collect();
+                cookies.sort_by(|a, b| a.name.cmp(&b.name));
+                let mut out = String::from("[\n");
+                for (idx, c) in cookies.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&format!(
+                        "  {{\"name\":\"{}\",\"value\":\"{}\",\"domain\":\"{}\",\"path\":\"{}\",\"secure\":{},\"http_only\":{},\"same_site\":\"{}\"}}",
+                        escape_json_str(&c.name),
+                        escape_json_str(&c.value),
+                        escape_json_str(&c.domain),
+                        escape_json_str(&c.path),
+                        c.secure,
+                        c.http_only,
+                        escape_json_str(&c.same_site)
+                    ));
+                }
+                out.push_str("\n]\n");
+                let _ = atomic_write_file(&path, out.as_bytes());
+            }
+        }
+        self.write_index_manifest();
+    }
+
+    fn persist_origin_idb_store(&self, serialized_origin: &str, store_name: &str) {
+        let Some(dir) = self.site_dir(serialized_origin) else {
+            return;
+        };
+        let idb_dir = dir.join("indexeddb");
+        let file_path = idb_dir.join(format!("{}.json", safe_file_slug(store_name)));
+        if let Some(bucket) = self.origins.get(serialized_origin) {
+            if let Some(store) = bucket.object_stores.get(store_name) {
+                if store.is_empty() {
+                    let _ = fs::remove_file(&file_path);
+                } else {
+                    self.persist_origin_meta(serialized_origin);
+                    let json = map_to_pretty_json(store);
+                    let _ = atomic_write_file(&file_path, json.as_bytes());
+                }
+            } else {
+                let _ = fs::remove_file(&file_path);
+            }
+        }
+        self.write_index_manifest();
+    }
+
+    fn persist_bookmarks(&self) {
+        if self.ephemeral_only || self.suppress_disk_write {
             return;
         }
-
-        let mut plain = Vec::with_capacity(64);
-        plain.push(op as u8);
-        write_u32(&mut plain, fields.len() as u32);
-        for field in fields {
-            write_bytes(&mut plain, field);
-        }
-
-        self.nonce_counter = self.nonce_counter.wrapping_add(1);
-        let nonce = generate_nonce_12(self.nonce_counter);
-        let sealed = seal_record(&self.vault_key, &nonce, WAL_RECORD_MAGIC, &plain);
-        secure_zero_slice(&mut plain);
-
-        if let Some(ref wpath) = self.wal_file_path {
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(wpath) {
-                let mut frame = Vec::with_capacity(8 + sealed.len());
-                frame.extend_from_slice(WAL_RECORD_MAGIC);
-                write_u32(&mut frame, sealed.len() as u32);
-                frame.extend_from_slice(&sealed);
-                let _ = file.write_all(&frame);
-                let _ = file.flush();
+        let Some(ref root) = self.storage_dir_path else {
+            return;
+        };
+        let path = root.join("bookmarks.json");
+        if self.bookmarks.is_empty() {
+            let _ = fs::remove_file(&path);
+        } else {
+            let mut out = String::from("[\n");
+            for (i, b) in self.bookmarks.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                out.push_str(&format!(
+                    "  {{\"url\":\"{}\",\"title\":\"{}\"}}",
+                    escape_json_str(&b.url),
+                    escape_json_str(&b.title)
+                ));
             }
+            out.push_str("\n]\n");
+            let _ = atomic_write_file(&path, out.as_bytes());
         }
-
-        self.wal_pending_ops += 1;
-        if self.wal_pending_ops >= self.wal_compact_threshold.max(8) {
-            let _ = self.save_to_backing_file();
-        }
+        self.write_index_manifest();
     }
 
-    // =========================================================================
-    // TRANSACTIONAL RELATIONAL TABLES (MantaDB + WAL)
-    // =========================================================================
-
-    pub fn db_create_table(
-        &mut self,
-        origin_url: &str,
-        table_name: &str,
-        columns: Vec<String>,
-    ) -> bool {
-        let ok = self.db.create_table(origin_url, table_name, columns.clone());
-        if ok {
-            let mut cols_buf = Vec::new();
-            write_u32(&mut cols_buf, columns.len() as u32);
-            for col in &columns {
-                write_str(&mut cols_buf, col);
+    fn persist_history(&self) {
+        if self.ephemeral_only || self.suppress_disk_write {
+            return;
+        }
+        let Some(ref root) = self.storage_dir_path else {
+            return;
+        };
+        let path = root.join("history.json");
+        if self.history.is_empty() {
+            let _ = fs::remove_file(&path);
+        } else {
+            let mut out = String::from("[\n");
+            for (i, h) in self.history.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                out.push_str(&format!(
+                    "  {{\"url\":\"{}\",\"title\":\"{}\",\"visit_count\":{}}}",
+                    escape_json_str(&h.url),
+                    escape_json_str(&h.title),
+                    h.visit_count
+                ));
             }
-            self.append_wal_op(
-                WalOp::DbCreateTable,
-                &[origin_url.as_bytes(), table_name.as_bytes(), &cols_buf],
-            );
+            out.push_str("\n]\n");
+            let _ = atomic_write_file(&path, out.as_bytes());
         }
-        ok
+        self.write_index_manifest();
     }
 
-    pub fn db_insert_row(
-        &mut self,
-        origin_url: &str,
-        table_name: &str,
-        values: Vec<DbValue>,
-    ) -> Option<u64> {
-        let rowid = self.db.insert_row(origin_url, table_name, values.clone())?;
-        let mut row_buf = Vec::new();
-        write_u32(&mut row_buf, values.len() as u32);
-        for v in &values {
-            write_db_value(&mut row_buf, v);
+    fn persist_tabs_session(&self) {
+        if self.ephemeral_only || self.suppress_disk_write {
+            return;
         }
-        self.append_wal_op(
-            WalOp::DbInsertRow,
-            &[origin_url.as_bytes(), table_name.as_bytes(), &row_buf],
-        );
-        Some(rowid)
+        let Some(ref root) = self.storage_dir_path else {
+            return;
+        };
+        let path = root.join("tabs_session.json");
+        if self.saved_tabs.is_empty() {
+            let _ = fs::remove_file(&path);
+        } else {
+            let json = format!("{}\n", self.export_saved_tabs_json());
+            let _ = atomic_write_file(&path, json.as_bytes());
+        }
     }
 
-    pub fn db_drop_table(&mut self, origin_url: &str, table_name: &str) -> bool {
-        let ok = self.db.drop_table(origin_url, table_name);
-        if ok {
-            self.append_wal_op(
-                WalOp::DbDropTable,
-                &[origin_url.as_bytes(), table_name.as_bytes()],
-            );
+    fn write_index_manifest(&self) {
+        if self.ephemeral_only || self.suppress_disk_write {
+            return;
         }
-        ok
+        let Some(ref root) = self.storage_dir_path else {
+            return;
+        };
+        let index_path = root.join("manta_index.json");
+        let manifest = self.inspect_storage_manifest_json();
+        let _ = atomic_write_file(&index_path, manifest.as_bytes());
     }
 
     // =========================================================================
-    // OPEN TAB SESSIONS & ENCRYPTED OFFLINE PAGE SNAPSHOTS (ZERO GHOST CACHE)
+    // TRANSPARENT FILE DISCOVERY & MANIFEST INSPECTION
+    // =========================================================================
+
+    /// Lists every real file currently stored inside Manta's user device storage directory.
+    pub fn list_all_saved_files_json(&self) -> String {
+        let Some(ref root) = self.storage_dir_path else {
+            return "[]".to_string();
+        };
+        let mut files = Vec::new();
+        collect_files_recursive(root, root, &mut files);
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut out = String::from("[");
+        for (i, (rel, abs, bytes)) in files.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let category = if rel.starts_with("sites/") {
+                "site_data"
+            } else if rel.starts_with("offline_pages/") {
+                "offline_page"
+            } else if rel == "history.json" {
+                "history"
+            } else if rel == "bookmarks.json" {
+                "bookmarks"
+            } else if rel == "tabs_session.json" {
+                "tabs_session"
+            } else {
+                "manifest"
+            };
+            out.push_str(&format!(
+                "{{\"relative_path\":\"{}\",\"full_path\":\"{}\",\"bytes\":{},\"category\":\"{}\"}}",
+                escape_json_str(rel),
+                escape_json_str(abs),
+                bytes,
+                category
+            ));
+        }
+        out.push(']');
+        out
+    }
+
+    pub fn inspect_storage_manifest_json(&self) -> String {
+        let mut out = String::from("{");
+        out.push_str(&format!(
+            "\"storage_mode\":\"transparent_device_files\",\"storage_dir\":\"{}\",\"total_bytes\":{},\"ephemeral_only\":{},\"saved_tabs_count\":{},\"bookmarks_count\":{},\"history_count\":{},\"origins\":[",
+            escape_json_str(self.storage_dir().as_deref().unwrap_or("")),
+            self.used_bytes(),
+            self.ephemeral_only,
+            self.saved_tabs.len(),
+            self.bookmarks.len(),
+            self.history.len()
+        ));
+
+        let mut all_origin_keys: Vec<String> = self.origins.keys().cloned().collect();
+        all_origin_keys.sort();
+
+        for (idx, origin_str) in all_origin_keys.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            let bucket = &self.origins[origin_str];
+            let dir_str = self
+                .site_dir_readonly(origin_str)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            out.push_str(&format!(
+                "{{\"origin\":\"{}\",\"folder\":\"{}\",\"used_bytes\":{},\"local_storage_keys\":{},\"session_storage_keys\":{},\"form_drafts\":{},\"cookies\":{},\"object_stores\":[",
+                escape_json_str(origin_str),
+                escape_json_str(&dir_str),
+                bucket.used_bytes,
+                bucket.local_storage.len(),
+                bucket.session_storage.len(),
+                bucket.form_drafts.len(),
+                bucket.cookies.len()
+            ));
+
+            for (s_idx, (sname, recs)) in bucket.object_stores.iter().enumerate() {
+                if s_idx > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!(
+                    "{{\"name\":\"{}\",\"records\":{}}}",
+                    escape_json_str(sname),
+                    recs.len()
+                ));
+            }
+            out.push_str("],\"saved_files\":[");
+            for (f_idx, (vpath, (mime, bytes, _))) in bucket.saved_files_meta.iter().enumerate() {
+                if f_idx > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!(
+                    "{{\"path\":\"{}\",\"mime\":\"{}\",\"bytes\":{}}}",
+                    escape_json_str(vpath),
+                    escape_json_str(mime),
+                    bytes
+                ));
+            }
+            out.push_str("]}");
+        }
+
+        out.push_str("]}");
+        out
+    }
+
+    // =========================================================================
+    // OPEN TAB SESSIONS & READABLE OFFLINE HTML FILES
     // =========================================================================
 
     pub fn save_tab_session_state(&mut self, tab_id: u32, url: &str, title: &str, scroll_y: i32) {
@@ -327,20 +475,14 @@ impl MantaStorageEngine {
                 scroll_y,
             },
         );
-        self.append_wal_op(
-            WalOp::SaveTabSession,
-            &[
-                &tab_id.to_le_bytes(),
-                url.as_bytes(),
-                title.as_bytes(),
-                &scroll_y.to_le_bytes(),
-            ],
-        );
+        if self.auto_commit_on_write {
+            self.persist_tabs_session();
+        }
     }
 
     pub fn remove_tab_session_state(&mut self, tab_id: u32) {
-        if self.saved_tabs.remove(&tab_id).is_some() {
-            self.append_wal_op(WalOp::RemoveTabSession, &[&tab_id.to_le_bytes()]);
+        if self.saved_tabs.remove(&tab_id).is_some() && self.auto_commit_on_write {
+            self.persist_tabs_session();
         }
     }
 
@@ -369,120 +511,36 @@ impl MantaStorageEngine {
         out
     }
 
-    /// Saves a user-requested offline copy of a page inside Manta's clearable encrypted vault (compressed with C++ LZ+RLE).
+    /// Saves a user-requested offline copy as a real readable `.html` file inside `<storage_dir>/offline_pages/`.
     pub fn save_offline_page_snapshot(&mut self, url: &str, html_bytes: &[u8]) -> bool {
-        let compressed = fast_compress(html_bytes);
-        let payload = if compressed.is_empty() {
-            html_bytes
-        } else {
-            &compressed
-        };
-        let key_path = format!("/offline/{}", url_to_safe_slug(url));
-        self.save_vfs_file("manta://offline", &key_path, "application/x-manta-lz", payload)
+        let slug = safe_file_slug(url);
+        if !self.ephemeral_only {
+            if let Some(ref root) = self.storage_dir_path {
+                let file_path = root.join("offline_pages").join(format!("{}.html", slug));
+                if atomic_write_file(&file_path, html_bytes).is_ok() {
+                    self.write_index_manifest();
+                    return true;
+                }
+            }
+        }
+        self.offline_mem_fallback.insert(slug, html_bytes.to_vec());
+        true
     }
 
     pub fn load_offline_page_snapshot(&self, url: &str) -> Option<Vec<u8>> {
-        let key_path = format!("/offline/{}", url_to_safe_slug(url));
-        let entry = self.db.read_virtual_file("manta://offline", &key_path)?;
-        if let Some(decomp) = fast_decompress(&entry.data) {
-            Some(decomp)
-        } else {
-            Some(entry.data.clone())
+        let slug = safe_file_slug(url);
+        if let Some(ref root) = self.storage_dir_path {
+            let file_path = root.join("offline_pages").join(format!("{}.html", slug));
+            if let Ok(bytes) = fs::read(&file_path) {
+                return Some(bytes);
+            }
         }
+        self.offline_mem_fallback.get(&slug).cloned()
     }
 
-    pub fn inspect_storage_manifest_json(&self) -> String {
-        let mut out = String::from("{");
-        out.push_str(&format!(
-            "\"total_bytes\":{},\"wal_pending_ops\":{},\"ephemeral_only\":{},\"saved_tabs_count\":{},\"bookmarks_count\":{},\"history_count\":{},\"origins\":[",
-            self.used_bytes(),
-            self.wal_pending_ops,
-            self.ephemeral_only,
-            self.saved_tabs.len(),
-            self.bookmarks.len(),
-            self.history.len()
-        ));
-
-        let mut all_origin_keys: Vec<String> = self.origins.keys().cloned().collect();
-        for k in self.db.partitions.keys() {
-            if !all_origin_keys.contains(k) {
-                all_origin_keys.push(k.clone());
-            }
-        }
-        all_origin_keys.sort();
-
-        for (idx, origin_str) in all_origin_keys.iter().enumerate() {
-            if idx > 0 {
-                out.push(',');
-            }
-            let kv_bucket = self.origins.get(origin_str);
-            let db_part = self.db.partitions.get(origin_str);
-
-            let kv_count = kv_bucket.map(|b| b.local_storage.len()).unwrap_or(0);
-            let sess_count = kv_bucket.map(|b| b.session_storage.len()).unwrap_or(0);
-            let draft_count = kv_bucket.map(|b| b.form_drafts.len()).unwrap_or(0);
-            let cookie_count = kv_bucket.map(|b| b.cookies.len()).unwrap_or(0);
-            let kv_bytes = kv_bucket.map(|b| b.used_bytes).unwrap_or(0);
-            let db_bytes = db_part.map(|p| p.used_bytes).unwrap_or(0);
-
-            out.push_str(&format!(
-                "{{\"origin\":\"{}\",\"used_bytes\":{},\"local_storage_keys\":{},\"session_storage_keys\":{},\"form_drafts\":{},\"cookies\":{},\"tables\":[",
-                escape_json_str(origin_str),
-                kv_bytes + db_bytes,
-                kv_count,
-                sess_count,
-                draft_count,
-                cookie_count
-            ));
-
-            if let Some(part) = db_part {
-                for (t_idx, table) in part.tables.values().enumerate() {
-                    if t_idx > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&format!(
-                        "{{\"name\":\"{}\",\"rows\":{},\"bytes\":{}}}",
-                        escape_json_str(&table.name),
-                        table.rows.len(),
-                        table.used_bytes
-                    ));
-                }
-            }
-            out.push_str("],\"object_stores\":[");
-            if let Some(part) = db_part {
-                for (s_idx, store) in part.object_stores.values().enumerate() {
-                    if s_idx > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&format!(
-                        "{{\"name\":\"{}\",\"records\":{},\"bytes\":{}}}",
-                        escape_json_str(&store.name),
-                        store.records.len(),
-                        store.used_bytes
-                    ));
-                }
-            }
-            out.push_str("],\"saved_files\":[");
-            if let Some(part) = db_part {
-                for (f_idx, vf) in part.virtual_files.values().enumerate() {
-                    if f_idx > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&format!(
-                        "{{\"path\":\"{}\",\"mime\":\"{}\",\"bytes\":{},\"crc32\":\"{:08X}\"}}",
-                        escape_json_str(&vf.virtual_path),
-                        escape_json_str(&vf.mime_type),
-                        vf.data.len(),
-                        vf.crc32
-                    ));
-                }
-            }
-            out.push_str("]}");
-        }
-
-        out.push_str("]}");
-        out
-    }
+    // =========================================================================
+    // LOCAL STORAGE, SESSION STORAGE & FORM DRAFTS
+    // =========================================================================
 
     pub fn set_local_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
         if let Some(draft_key) = key.strip_prefix("__manta_draft::") {
@@ -503,11 +561,9 @@ impl MantaStorageEngine {
             }
         }
         let ok = self.set_kv_internal(origin_url, key, value, false);
-        if ok {
-            self.append_wal_op(
-                WalOp::SetLocal,
-                &[origin_url.as_bytes(), key.as_bytes(), value.as_bytes()],
-            );
+        if ok && self.auto_commit_on_write {
+            let orig = OriginKey::from_url(origin_url).serialize();
+            self.persist_origin_local_storage(&orig);
         }
         ok
     }
@@ -523,8 +579,9 @@ impl MantaStorageEngine {
             }
         }
         let ok = self.remove_kv_internal(origin_url, key, false);
-        if ok {
-            self.append_wal_op(WalOp::RemoveLocal, &[origin_url.as_bytes(), key.as_bytes()]);
+        if ok && self.auto_commit_on_write {
+            let orig = OriginKey::from_url(origin_url).serialize();
+            self.persist_origin_local_storage(&orig);
         }
         ok
     }
@@ -534,7 +591,8 @@ impl MantaStorageEngine {
         if origin_key.is_opaque {
             return false;
         }
-        let Some(bucket) = self.origins.get_mut(&origin_key.serialize()) else {
+        let serialized = origin_key.serialize();
+        let Some(bucket) = self.origins.get_mut(&serialized) else {
             return false;
         };
         let freed: usize = bucket
@@ -544,8 +602,10 @@ impl MantaStorageEngine {
             .sum();
         bucket.local_storage.clear();
         bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
-        self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
-        self.append_wal_op(WalOp::ClearLocal, &[origin_url.as_bytes()]);
+        self.total_used_bytes = self.total_used_bytes.saturating_sub(freed);
+        if self.auto_commit_on_write {
+            self.persist_origin_local_storage(&serialized);
+        }
         true
     }
 
@@ -576,22 +636,11 @@ impl MantaStorageEngine {
             .sum();
         bucket.session_storage.clear();
         bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
-        self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
+        self.total_used_bytes = self.total_used_bytes.saturating_sub(freed);
         true
     }
 
     pub fn save_form_draft(&mut self, origin_url: &str, field_key: &str, value: &str) -> bool {
-        let ok = self.apply_save_form_draft(origin_url, field_key, value);
-        if ok {
-            self.append_wal_op(
-                WalOp::SaveFormDraft,
-                &[origin_url.as_bytes(), field_key.as_bytes(), value.as_bytes()],
-            );
-        }
-        ok
-    }
-
-    fn apply_save_form_draft(&mut self, origin_url: &str, field_key: &str, value: &str) -> bool {
         let origin_key = OriginKey::from_url(origin_url);
         if origin_key.is_opaque || field_key.trim().is_empty() {
             return false;
@@ -599,7 +648,7 @@ impl MantaStorageEngine {
         let serialized_origin = origin_key.serialize();
         let entry_cost = field_key.len() + value.len();
 
-        let bucket = self.origins.entry(serialized_origin).or_default();
+        let bucket = self.origins.entry(serialized_origin.clone()).or_default();
         let prev_cost = bucket
             .form_drafts
             .get(field_key)
@@ -607,10 +656,8 @@ impl MantaStorageEngine {
             .unwrap_or(0);
 
         let next_bucket = bucket.used_bytes.saturating_sub(prev_cost) + entry_cost;
-        let next_total = self.kv_cookie_used_bytes.saturating_sub(prev_cost) + entry_cost;
-        if next_bucket > self.per_origin_quota_bytes
-            || next_total + self.db.total_used_bytes > self.total_ceiling_bytes
-        {
+        let next_total = self.total_used_bytes.saturating_sub(prev_cost) + entry_cost;
+        if next_bucket > self.per_origin_quota_bytes || next_total > self.total_ceiling_bytes {
             return false;
         }
 
@@ -618,7 +665,11 @@ impl MantaStorageEngine {
             .form_drafts
             .insert(field_key.to_string(), value.to_string());
         bucket.used_bytes = next_bucket;
-        self.kv_cookie_used_bytes = next_total;
+        self.total_used_bytes = next_total;
+
+        if self.auto_commit_on_write {
+            self.persist_origin_form_drafts(&serialized_origin);
+        }
         true
     }
 
@@ -634,19 +685,9 @@ impl MantaStorageEngine {
             .cloned()
     }
 
-    pub fn clear_form_drafts_for_origin(&mut self, origin_url: &str) {
-        let origin_key = OriginKey::from_url(origin_url);
-        if let Some(bucket) = self.origins.get_mut(&origin_key.serialize()) {
-            let freed: usize = bucket
-                .form_drafts
-                .iter()
-                .map(|(k, v)| k.len() + v.len())
-                .sum();
-            bucket.form_drafts.clear();
-            bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
-            self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
-        }
-    }
+    // =========================================================================
+    // FILE-BACKED INDEXEDDB OBJECT STORES & SITE FILES (OPFS)
+    // =========================================================================
 
     pub fn put_idb_object(
         &mut self,
@@ -655,30 +696,81 @@ impl MantaStorageEngine {
         key: &str,
         json_val: &str,
     ) -> bool {
-        let ok = self.db.put_object(origin_url, store_name, key, json_val);
-        if ok {
-            self.append_wal_op(
-                WalOp::IdbPut,
-                &[
-                    origin_url.as_bytes(),
-                    store_name.as_bytes(),
-                    key.as_bytes(),
-                    json_val.as_bytes(),
-                ],
-            );
+        let origin_key = OriginKey::from_url(origin_url);
+        let clean_store = store_name.trim();
+        if origin_key.is_opaque || clean_store.is_empty() || key.is_empty() {
+            return false;
         }
-        ok
+        let serialized = origin_key.serialize();
+        let cost = key.len() + json_val.len();
+
+        let bucket = self.origins.entry(serialized.clone()).or_default();
+        let store = bucket
+            .object_stores
+            .entry(clean_store.to_string())
+            .or_default();
+        let old_cost = store
+            .get(key)
+            .map(|old| key.len() + old.len())
+            .unwrap_or(0);
+
+        let next_bucket = bucket.used_bytes.saturating_sub(old_cost) + cost;
+        let next_total = self.total_used_bytes.saturating_sub(old_cost) + cost;
+        if next_bucket > self.per_origin_quota_bytes || next_total > self.total_ceiling_bytes {
+            return false;
+        }
+
+        store.insert(key.to_string(), json_val.to_string());
+        bucket.used_bytes = next_bucket;
+        self.total_used_bytes = next_total;
+
+        if self.auto_commit_on_write {
+            self.persist_origin_idb_store(&serialized, clean_store);
+        }
+        true
+    }
+
+    pub fn get_idb_object(
+        &self,
+        origin_url: &str,
+        store_name: &str,
+        key: &str,
+    ) -> Option<String> {
+        let origin_key = OriginKey::from_url(origin_url);
+        if origin_key.is_opaque {
+            return None;
+        }
+        self.origins
+            .get(&origin_key.serialize())?
+            .object_stores
+            .get(store_name.trim())?
+            .get(key)
+            .cloned()
     }
 
     pub fn delete_idb_object(&mut self, origin_url: &str, store_name: &str, key: &str) -> bool {
-        let ok = self.db.delete_object(origin_url, store_name, key);
-        if ok {
-            self.append_wal_op(
-                WalOp::IdbDelete,
-                &[origin_url.as_bytes(), store_name.as_bytes(), key.as_bytes()],
-            );
+        let origin_key = OriginKey::from_url(origin_url);
+        let clean_store = store_name.trim();
+        if origin_key.is_opaque || clean_store.is_empty() {
+            return false;
         }
-        ok
+        let serialized = origin_key.serialize();
+        let Some(bucket) = self.origins.get_mut(&serialized) else {
+            return false;
+        };
+        let Some(store) = bucket.object_stores.get_mut(clean_store) else {
+            return false;
+        };
+        if let Some(removed) = store.remove(key) {
+            let freed = key.len() + removed.len();
+            bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
+            self.total_used_bytes = self.total_used_bytes.saturating_sub(freed);
+            if self.auto_commit_on_write {
+                self.persist_origin_idb_store(&serialized, clean_store);
+            }
+            return true;
+        }
+        false
     }
 
     pub fn save_vfs_file(
@@ -688,20 +780,108 @@ impl MantaStorageEngine {
         mime_type: &str,
         data: &[u8],
     ) -> bool {
-        let ok = self.db.save_virtual_file(origin_url, virtual_path, mime_type, data);
-        if ok {
-            self.append_wal_op(
-                WalOp::VfsSave,
-                &[
-                    origin_url.as_bytes(),
-                    virtual_path.as_bytes(),
-                    mime_type.as_bytes(),
-                    data,
-                ],
-            );
+        let origin_key = OriginKey::from_url(origin_url);
+        let clean_vpath = sanitize_virtual_path(virtual_path);
+        if origin_key.is_opaque || clean_vpath.is_empty() {
+            return false;
         }
-        ok
+        let serialized = origin_key.serialize();
+        let cost = data.len();
+
+        let disk_written = if let Some(dir) = self.site_dir(&serialized) {
+            self.persist_origin_meta(&serialized);
+            let rel = clean_vpath.trim_start_matches('/');
+            let full = dir.join("files").join(rel);
+            atomic_write_file(&full, data).is_ok()
+        } else {
+            false
+        };
+
+        let bucket = self.origins.entry(serialized.clone()).or_default();
+        let prev_len = bucket
+            .saved_files_meta
+            .get(&clean_vpath)
+            .map(|(_, len, _)| *len)
+            .unwrap_or(0);
+        let next_bucket = bucket.used_bytes.saturating_sub(prev_len) + cost;
+        let next_total = self.total_used_bytes.saturating_sub(prev_len) + cost;
+        if next_bucket > self.per_origin_quota_bytes || next_total > self.total_ceiling_bytes {
+            return false;
+        }
+
+        // Keep file bytes out of RAM when written directly to user device disk!
+        let mem_copy = if disk_written {
+            None
+        } else {
+            Some(data.to_vec())
+        };
+        bucket.saved_files_meta.insert(
+            clean_vpath,
+            (
+                if mime_type.is_empty() {
+                    "application/octet-stream".to_string()
+                } else {
+                    mime_type.to_string()
+                },
+                data.len(),
+                mem_copy,
+            ),
+        );
+        bucket.used_bytes = next_bucket;
+        self.total_used_bytes = next_total;
+
+        if disk_written {
+            self.write_index_manifest();
+        }
+        true
     }
+
+    pub fn read_vfs_file(&self, origin_url: &str, virtual_path: &str) -> Option<Vec<u8>> {
+        let origin_key = OriginKey::from_url(origin_url);
+        let clean_vpath = sanitize_virtual_path(virtual_path);
+        if origin_key.is_opaque || clean_vpath.is_empty() {
+            return None;
+        }
+        let serialized = origin_key.serialize();
+        if let Some(dir) = self.site_dir_readonly(&serialized) {
+            let full = dir.join("files").join(clean_vpath.trim_start_matches('/'));
+            if let Ok(bytes) = fs::read(&full) {
+                return Some(bytes);
+            }
+        }
+        self.origins
+            .get(&serialized)?
+            .saved_files_meta
+            .get(&clean_vpath)?
+            .2
+            .clone()
+    }
+
+    pub fn delete_vfs_file(&mut self, origin_url: &str, virtual_path: &str) -> bool {
+        let origin_key = OriginKey::from_url(origin_url);
+        let clean_vpath = sanitize_virtual_path(virtual_path);
+        if origin_key.is_opaque || clean_vpath.is_empty() {
+            return false;
+        }
+        let serialized = origin_key.serialize();
+        if let Some(dir) = self.site_dir(&serialized) {
+            let full = dir.join("files").join(clean_vpath.trim_start_matches('/'));
+            let _ = fs::remove_file(full);
+        }
+        if let Some(bucket) = self.origins.get_mut(&serialized) {
+            if let Some((_, len, _)) = bucket.saved_files_meta.remove(&clean_vpath) {
+                bucket.used_bytes = bucket.used_bytes.saturating_sub(len);
+                self.total_used_bytes = self.total_used_bytes.saturating_sub(len);
+                self.write_index_manifest();
+                return true;
+            }
+        }
+        false
+    }
+
+    // =========================================================================
+    // JSON EXPORT HELPERS FOR KERNEL HYDRATION
+    // =========================================================================
 
     pub fn export_origin_storage_json(&self, origin_url: &str, is_session: bool) -> String {
         let origin_key = OriginKey::from_url(origin_url);
@@ -735,18 +915,18 @@ impl MantaStorageEngine {
         if origin_key.is_opaque {
             return "{}".to_string();
         }
-        let Some(part) = self.db.partitions.get(&origin_key.serialize()) else {
+        let Some(bucket) = self.origins.get(&origin_key.serialize()) else {
             return "{}".to_string();
         };
         let mut out = String::from("{");
-        for (idx, (store_name, store)) in part.object_stores.iter().enumerate() {
+        for (idx, (store_name, recs)) in bucket.object_stores.iter().enumerate() {
             if idx > 0 {
                 out.push(',');
             }
             out.push('"');
             out.push_str(&escape_json_str(store_name));
             out.push_str("\":");
-            out.push_str(&map_to_json_object(&store.records));
+            out.push_str(&map_to_json_object(recs));
         }
         out.push('}');
         out
@@ -783,19 +963,19 @@ impl MantaStorageEngine {
             .saturating_sub(previous_cost)
             .saturating_add(entry_cost);
         let next_total_bytes = self
-            .kv_cookie_used_bytes
+            .total_used_bytes
             .saturating_sub(previous_cost)
             .saturating_add(entry_cost);
 
         if next_bucket_bytes > self.per_origin_quota_bytes
-            || next_total_bytes + self.db.total_used_bytes > self.total_ceiling_bytes
+            || next_total_bytes > self.total_ceiling_bytes
         {
             return false;
         }
 
         map.insert(key.to_string(), value.to_string());
         bucket.used_bytes = next_bucket_bytes;
-        self.kv_cookie_used_bytes = next_total_bytes;
+        self.total_used_bytes = next_total_bytes;
         true
     }
 
@@ -828,24 +1008,17 @@ impl MantaStorageEngine {
         if let Some(removed_val) = map.remove(key) {
             let cost = key.len() + removed_val.len();
             bucket.used_bytes = bucket.used_bytes.saturating_sub(cost);
-            self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(cost);
+            self.total_used_bytes = self.total_used_bytes.saturating_sub(cost);
             return true;
         }
         false
     }
 
-    pub fn set_cookie_from_header(&mut self, origin_url: &str, raw_set_cookie: &str) -> bool {
-        let ok = self.apply_set_cookie_from_header(origin_url, raw_set_cookie);
-        if ok {
-            self.append_wal_op(
-                WalOp::SetCookie,
-                &[origin_url.as_bytes(), raw_set_cookie.as_bytes()],
-            );
-        }
-        ok
-    }
+    // =========================================================================
+    // COOKIES, HISTORY, BOOKMARKS
+    // =========================================================================
 
-    fn apply_set_cookie_from_header(&mut self, origin_url: &str, raw_set_cookie: &str) -> bool {
+    pub fn set_cookie_from_header(&mut self, origin_url: &str, raw_set_cookie: &str) -> bool {
         let origin = OriginKey::from_url(origin_url);
         if origin.is_opaque || raw_set_cookie.trim().is_empty() {
             return false;
@@ -903,21 +1076,23 @@ impl MantaStorageEngine {
         }
 
         let serialized_origin = origin.serialize();
-        let bucket = self.origins.entry(serialized_origin).or_default();
+        let bucket = self.origins.entry(serialized_origin.clone()).or_default();
 
         if max_age_zero {
             if let Some(old) = bucket.cookies.remove(&name) {
                 let cost = old.name.len() + old.value.len();
                 bucket.used_bytes = bucket.used_bytes.saturating_sub(cost);
-                self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(cost);
+                self.total_used_bytes = self.total_used_bytes.saturating_sub(cost);
+            }
+            if self.auto_commit_on_write {
+                self.persist_origin_cookies(&serialized_origin);
             }
             return true;
         }
 
         let cost = name.len() + value.len();
         if bucket.used_bytes + cost > self.per_origin_quota_bytes
-            || self.kv_cookie_used_bytes + self.db.total_used_bytes + cost
-                > self.total_ceiling_bytes
+            || self.total_used_bytes + cost > self.total_ceiling_bytes
         {
             return false;
         }
@@ -925,7 +1100,7 @@ impl MantaStorageEngine {
         if let Some(old) = bucket.cookies.remove(&name) {
             let old_cost = old.name.len() + old.value.len();
             bucket.used_bytes = bucket.used_bytes.saturating_sub(old_cost);
-            self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(old_cost);
+            self.total_used_bytes = self.total_used_bytes.saturating_sub(old_cost);
         }
 
         bucket.cookies.insert(
@@ -941,7 +1116,11 @@ impl MantaStorageEngine {
             },
         );
         bucket.used_bytes += cost;
-        self.kv_cookie_used_bytes += cost;
+        self.total_used_bytes += cost;
+
+        if self.auto_commit_on_write {
+            self.persist_origin_cookies(&serialized_origin);
+        }
         true
     }
 
@@ -973,30 +1152,28 @@ impl MantaStorageEngine {
         if clean_url.is_empty() || clean_url.starts_with("manta://") {
             return;
         }
-        self.apply_record_history_visit(clean_url, title);
-        self.append_wal_op(WalOp::RecordHistory, &[clean_url.as_bytes(), title.as_bytes()]);
-    }
-
-    fn apply_record_history_visit(&mut self, clean_url: &str, title: &str) {
         if let Some(existing) = self.history.iter_mut().find(|h| h.url == clean_url) {
             existing.visit_count = existing.visit_count.saturating_add(1);
             if !title.trim().is_empty() {
                 existing.title = title.trim().to_string();
             }
-            return;
+        } else {
+            if self.history.len() >= 2048 {
+                self.history.remove(0);
+            }
+            self.history.push(HistoryVisitEntry {
+                url: clean_url.to_string(),
+                title: if title.trim().is_empty() {
+                    clean_url.to_string()
+                } else {
+                    title.trim().to_string()
+                },
+                visit_count: 1,
+            });
         }
-        if self.history.len() >= 2048 {
-            self.history.remove(0);
+        if self.auto_commit_on_write {
+            self.persist_history();
         }
-        self.history.push(HistoryVisitEntry {
-            url: clean_url.to_string(),
-            title: if title.trim().is_empty() {
-                clean_url.to_string()
-            } else {
-                title.trim().to_string()
-            },
-            visit_count: 1,
-        });
     }
 
     pub fn history(&self) -> &[HistoryVisitEntry] {
@@ -1006,7 +1183,7 @@ impl MantaStorageEngine {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history.shrink_to_fit();
-        self.append_wal_op(WalOp::ClearHistory, &[]);
+        self.persist_history();
     }
 
     pub fn toggle_bookmark(&mut self, url: &str, title: &str) -> bool {
@@ -1014,13 +1191,7 @@ impl MantaStorageEngine {
         if clean_url.is_empty() {
             return false;
         }
-        let added = self.apply_toggle_bookmark(clean_url, title);
-        self.append_wal_op(WalOp::ToggleBookmark, &[clean_url.as_bytes(), title.as_bytes()]);
-        added
-    }
-
-    fn apply_toggle_bookmark(&mut self, clean_url: &str, title: &str) -> bool {
-        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == clean_url) {
+        let added = if let Some(pos) = self.bookmarks.iter().position(|b| b.url == clean_url) {
             self.bookmarks.remove(pos);
             false
         } else {
@@ -1035,7 +1206,17 @@ impl MantaStorageEngine {
                 });
             }
             true
+        };
+        if self.auto_commit_on_write {
+            self.persist_bookmarks();
         }
+        added
+    }
+
+    pub fn clear_bookmarks(&mut self) {
+        self.bookmarks.clear();
+        self.bookmarks.shrink_to_fit();
+        self.persist_bookmarks();
     }
 
     pub fn bookmarks(&self) -> &[BookmarkEntry] {
@@ -1058,24 +1239,25 @@ impl MantaStorageEngine {
         out
     }
 
-    pub fn clear_origin(&mut self, origin_url: &str) -> bool {
-        let removed = self.apply_clear_origin(origin_url);
-        if removed {
-            self.append_wal_op(WalOp::ClearOrigin, &[origin_url.as_bytes()]);
-        }
-        removed
-    }
+    // =========================================================================
+    // FULL TRANSPARENT DELETION (PER-ORIGIN & FULL WIPE)
+    // =========================================================================
 
-    fn apply_clear_origin(&mut self, origin_url: &str) -> bool {
+    pub fn clear_origin(&mut self, origin_url: &str) -> bool {
         let origin = OriginKey::from_url(origin_url).serialize();
         let mut removed_any = false;
         if let Some(removed) = self.origins.remove(&origin) {
-            self.kv_cookie_used_bytes =
-                self.kv_cookie_used_bytes.saturating_sub(removed.used_bytes);
+            self.total_used_bytes = self.total_used_bytes.saturating_sub(removed.used_bytes);
             removed_any = true;
         }
-        if self.db.clear_origin(&origin) > 0 {
-            removed_any = true;
+        if let Some(dir) = self.site_dir_readonly(&origin) {
+            if dir.exists() {
+                let _ = fs::remove_dir_all(&dir);
+                removed_any = true;
+            }
+        }
+        if removed_any {
+            self.write_index_manifest();
         }
         removed_any
     }
@@ -1089,7 +1271,7 @@ impl MantaStorageEngine {
                 .sum();
             bucket.session_storage.clear();
             bucket.used_bytes = bucket.used_bytes.saturating_sub(session_bytes);
-            self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(session_bytes);
+            self.total_used_bytes = self.total_used_bytes.saturating_sub(session_bytes);
         }
     }
 
@@ -1102,405 +1284,51 @@ impl MantaStorageEngine {
         self.history.shrink_to_fit();
         self.saved_tabs.clear();
         self.saved_tabs.shrink_to_fit();
-        self.db.clear_all();
-        self.kv_cookie_used_bytes = 0;
-        self.wal_pending_ops = 0;
+        self.offline_mem_fallback.clear();
+        self.offline_mem_fallback.shrink_to_fit();
+        self.total_used_bytes = 0;
 
-        secure_zero_slice(&mut self.vault_key);
-        self.vault_key = generate_volatile_entropy_32();
-
-        if let Some(ref path) = self.backing_file_path {
-            let _ = fs::remove_file(path);
-            let _ = fs::remove_file(format!("{}.tmp", path));
-        }
-        if let Some(ref wpath) = self.wal_file_path {
-            let _ = fs::remove_file(wpath);
-        }
-        if let Some(ref kpath) = self.key_file_path {
-            if let Ok(mut f) = OpenOptions::new().write(true).open(kpath) {
-                let zeros = [0u8; 32];
-                let _ = f.write_all(&zeros);
-                let _ = f.sync_all();
-            }
-            let _ = fs::remove_file(kpath);
+        if let Some(ref root) = self.storage_dir_path {
+            let _ = fs::remove_file(root.join("bookmarks.json"));
+            let _ = fs::remove_file(root.join("history.json"));
+            let _ = fs::remove_file(root.join("tabs_session.json"));
+            let _ = fs::remove_file(root.join("manta_index.json"));
+            let _ = fs::remove_dir_all(root.join("sites"));
+            let _ = fs::remove_dir_all(root.join("offline_pages"));
+            let _ = fs::remove_dir(root);
         }
     }
 
-    fn serialize_plain_payload(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(self.used_bytes() + 1024);
-
-        write_u32(&mut payload, self.bookmarks.len() as u32);
-        for bm in &self.bookmarks {
-            write_str(&mut payload, &bm.url);
-            write_str(&mut payload, &bm.title);
-        }
-
-        write_u32(&mut payload, self.history.len() as u32);
-        for h in &self.history {
-            write_str(&mut payload, &h.url);
-            write_str(&mut payload, &h.title);
-            write_u32(&mut payload, h.visit_count);
-        }
-
-        write_u32(&mut payload, self.origins.len() as u32);
-        for (origin_str, bucket) in &self.origins {
-            write_str(&mut payload, origin_str);
-
-            write_u32(&mut payload, bucket.local_storage.len() as u32);
-            for (k, v) in &bucket.local_storage {
-                write_str(&mut payload, k);
-                write_str(&mut payload, v);
-            }
-
-            write_u32(&mut payload, 0);
-
-            write_u32(&mut payload, bucket.form_drafts.len() as u32);
-            for (k, v) in &bucket.form_drafts {
-                write_str(&mut payload, k);
-                write_str(&mut payload, v);
-            }
-
-            write_u32(&mut payload, bucket.cookies.len() as u32);
-            for cookie in bucket.cookies.values() {
-                write_str(&mut payload, &cookie.name);
-                write_str(&mut payload, &cookie.value);
-                write_str(&mut payload, &cookie.domain);
-                write_str(&mut payload, &cookie.path);
-                payload.push(u8::from(cookie.secure));
-                payload.push(u8::from(cookie.http_only));
-                write_str(&mut payload, &cookie.same_site);
-            }
-        }
-
-        write_u32(&mut payload, self.db.partitions.len() as u32);
-        for (origin_str, part) in &self.db.partitions {
-            write_str(&mut payload, origin_str);
-
-            write_u32(&mut payload, part.tables.len() as u32);
-            for (table_name, table) in &part.tables {
-                write_str(&mut payload, table_name);
-                write_u64(&mut payload, table.next_rowid);
-                write_u32(&mut payload, table.columns.len() as u32);
-                for col in &table.columns {
-                    write_str(&mut payload, col);
-                }
-                write_u32(&mut payload, table.rows.len() as u32);
-                for (rowid, vals) in &table.rows {
-                    write_u64(&mut payload, *rowid);
-                    write_u32(&mut payload, vals.len() as u32);
-                    for val in vals {
-                        write_db_value(&mut payload, val);
-                    }
-                }
-            }
-
-            write_u32(&mut payload, part.object_stores.len() as u32);
-            for (store_name, store) in &part.object_stores {
-                write_str(&mut payload, store_name);
-                write_u32(&mut payload, store.records.len() as u32);
-                for (pk, json_val) in &store.records {
-                    write_str(&mut payload, pk);
-                    write_str(&mut payload, json_val);
-                }
-            }
-
-            write_u32(&mut payload, part.virtual_files.len() as u32);
-            for vf in part.virtual_files.values() {
-                write_str(&mut payload, &vf.virtual_path);
-                write_str(&mut payload, &vf.mime_type);
-                write_u32(&mut payload, vf.crc32);
-                write_bytes(&mut payload, &vf.data);
-            }
-        }
-
-        write_u32(&mut payload, self.saved_tabs.len() as u32);
-        for tab in self.saved_tabs.values() {
-            write_u32(&mut payload, tab.tab_id);
-            write_str(&mut payload, &tab.url);
-            write_str(&mut payload, &tab.title);
-            write_u32(&mut payload, tab.scroll_y as u32);
-        }
-
-        payload
-    }
-
-    pub fn serialize_to_bytes(&self) -> Vec<u8> {
-        let mut payload = self.serialize_plain_payload();
-        let nonce = generate_nonce_12(self.nonce_counter.wrapping_add(0x4D41_4E54));
-        let sealed = seal_record(&self.vault_key, &nonce, STORAGE_MAGIC_V4, &payload);
-        secure_zero_slice(&mut payload);
-
-        let mut frame = Vec::with_capacity(8 + sealed.len());
-        frame.extend_from_slice(STORAGE_MAGIC_V4);
-        frame.extend_from_slice(&sealed);
-        frame
-    }
-
-    pub fn deserialize_from_bytes(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
-        if bytes.len() < 12 {
-            return Err("Invalid custom storage header");
-        }
-        if &bytes[0..8] == STORAGE_MAGIC_V4 {
-            let mut decrypted = open_record(&self.vault_key, STORAGE_MAGIC_V4, &bytes[8..])?;
-            let res = self.parse_plain_payload(&decrypted, true);
-            secure_zero_slice(&mut decrypted);
-            return res;
-        }
-
-        let is_v3 = &bytes[0..8] == STORAGE_MAGIC_V3;
-        let is_v2 = &bytes[0..8] == STORAGE_MAGIC_V2;
-        if !is_v3 && !is_v2 {
-            return Err("Unknown custom storage header magic");
-        }
-        let mut cursor = 8usize;
-        let expected_crc = read_u32(bytes, &mut cursor).ok_or("Truncated checksum")?;
-        let payload = &bytes[12..];
-        if crc32_hash(payload) != expected_crc {
-            return Err("Custom storage CRC32 integrity mismatch");
-        }
-        self.parse_plain_payload(payload, is_v3)
-    }
-
-    fn parse_plain_payload(&mut self, payload: &[u8], has_v3_fields: bool) -> Result<(), &'static str> {
-        let mut p_cur = 0usize;
-
-        let bm_count = read_u32(payload, &mut p_cur).ok_or("Invalid bookmark count")?;
-        let mut new_bookmarks = Vec::with_capacity((bm_count as usize).min(1024));
-        for _ in 0..bm_count {
-            let url = read_str(payload, &mut p_cur).ok_or("Corrupt bookmark URL")?;
-            let title = read_str(payload, &mut p_cur).ok_or("Corrupt bookmark title")?;
-            new_bookmarks.push(BookmarkEntry { url, title });
-        }
-
-        let hist_count = read_u32(payload, &mut p_cur).ok_or("Invalid history count")?;
-        let mut new_history = Vec::with_capacity((hist_count as usize).min(2048));
-        for _ in 0..hist_count {
-            let url = read_str(payload, &mut p_cur).ok_or("Corrupt history URL")?;
-            let title = read_str(payload, &mut p_cur).ok_or("Corrupt history title")?;
-            let visit_count = read_u32(payload, &mut p_cur).ok_or("Corrupt visit count")?;
-            new_history.push(HistoryVisitEntry {
-                url,
-                title,
-                visit_count,
-            });
-        }
-
-        let origin_count = read_u32(payload, &mut p_cur).ok_or("Invalid origin count")?;
-        let mut new_origins = HashMap::with_capacity((origin_count as usize).min(1024));
-        let mut kv_total_bytes = 0usize;
-
-        for _ in 0..origin_count {
-            let origin_str = read_str(payload, &mut p_cur).ok_or("Corrupt origin key")?;
-            let kv_count = read_u32(payload, &mut p_cur).ok_or("Corrupt KV count")?;
-            let mut bucket = OriginStorageBucket::default();
-
-            for _ in 0..kv_count {
-                let k = read_str(payload, &mut p_cur).ok_or("Corrupt storage key")?;
-                let v = read_str(payload, &mut p_cur).ok_or("Corrupt storage value")?;
-                let cost = k.len() + v.len();
-                bucket.used_bytes += cost;
-                kv_total_bytes += cost;
-                bucket.local_storage.insert(k, v);
-            }
-
-            if has_v3_fields {
-                let sess_count = read_u32(payload, &mut p_cur).ok_or("Corrupt session count")?;
-                for _ in 0..sess_count {
-                    let _k = read_str(payload, &mut p_cur).ok_or("Corrupt session key")?;
-                    let _v = read_str(payload, &mut p_cur).ok_or("Corrupt session value")?;
-                }
-
-                let draft_count = read_u32(payload, &mut p_cur).ok_or("Corrupt draft count")?;
-                for _ in 0..draft_count {
-                    let k = read_str(payload, &mut p_cur).ok_or("Corrupt draft key")?;
-                    let v = read_str(payload, &mut p_cur).ok_or("Corrupt draft value")?;
-                    let cost = k.len() + v.len();
-                    bucket.used_bytes += cost;
-                    kv_total_bytes += cost;
-                    bucket.form_drafts.insert(k, v);
-                }
-            }
-
-            let cookie_count = read_u32(payload, &mut p_cur).ok_or("Corrupt cookie count")?;
-            for _ in 0..cookie_count {
-                let name = read_str(payload, &mut p_cur).ok_or("Corrupt cookie name")?;
-                let value = read_str(payload, &mut p_cur).ok_or("Corrupt cookie value")?;
-                let domain = read_str(payload, &mut p_cur).ok_or("Corrupt cookie domain")?;
-                let path = read_str(payload, &mut p_cur).ok_or("Corrupt cookie path")?;
-                if p_cur + 2 > payload.len() {
-                    return Err("Truncated cookie flags");
-                }
-                let secure = payload[p_cur] != 0;
-                let http_only = payload[p_cur + 1] != 0;
-                p_cur += 2;
-                let same_site = read_str(payload, &mut p_cur).ok_or("Corrupt SameSite")?;
-
-                let cost = name.len() + value.len();
-                bucket.used_bytes += cost;
-                kv_total_bytes += cost;
-                bucket.cookies.insert(
-                    name.clone(),
-                    StoredCookie {
-                        name,
-                        value,
-                        domain,
-                        path,
-                        secure,
-                        http_only,
-                        same_site,
-                    },
-                );
-            }
-
-            new_origins.insert(origin_str, bucket);
-        }
-
-        self.db.clear_all();
-        if p_cur < payload.len() {
-            let db_part_count = read_u32(payload, &mut p_cur).ok_or("Corrupt DB part count")?;
-            for _ in 0..db_part_count {
-                let origin_str = read_str(payload, &mut p_cur).ok_or("Corrupt DB origin")?;
-
-                if has_v3_fields {
-                    let table_count = read_u32(payload, &mut p_cur).ok_or("Corrupt table count")?;
-                    for _ in 0..table_count {
-                        let tname = read_str(payload, &mut p_cur).ok_or("Corrupt table name")?;
-                        let next_rowid = read_u64(payload, &mut p_cur).ok_or("Corrupt next_rowid")?;
-                        let col_count = read_u32(payload, &mut p_cur).ok_or("Corrupt col count")?;
-                        let mut cols = Vec::with_capacity((col_count as usize).min(256));
-                        for _ in 0..col_count {
-                            cols.push(read_str(payload, &mut p_cur).ok_or("Corrupt col name")?);
-                        }
-                        let row_count = read_u32(payload, &mut p_cur).ok_or("Corrupt row count")?;
-                        let mut rows = Vec::with_capacity((row_count as usize).min(65536));
-                        let mut table_bytes = 0usize;
-                        for _ in 0..row_count {
-                            let rowid = read_u64(payload, &mut p_cur).ok_or("Corrupt rowid")?;
-                            let val_count = read_u32(payload, &mut p_cur).ok_or("Corrupt val count")?;
-                            let mut vals = Vec::with_capacity((val_count as usize).min(256));
-                            for _ in 0..val_count {
-                                let dv = read_db_value(payload, &mut p_cur).ok_or("Corrupt DbValue")?;
-                                table_bytes += dv.approx_bytes();
-                                vals.push(dv);
-                            }
-                            table_bytes += 16;
-                            rows.push((rowid, vals));
-                        }
-                        let part = self.db.partitions.entry(origin_str.clone()).or_default();
-                        part.used_bytes += table_bytes;
-                        self.db.total_used_bytes += table_bytes;
-                        part.tables.insert(
-                            tname.clone(),
-                            RelationalTable {
-                                name: tname,
-                                columns: cols,
-                                rows,
-                                next_rowid,
-                                used_bytes: table_bytes,
-                            },
-                        );
-                    }
-                }
-
-                let store_count = read_u32(payload, &mut p_cur).ok_or("Corrupt store count")?;
-                for _ in 0..store_count {
-                    let store_name = read_str(payload, &mut p_cur).ok_or("Corrupt store name")?;
-                    let rec_count = read_u32(payload, &mut p_cur).ok_or("Corrupt record count")?;
-                    for _ in 0..rec_count {
-                        let pk = read_str(payload, &mut p_cur).ok_or("Corrupt PK")?;
-                        let val = read_str(payload, &mut p_cur).ok_or("Corrupt JSON val")?;
-                        self.db.put_object(&origin_str, &store_name, &pk, &val);
-                    }
-                }
-
-                let vf_count = read_u32(payload, &mut p_cur).ok_or("Corrupt VFS count")?;
-                for _ in 0..vf_count {
-                    let vpath = read_str(payload, &mut p_cur).ok_or("Corrupt VFS path")?;
-                    let mime = read_str(payload, &mut p_cur).ok_or("Corrupt VFS mime")?;
-                    let crc32 = read_u32(payload, &mut p_cur).ok_or("Corrupt VFS crc")?;
-                    let data = read_bytes(payload, &mut p_cur).ok_or("Corrupt VFS data")?;
-                    let part = self.db.partitions.entry(origin_str.clone()).or_default();
-                    let cost = vpath.len() + mime.len() + data.len();
-                    part.used_bytes += cost;
-                    self.db.total_used_bytes += cost;
-                    part.virtual_files.insert(
-                        vpath.clone(),
-                        VirtualFileEntry {
-                            virtual_path: vpath,
-                            mime_type: mime,
-                            data,
-                            crc32,
-                        },
-                    );
-                }
-            }
-        }
-
-        let mut new_saved_tabs = HashMap::new();
-        if p_cur < payload.len() {
-            if let Some(tab_count) = read_u32(payload, &mut p_cur) {
-                for _ in 0..tab_count {
-                    let tid = read_u32(payload, &mut p_cur).unwrap_or(0);
-                    let url = read_str(payload, &mut p_cur).unwrap_or_default();
-                    let title = read_str(payload, &mut p_cur).unwrap_or_default();
-                    let sy = read_u32(payload, &mut p_cur).unwrap_or(0) as i32;
-                    if tid > 0 && !url.is_empty() {
-                        new_saved_tabs.insert(
-                            tid,
-                            SavedTabSession {
-                                tab_id: tid,
-                                url,
-                                title,
-                                scroll_y: sy,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        self.bookmarks = new_bookmarks;
-        self.history = new_history;
-        self.origins = new_origins;
-        self.saved_tabs = new_saved_tabs;
-        self.kv_cookie_used_bytes = kv_total_bytes;
-        Ok(())
-    }
+    // =========================================================================
+    // FULL SYNC SAVE & READ-BACK FROM USER DEVICE FOLDER
+    // =========================================================================
 
     pub fn save_to_backing_file(&mut self) -> Result<(), String> {
         if self.ephemeral_only {
             return Ok(());
         }
-        let Some(path) = self.backing_file_path.clone() else {
+        if self.storage_dir_path.is_none() {
             return Ok(());
-        };
-        if self.used_bytes() == 0
-            && self.bookmarks.is_empty()
-            && self.history.is_empty()
-            && self.saved_tabs.is_empty()
-        {
-            let _ = fs::remove_file(&path);
-            if let Some(ref wpath) = self.wal_file_path {
-                let _ = fs::remove_file(wpath);
+        }
+        self.persist_bookmarks();
+        self.persist_history();
+        self.persist_tabs_session();
+
+        let keys: Vec<String> = self.origins.keys().cloned().collect();
+        for origin in keys {
+            self.persist_origin_local_storage(&origin);
+            self.persist_origin_form_drafts(&origin);
+            self.persist_origin_cookies(&origin);
+            let store_names: Vec<String> = self
+                .origins
+                .get(&origin)
+                .map(|b| b.object_stores.keys().cloned().collect())
+                .unwrap_or_default();
+            for sname in store_names {
+                self.persist_origin_idb_store(&origin, &sname);
             }
-            self.wal_pending_ops = 0;
-            return Ok(());
         }
-
-        self.ensure_or_load_key_file();
-        let data = self.serialize_to_bytes();
-        let tmp_path = format!("{}.tmp", path);
-        {
-            let mut f = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
-            f.write_all(&data).map_err(|e| e.to_string())?;
-            f.sync_all().map_err(|e| e.to_string())?;
-        }
-        fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
-
-        if let Some(ref wpath) = self.wal_file_path {
-            let _ = fs::remove_file(wpath);
-        }
-        self.wal_pending_ops = 0;
+        self.write_index_manifest();
         Ok(())
     }
 
@@ -1508,202 +1336,343 @@ impl MantaStorageEngine {
         if self.ephemeral_only {
             return Ok(());
         }
-        self.ensure_or_load_key_file();
-
-        if let Some(ref path) = self.backing_file_path {
-            if let Ok(mut f) = fs::File::open(path) {
-                let mut buf = Vec::new();
-                f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-                self.deserialize_from_bytes(&buf)
-                    .map_err(|e| e.to_string())?;
-            }
+        let Some(root) = self.storage_dir_path.clone() else {
+            return Ok(());
+        };
+        if !root.exists() {
+            return Ok(());
         }
 
-        if let Some(wpath) = self.wal_file_path.clone() {
-            if let Ok(mut wf) = fs::File::open(&wpath) {
-                let mut wbuf = Vec::new();
-                if wf.read_to_end(&mut wbuf).is_ok() {
-                    self.replay_wal_bytes(&wbuf);
+        self.suppress_disk_write = true;
+
+        // 1. Load bookmarks.json
+        if let Ok(raw) = fs::read_to_string(root.join("bookmarks.json")) {
+            if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
+                self.bookmarks.clear();
+                for item in arr {
+                    if let JsonVal::Obj(pairs) = item {
+                        let url = json_get_str(&pairs, "url").unwrap_or_default();
+                        let title = json_get_str(&pairs, "title").unwrap_or_default();
+                        if !url.is_empty() {
+                            self.bookmarks.push(BookmarkEntry { url, title });
+                        }
+                    }
                 }
             }
         }
+
+        // 2. Load history.json
+        if let Ok(raw) = fs::read_to_string(root.join("history.json")) {
+            if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
+                self.history.clear();
+                for item in arr {
+                    if let JsonVal::Obj(pairs) = item {
+                        let url = json_get_str(&pairs, "url").unwrap_or_default();
+                        let title = json_get_str(&pairs, "title").unwrap_or_default();
+                        let visit_count = json_get_i64(&pairs, "visit_count").unwrap_or(1).max(1) as u32;
+                        if !url.is_empty() {
+                            self.history.push(HistoryVisitEntry {
+                                url,
+                                title,
+                                visit_count,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Load tabs_session.json
+        if let Ok(raw) = fs::read_to_string(root.join("tabs_session.json")) {
+            if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
+                self.saved_tabs.clear();
+                for item in arr {
+                    if let JsonVal::Obj(pairs) = item {
+                        let tab_id = json_get_i64(&pairs, "tab_id").unwrap_or(0) as u32;
+                        let url = json_get_str(&pairs, "url").unwrap_or_default();
+                        let title = json_get_str(&pairs, "title").unwrap_or_default();
+                        let scroll_y = json_get_i64(&pairs, "scroll_y").unwrap_or(0) as i32;
+                        if tab_id > 0 && !url.is_empty() {
+                            self.saved_tabs.insert(
+                                tab_id,
+                                SavedTabSession {
+                                    tab_id,
+                                    url,
+                                    title,
+                                    scroll_y,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Load per-origin directories under sites/
+        let sites_dir = root.join("sites");
+        if let Ok(entries) = fs::read_dir(&sites_dir) {
+            for entry in entries.flatten() {
+                let sdir = entry.path();
+                if !sdir.is_dir() {
+                    continue;
+                }
+                let origin_url = fs::read_to_string(sdir.join("meta.json"))
+                    .ok()
+                    .and_then(|raw| parse_json(&raw))
+                    .and_then(|v| match v {
+                        JsonVal::Obj(pairs) => json_get_str(&pairs, "origin"),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        folder_slug_to_origin(
+                            sdir.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("https__unknown"),
+                        )
+                    });
+
+                let serialized = OriginKey::from_url(&origin_url).serialize();
+                if serialized == "null" {
+                    continue;
+                }
+
+                // local_storage.json
+                if let Ok(raw) = fs::read_to_string(sdir.join("local_storage.json")) {
+                    if let Some(JsonVal::Obj(pairs)) = parse_json(&raw) {
+                        for (k, v) in pairs {
+                            if let JsonVal::Str(s) = v {
+                                let _ = self.set_kv_internal(&serialized, &k, &s, false);
+                            }
+                        }
+                    }
+                }
+
+                // form_drafts.json
+                if let Ok(raw) = fs::read_to_string(sdir.join("form_drafts.json")) {
+                    if let Some(JsonVal::Obj(pairs)) = parse_json(&raw) {
+                        for (k, v) in pairs {
+                            if let JsonVal::Str(s) = v {
+                                let _ = self.save_form_draft(&serialized, &k, &s);
+                            }
+                        }
+                    }
+                }
+
+                // cookies.json
+                if let Ok(raw) = fs::read_to_string(sdir.join("cookies.json")) {
+                    if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
+                        let bucket = self.origins.entry(serialized.clone()).or_default();
+                        for item in arr {
+                            if let JsonVal::Obj(pairs) = item {
+                                let name = json_get_str(&pairs, "name").unwrap_or_default();
+                                let value = json_get_str(&pairs, "value").unwrap_or_default();
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                let domain = json_get_str(&pairs, "domain").unwrap_or_default();
+                                let path =
+                                    json_get_str(&pairs, "path").unwrap_or_else(|| "/".to_string());
+                                let secure = json_get_bool(&pairs, "secure").unwrap_or(false);
+                                let http_only = json_get_bool(&pairs, "http_only").unwrap_or(false);
+                                let same_site = json_get_str(&pairs, "same_site")
+                                    .unwrap_or_else(|| "Lax".to_string());
+                                let cost = name.len() + value.len();
+                                bucket.cookies.insert(
+                                    name.clone(),
+                                    StoredCookie {
+                                        name,
+                                        value,
+                                        domain,
+                                        path,
+                                        secure,
+                                        http_only,
+                                        same_site,
+                                    },
+                                );
+                                bucket.used_bytes += cost;
+                                self.total_used_bytes += cost;
+                            }
+                        }
+                    }
+                }
+
+                // indexeddb/*.json
+                let idb_dir = sdir.join("indexeddb");
+                if let Ok(idb_entries) = fs::read_dir(&idb_dir) {
+                    for idb_ent in idb_entries.flatten() {
+                        let p = idb_ent.path();
+                        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                            continue;
+                        }
+                        let store_name = p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Ok(raw) = fs::read_to_string(&p) {
+                            if let Some(JsonVal::Obj(pairs)) = parse_json(&raw) {
+                                for (k, v) in pairs {
+                                    if let JsonVal::Str(s) = v {
+                                        let _ = self.put_idb_object(&serialized, &store_name, &k, &s);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // files/ (index metadata only — keep file bodies out of RAM!)
+                let files_dir = sdir.join("files");
+                if files_dir.is_dir() {
+                    let mut found = Vec::new();
+                    collect_files_recursive(&files_dir, &files_dir, &mut found);
+                    let bucket = self.origins.entry(serialized.clone()).or_default();
+                    for (rel, _, size) in found {
+                        let vpath = format!("/{}", rel);
+                        bucket.saved_files_meta.insert(
+                            vpath,
+                            ("application/octet-stream".to_string(), size as usize, None),
+                        );
+                        bucket.used_bytes += size as usize;
+                        self.total_used_bytes += size as usize;
+                    }
+                }
+            }
+        }
+
+        self.suppress_disk_write = false;
         Ok(())
     }
+}
 
-    fn replay_wal_bytes(&mut self, bytes: &[u8]) {
-        let mut cur = 0usize;
-        while cur + 8 <= bytes.len() {
-            if &bytes[cur..cur + 4] != WAL_RECORD_MAGIC {
-                break;
-            }
-            cur += 4;
-            let Some(frame_len) = read_u32(bytes, &mut cur) else {
-                break;
-            };
-            let len = frame_len as usize;
-            if cur + len > bytes.len() {
-                break;
-            }
-            let sealed = &bytes[cur..cur + len];
-            cur += len;
+// =============================================================================
+// FILESYSTEM PERMISSION & ATOMIC WRITE UTILITIES
+// =============================================================================
 
-            if let Ok(mut plain) = open_record(&self.vault_key, WAL_RECORD_MAGIC, sealed) {
-                self.apply_decoded_wal_record(&plain);
-                secure_zero_slice(&mut plain);
-                self.wal_pending_ops += 1;
-            }
-        }
+fn ensure_dir_readable(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
     }
+    Ok(())
+}
 
-    fn apply_decoded_wal_record(&mut self, plain: &[u8]) {
-        if plain.is_empty() {
-            return;
-        }
-        let Some(op) = WalOp::from_u8(plain[0]) else {
-            return;
-        };
-        let mut cur = 1usize;
-        let Some(field_count) = read_u32(plain, &mut cur) else {
-            return;
-        };
-        let mut fields = Vec::with_capacity((field_count as usize).min(8));
-        for _ in 0..field_count {
-            let Some(b) = read_bytes(plain, &mut cur) else {
-                return;
-            };
-            fields.push(b);
-        }
+fn atomic_write_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir_readable(parent)?;
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+    {
+        let mut f = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+        f.write_all(data).map_err(|e| e.to_string())?;
+        let _ = f.sync_all();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o644));
+    }
+    fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
 
-        let str_at = |i: usize| -> String {
-            fields
-                .get(i)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .unwrap_or("")
-                .to_string()
-        };
-
-        match op {
-            WalOp::SetLocal if fields.len() >= 3 => {
-                let _ = self.set_kv_internal(&str_at(0), &str_at(1), &str_at(2), false);
-            }
-            WalOp::RemoveLocal if fields.len() >= 2 => {
-                let _ = self.remove_kv_internal(&str_at(0), &str_at(1), false);
-            }
-            WalOp::ClearLocal if !fields.is_empty() => {
-                let orig = OriginKey::from_url(&str_at(0));
-                if let Some(bucket) = self.origins.get_mut(&orig.serialize()) {
-                    let freed: usize = bucket
-                        .local_storage
-                        .iter()
-                        .map(|(k, v)| k.len() + v.len())
-                        .sum();
-                    bucket.local_storage.clear();
-                    bucket.used_bytes = bucket.used_bytes.saturating_sub(freed);
-                    self.kv_cookie_used_bytes = self.kv_cookie_used_bytes.saturating_sub(freed);
-                }
-            }
-            WalOp::SaveFormDraft if fields.len() >= 3 => {
-                self.apply_save_form_draft(&str_at(0), &str_at(1), &str_at(2));
-            }
-            WalOp::SetCookie if fields.len() >= 2 => {
-                self.apply_set_cookie_from_header(&str_at(0), &str_at(1));
-            }
-            WalOp::RecordHistory if fields.len() >= 2 => {
-                self.apply_record_history_visit(&str_at(0), &str_at(1));
-            }
-            WalOp::ClearHistory => {
-                self.history.clear();
-            }
-            WalOp::ToggleBookmark if fields.len() >= 2 => {
-                self.apply_toggle_bookmark(&str_at(0), &str_at(1));
-            }
-            WalOp::IdbPut if fields.len() >= 4 => {
-                self.db
-                    .put_object(&str_at(0), &str_at(1), &str_at(2), &str_at(3));
-            }
-            WalOp::IdbDelete if fields.len() >= 3 => {
-                self.db.delete_object(&str_at(0), &str_at(1), &str_at(2));
-            }
-            WalOp::VfsSave if fields.len() >= 4 => {
-                self.db
-                    .save_virtual_file(&str_at(0), &str_at(1), &str_at(2), &fields[3]);
-            }
-            WalOp::ClearOrigin if !fields.is_empty() => {
-                self.apply_clear_origin(&str_at(0));
-            }
-            WalOp::DbCreateTable if fields.len() >= 3 => {
-                let mut c = 0usize;
-                if let Some(cnt) = read_u32(&fields[2], &mut c) {
-                    let mut cols = Vec::with_capacity((cnt as usize).min(256));
-                    for _ in 0..cnt {
-                        if let Some(col) = read_str(&fields[2], &mut c) {
-                            cols.push(col);
-                        }
-                    }
-                    self.db.create_table(&str_at(0), &str_at(1), cols);
-                }
-            }
-            WalOp::DbInsertRow if fields.len() >= 3 => {
-                let mut c = 0usize;
-                if let Some(cnt) = read_u32(&fields[2], &mut c) {
-                    let mut vals = Vec::with_capacity((cnt as usize).min(256));
-                    for _ in 0..cnt {
-                        if let Some(v) = read_db_value(&fields[2], &mut c) {
-                            vals.push(v);
-                        }
-                    }
-                    self.db.insert_row(&str_at(0), &str_at(1), vals);
-                }
-            }
-            WalOp::DbDropTable if fields.len() >= 2 => {
-                self.db.drop_table(&str_at(0), &str_at(1));
-            }
-            WalOp::SaveTabSession if fields.len() >= 4 && fields[0].len() == 4 && fields[3].len() == 4 => {
-                let tid = u32::from_le_bytes(fields[0][..4].try_into().unwrap());
-                let sy = i32::from_le_bytes(fields[3][..4].try_into().unwrap());
-                self.saved_tabs.insert(
-                    tid,
-                    SavedTabSession {
-                        tab_id: tid,
-                        url: str_at(1),
-                        title: str_at(2),
-                        scroll_y: sy,
-                    },
-                );
-            }
-            WalOp::RemoveTabSession if !fields.is_empty() && fields[0].len() == 4 => {
-                let tid = u32::from_le_bytes(fields[0][..4].try_into().unwrap());
-                self.saved_tabs.remove(&tid);
-            }
-            _ => {}
+fn collect_files_recursive(root: &Path, cur: &Path, out: &mut Vec<(String, String, u64)>) {
+    let Ok(entries) = fs::read_dir(cur) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_files_recursive(root, &p, out);
+        } else if p.is_file() {
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let abs = p.to_string_lossy().into_owned();
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push((rel, abs, size));
         }
     }
 }
 
-fn url_to_safe_slug(url: &str) -> String {
-    let mut s = String::with_capacity(url.len().min(96));
-    for c in url.chars().take(96) {
+fn origin_to_folder_slug(serialized_origin: &str) -> String {
+    let replaced = serialized_origin
+        .replace("://", "__")
+        .replace(':', "__");
+    let clean: String = replaced
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "unknown_site".to_string()
+    } else {
+        clean
+    }
+}
+
+fn folder_slug_to_origin(slug: &str) -> String {
+    if let Some((scheme, rest)) = slug.split_once("__") {
+        if let Some((host, port)) = rest.split_once("__") {
+            return format!("{}://{}:{}", scheme, host, port);
+        }
+        return format!("{}://{}", scheme, rest);
+    }
+    format!("https://{}", slug)
+}
+
+fn safe_file_slug(raw: &str) -> String {
+    let mut s = String::with_capacity(raw.len().min(96));
+    for c in raw.chars().take(96) {
         if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
             s.push(c);
         } else {
             s.push('_');
         }
     }
-    if s.is_empty() {
+    let trimmed = s.trim_matches('_');
+    if trimmed.is_empty() {
         "index".to_string()
     } else {
-        s
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_virtual_path(raw: &str) -> String {
+    let trimmed = raw.trim().replace('\\', "/");
+    let mut parts = Vec::new();
+    for seg in trimmed.split('/') {
+        let s = seg.trim();
+        if s.is_empty() || s == "." || s == ".." {
+            continue;
+        }
+        parts.push(s);
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", parts.join("/"))
     }
 }
 
 fn map_to_json_object(map: &HashMap<String, String>) -> String {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
     let mut out = String::from("{");
-    let mut first = true;
-    for (k, v) in map {
-        if !first {
+    for (idx, k) in keys.iter().enumerate() {
+        if idx > 0 {
             out.push(',');
         }
-        first = false;
+        let v = &map[*k];
         out.push('"');
         out.push_str(&escape_json_str(k));
         out.push_str("\":\"");
@@ -1714,120 +1683,23 @@ fn map_to_json_object(map: &HashMap<String, String>) -> String {
     out
 }
 
-fn write_db_value(out: &mut Vec<u8>, val: &DbValue) {
-    match val {
-        DbValue::Null => out.push(0),
-        DbValue::Int(i) => {
-            out.push(1);
-            out.extend_from_slice(&i.to_le_bytes());
+fn map_to_pretty_json(map: &HashMap<String, String>) -> String {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let mut out = String::from("{\n");
+    for (idx, k) in keys.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(",\n");
         }
-        DbValue::Float(f) => {
-            out.push(2);
-            out.extend_from_slice(&f.to_bits().to_le_bytes());
-        }
-        DbValue::Text(s) => {
-            out.push(3);
-            write_str(out, s);
-        }
-        DbValue::Blob(b) => {
-            out.push(4);
-            write_bytes(out, b);
-        }
+        let v = &map[*k];
+        out.push_str("  \"");
+        out.push_str(&escape_json_str(k));
+        out.push_str("\": \"");
+        out.push_str(&escape_json_str(v));
+        out.push('"');
     }
-}
-
-fn read_db_value(buf: &[u8], cursor: &mut usize) -> Option<DbValue> {
-    if *cursor >= buf.len() {
-        return None;
-    }
-    let tag = buf[*cursor];
-    *cursor += 1;
-    match tag {
-        0 => Some(DbValue::Null),
-        1 => {
-            if *cursor + 8 > buf.len() {
-                return None;
-            }
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&buf[*cursor..*cursor + 8]);
-            *cursor += 8;
-            Some(DbValue::Int(i64::from_le_bytes(arr)))
-        }
-        2 => {
-            let bits = read_u64(buf, cursor)?;
-            Some(DbValue::Float(f64::from_bits(bits)))
-        }
-        3 => Some(DbValue::Text(read_str(buf, cursor)?)),
-        4 => Some(DbValue::Blob(read_bytes(buf, cursor)?)),
-        _ => None,
-    }
-}
-
-fn write_u32(out: &mut Vec<u8>, val: u32) {
-    out.extend_from_slice(&val.to_le_bytes());
-}
-
-fn write_u64(out: &mut Vec<u8>, val: u64) {
-    out.extend_from_slice(&val.to_le_bytes());
-}
-
-fn write_str(out: &mut Vec<u8>, s: &str) {
-    write_bytes(out, s.as_bytes());
-}
-
-fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    write_u32(out, bytes.len() as u32);
-    out.extend_from_slice(bytes);
-}
-
-fn read_u32(buf: &[u8], cursor: &mut usize) -> Option<u32> {
-    if *cursor + 4 > buf.len() {
-        return None;
-    }
-    let mut arr = [0u8; 4];
-    arr.copy_from_slice(&buf[*cursor..*cursor + 4]);
-    *cursor += 4;
-    Some(u32::from_le_bytes(arr))
-}
-
-fn read_u64(buf: &[u8], cursor: &mut usize) -> Option<u64> {
-    if *cursor + 8 > buf.len() {
-        return None;
-    }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(&buf[*cursor..*cursor + 8]);
-    *cursor += 8;
-    Some(u64::from_le_bytes(arr))
-}
-
-fn read_bytes(buf: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
-    let len = read_u32(buf, cursor)? as usize;
-    if *cursor + len > buf.len() {
-        return None;
-    }
-    let slice = buf[*cursor..*cursor + len].to_vec();
-    *cursor += len;
-    Some(slice)
-}
-
-fn read_str(buf: &[u8], cursor: &mut usize) -> Option<String> {
-    let bytes = read_bytes(buf, cursor)?;
-    String::from_utf8(bytes).ok()
-}
-
-fn crc32_hash(bytes: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in bytes {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
+    out.push_str("\n}\n");
+    out
 }
 
 fn escape_json_str(s: &str) -> String {
@@ -1839,10 +1711,197 @@ fn escape_json_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             _ => out.push(c),
         }
     }
     out
+}
+
+// =============================================================================
+// LIGHTWEIGHT PURE-RUST JSON PARSER FOR READ-BACK
+// =============================================================================
+
+enum JsonVal {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Str(String),
+    Arr(Vec<JsonVal>),
+    Obj(Vec<(String, JsonVal)>),
+}
+
+fn parse_json(input: &str) -> Option<JsonVal> {
+    let b = input.as_bytes();
+    let mut cur = 0usize;
+    parse_val(b, &mut cur)
+}
+
+fn skip_ws(b: &[u8], cur: &mut usize) {
+    while *cur < b.len() && b[*cur].is_ascii_whitespace() {
+        *cur += 1;
+    }
+}
+
+fn parse_val(b: &[u8], cur: &mut usize) -> Option<JsonVal> {
+    skip_ws(b, cur);
+    if *cur >= b.len() {
+        return None;
+    }
+    match b[*cur] {
+        b'n' if b[*cur..].starts_with(b"null") => {
+            *cur += 4;
+            Some(JsonVal::Null)
+        }
+        b't' if b[*cur..].starts_with(b"true") => {
+            *cur += 4;
+            Some(JsonVal::Bool(true))
+        }
+        b'f' if b[*cur..].starts_with(b"false") => {
+            *cur += 5;
+            Some(JsonVal::Bool(false))
+        }
+        b'"' => Some(JsonVal::Str(parse_str(b, cur)?)),
+        b'[' => {
+            *cur += 1;
+            let mut items = Vec::new();
+            skip_ws(b, cur);
+            if *cur < b.len() && b[*cur] == b']' {
+                *cur += 1;
+                return Some(JsonVal::Arr(items));
+            }
+            while *cur < b.len() {
+                items.push(parse_val(b, cur)?);
+                skip_ws(b, cur);
+                if *cur < b.len() && b[*cur] == b',' {
+                    *cur += 1;
+                } else if *cur < b.len() && b[*cur] == b']' {
+                    *cur += 1;
+                    break;
+                } else {
+                    return None;
+                }
+            }
+            Some(JsonVal::Arr(items))
+        }
+        b'{' => {
+            *cur += 1;
+            let mut pairs = Vec::new();
+            skip_ws(b, cur);
+            if *cur < b.len() && b[*cur] == b'}' {
+                *cur += 1;
+                return Some(JsonVal::Obj(pairs));
+            }
+            while *cur < b.len() {
+                skip_ws(b, cur);
+                let key = parse_str(b, cur)?;
+                skip_ws(b, cur);
+                if *cur >= b.len() || b[*cur] != b':' {
+                    return None;
+                }
+                *cur += 1;
+                let val = parse_val(b, cur)?;
+                pairs.push((key, val));
+                skip_ws(b, cur);
+                if *cur < b.len() && b[*cur] == b',' {
+                    *cur += 1;
+                } else if *cur < b.len() && b[*cur] == b'}' {
+                    *cur += 1;
+                    break;
+                } else {
+                    return None;
+                }
+            }
+            Some(JsonVal::Obj(pairs))
+        }
+        _ => {
+            let start = *cur;
+            while *cur < b.len()
+                && (b[*cur].is_ascii_digit() || matches!(b[*cur], b'-' | b'+' | b'.' | b'e' | b'E'))
+            {
+                *cur += 1;
+            }
+            let s = std::str::from_utf8(&b[start..*cur]).ok()?;
+            let n = s.parse::<i64>().unwrap_or(0);
+            Some(JsonVal::Int(n))
+        }
+    }
+}
+
+fn parse_str(b: &[u8], cur: &mut usize) -> Option<String> {
+    if *cur >= b.len() || b[*cur] != b'"' {
+        return None;
+    }
+    *cur += 1;
+    let mut out = String::new();
+    while *cur < b.len() {
+        let byte = b[*cur];
+        if byte == b'"' {
+            *cur += 1;
+            return Some(out);
+        }
+        if byte == b'\\' {
+            *cur += 1;
+            if *cur >= b.len() {
+                return None;
+            }
+            match b[*cur] {
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'u' if *cur + 4 < b.len() => {
+                    let hex = std::str::from_utf8(&b[*cur + 1..*cur + 5]).ok()?;
+                    if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                        }
+                    }
+                    *cur += 4;
+                }
+                other => out.push(other as char),
+            }
+            *cur += 1;
+        } else {
+            let rest = std::str::from_utf8(&b[*cur..]).ok()?;
+            let ch = rest.chars().next()?;
+            out.push(ch);
+            *cur += ch.len_utf8();
+        }
+    }
+    None
+}
+
+fn json_get_str(pairs: &[(String, JsonVal)], key: &str) -> Option<String> {
+    pairs.iter().find_map(|(k, v)| {
+        if k == key {
+            if let JsonVal::Str(s) = v {
+                return Some(s.clone());
+            }
+        }
+        None
+    })
+}
+
+fn json_get_bool(pairs: &[(String, JsonVal)], key: &str) -> Option<bool> {
+    pairs.iter().find_map(|(k, v)| {
+        if k == key {
+            if let JsonVal::Bool(b) = v {
+                return Some(*b);
+            }
+        }
+        None
+    })
+}
+
+fn json_get_i64(pairs: &[(String, JsonVal)], key: &str) -> Option<i64> {
+    pairs.iter().find_map(|(k, v)| {
+        if k == key {
+            if let JsonVal::Int(n) = v {
+                return Some(*n);
+            }
+        }
+        None
+    })
 }
 
 #[cfg(test)]
@@ -1850,56 +1909,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encrypted_wal_replay_tables_tabs_and_offline_snapshot() {
-        let db_path = "./test_manta_wal_v4.db";
-        let _ = fs::remove_file(db_path);
-        let _ = fs::remove_file(format!("{}.wal", db_path));
-        let _ = fs::remove_file(format!("{}.key", db_path));
+    fn test_transparent_device_files_readback_locate_and_delete() {
+        let dir = "./test_manta_transparent_files";
+        let _ = fs::remove_dir_all(dir);
 
         {
             let mut store = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
-            store.set_backing_file(db_path);
+            store.set_storage_dir(dir);
 
             let origin = "https://manta.dev/workspace";
             assert!(store.set_local_storage(origin, "theme", "obsidian"));
             assert!(store.set_session_storage(origin, "volatile_tab", "only_in_ram"));
-            assert!(store.save_form_draft(origin, "/workspace::input::title", "Manta v3.0"));
+            assert!(store.save_form_draft(origin, "/workspace::input::title", "Manta v3.1"));
             assert!(store.set_cookie_from_header(origin, "auth=token_xyz; Path=/; Secure"));
             assert!(store.put_idb_object(origin, "cache", "k1", "{\"v\":1}"));
-
-            // Relational SQL table via encrypted WAL
-            assert!(store.db_create_table(origin, "notes", vec!["title".to_string(), "score".to_string()]));
-            assert_eq!(
-                store.db_insert_row(origin, "notes", vec![DbValue::Text("Fast".to_string()), DbValue::Int(100)]),
-                Some(1)
-            );
-            // Tab session & offline snapshot
+            assert!(store.save_vfs_file(origin, "/notes/todo.txt", "text/plain", b"Ship fast"));
+            store.record_history_visit(origin, "Manta Workspace");
+            assert!(store.toggle_bookmark(origin, "Manta Workspace"));
             store.save_tab_session_state(1, origin, "Workspace", 320);
-            assert!(store.save_offline_page_snapshot(origin, b"<html><body><h1>Saved Offline</h1></body></html>"));
+            assert!(store.save_offline_page_snapshot(
+                origin,
+                b"<html><body><h1>Saved Offline</h1></body></html>"
+            ));
+
+            // User can directly locate the exact origin folder & files on device
+            let origin_dir = store.locate_origin_dir(origin).unwrap();
+            assert!(Path::new(&origin_dir).join("local_storage.json").exists());
+            assert!(Path::new(&origin_dir).join("cookies.json").exists());
+            assert!(Path::new(&origin_dir).join("form_drafts.json").exists());
+            assert!(Path::new(&origin_dir).join("indexeddb/cache.json").exists());
+            assert!(Path::new(&origin_dir).join("files/notes/todo.txt").exists());
+            assert!(Path::new(dir).join("bookmarks.json").exists());
+            assert!(Path::new(dir).join("history.json").exists());
+            assert!(Path::new(dir).join("tabs_session.json").exists());
+            assert!(Path::new(dir).join("manta_index.json").exists());
+
+            let files_json = store.list_all_saved_files_json();
+            assert!(files_json.contains("local_storage.json"));
+            assert!(files_json.contains("todo.txt"));
         }
 
+        // Fresh engine reads back every file transparently
         let mut restored = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
-        restored.set_backing_file(db_path);
+        restored.set_storage_dir(dir);
         restored.load_from_backing_file().unwrap();
 
         assert_eq!(
             restored.get_local_storage("https://manta.dev", "theme"),
             Some("obsidian".to_string())
         );
+        // sessionStorage must NEVER persist to disk
         assert_eq!(
             restored.get_session_storage("https://manta.dev", "volatile_tab"),
             None
         );
-        let rows = restored.db.select_where("https://manta.dev", "notes", None, None);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1[0], DbValue::Text("Fast".to_string()));
-        let saved_tabs = restored.list_saved_tab_sessions();
-        assert_eq!(saved_tabs.len(), 1);
-        assert_eq!(saved_tabs[0].scroll_y, 320);
-        let off_html = restored.load_offline_page_snapshot("https://manta.dev/workspace").unwrap();
+        assert_eq!(
+            restored.get_idb_object("https://manta.dev", "cache", "k1"),
+            Some("{\"v\":1}".to_string())
+        );
+        assert_eq!(
+            restored.read_vfs_file("https://manta.dev", "/notes/todo.txt"),
+            Some(b"Ship fast".to_vec())
+        );
+        assert_eq!(restored.list_saved_tab_sessions().len(), 1);
+        assert_eq!(restored.list_saved_tab_sessions()[0].scroll_y, 320);
+
+        let off_html = restored
+            .load_offline_page_snapshot("https://manta.dev/workspace")
+            .unwrap();
         assert!(String::from_utf8_lossy(&off_html).contains("Saved Offline"));
 
+        // Per-origin deletion immediately deletes the origin folder from disk
+        let origin_dir = restored.locate_origin_dir("https://manta.dev").unwrap();
+        assert!(restored.clear_origin("https://manta.dev"));
+        assert!(!Path::new(&origin_dir).exists());
+
+        // Full deletion removes all remaining device files cleanly
         restored.clear_all();
-        assert!(!std::path::Path::new(db_path).exists());
+        assert!(!Path::new(dir).join("history.json").exists());
+        assert!(!Path::new(dir).join("bookmarks.json").exists());
+        assert!(!Path::new(dir).exists());
     }
 }

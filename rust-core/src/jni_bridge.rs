@@ -80,6 +80,53 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInit
 }
 
 #[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetStorageDir(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    unsafe { env.new_java_string(engine.storage.storage_dir().as_deref().unwrap_or("")) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeLocateOriginDir(
+    env: JNIEnv,
+    _class: JClass,
+    j_origin_url: JString,
+) -> JString {
+    let origin = unsafe { env.get_rust_string(j_origin_url) };
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    let dir = engine.storage.locate_origin_dir(&origin).unwrap_or_default();
+    unsafe { env.new_java_string(&dir) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeListStorageFilesJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("[]") };
+    };
+    let json = engine.storage.list_all_saved_files_json();
+    unsafe { env.new_java_string(&json) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeClearHistory(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut engine) = MantaEngine::global().lock() {
+        engine.storage.clear_history();
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetWorkerCoreCount(
     _env: JNIEnv,
     _class: JClass,

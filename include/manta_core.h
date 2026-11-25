@@ -9,7 +9,8 @@ extern "C" {
 #endif
 
 /**
- * Manta Core v3.0 — Universal Bolt-On C-ABI Header
+ * Manta Core v3.1 — Universal Bolt-On C-ABI Header
+ * Fixed-Latency Paced Rendering + Transparent Device File Storage
  */
 
 typedef int32_t (*MantaNetFetchCallback)(
@@ -21,7 +22,7 @@ typedef int32_t (*MantaNetFetchCallback)(
     void (*on_body_chunk)(void* user_ctx, const uint8_t* ptr, uint32_t len, bool is_eof)
 );
 
-uint32_t manta_abi_init_engine(const char* storage_path, const char* download_dir);
+uint32_t manta_abi_init_engine(const char* storage_dir, const char* download_dir);
 uint32_t manta_abi_get_worker_cores(void);
 void     manta_abi_register_net_transport(MantaNetFetchCallback callback);
 
@@ -71,9 +72,11 @@ bool     manta_abi_media_seek_ms(uint32_t stream_id, uint64_t target_ms);
 char*    manta_abi_media_get_stats_json(uint32_t stream_id);
 bool     manta_abi_media_close_stream(uint32_t stream_id);
 
-/* Encrypted WAL Storage, Tab Sessions, Offline Page Snapshots & Zero-Trace Mode */
+/* Transparent User-Accessible Device File Storage, Locator & Full Deletion */
 bool     manta_abi_set_ephemeral_mode(bool enabled);
-bool     manta_abi_set_vault_passphrase(const char* passphrase);
+char*    manta_abi_get_storage_dir(void);
+char*    manta_abi_locate_origin_dir(const char* origin_url);
+char*    manta_abi_list_storage_files_json(void);
 bool     manta_abi_storage_set(const char* origin_url, const char* key, const char* value, bool is_session);
 char*    manta_abi_storage_get(const char* origin_url, const char* key, bool is_session);
 bool     manta_abi_storage_remove(const char* origin_url, const char* key, bool is_session);
@@ -88,6 +91,8 @@ char*    manta_abi_load_page_offline(const char* url);
 char*    manta_abi_list_saved_tabs_json(void);
 char*    manta_abi_inspect_storage_manifest_json(void);
 bool     manta_abi_clear_origin_data(const char* origin_url);
+bool     manta_abi_clear_history(void);
+bool     manta_abi_clear_bookmarks(void);
 bool     manta_abi_shred_all_storage_and_ram(void);
 bool     manta_abi_flush_storage(void);
 
