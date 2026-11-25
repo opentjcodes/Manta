@@ -2366,6 +2366,7 @@ impl JsBytecodeCompiler {
                             _ => break,
                         };
                         let key_id = self.program.add_ident(&key_str);
+                        self.program.instructions.push(OpCode::Dup);
                         if self.peek() == &Token::Colon {
                             self.advance();
                             self.compile_expr()?;
@@ -2541,7 +2542,7 @@ impl MantaJsSandbox {
             gc_threshold: 1024,
             fuel_remaining: max_fuel,
             max_fuel,
-            max_time_budget_us: 25_000, // 25ms default ceiling; overridden by MantaConfig
+            max_time_budget_us: 25_000,
             script_start_us: now,
             vm_boot_us: now,
             rng_state: now ^ 0x9E37_79B9_7F4A_7C15,
@@ -2732,7 +2733,6 @@ impl MantaJsSandbox {
         Ok(id)
     }
 
-    /// Exact Mark-and-Sweep GC recycling unreachable JS Objects, Arrays, AND dead ScopeFrames!
     fn maybe_collect_garbage(
         &mut self,
         stack: &[JsValue],
@@ -3322,7 +3322,6 @@ impl MantaJsSandbox {
             }
             self.fuel_remaining -= 1;
 
-            // Fixed-latency microsecond compute pacing checked every 256 instructions
             if (self.fuel_remaining & 0xFF) == 0 && self.is_time_budget_exceeded() {
                 return Err("JS execution paused: fixed compute budget reached");
             }
@@ -6370,7 +6369,6 @@ impl MantaJsSandbox {
                         Ok(JsValue::Number(s))
                     }
                     ("Math", "random") => {
-                        // Fast xorshift64* PRNG
                         let mut x = self.rng_state;
                         if x == 0 {
                             x = 0x2545_F491_4F6C_DD1D;
@@ -6831,6 +6829,10 @@ mod tests {
             const { ver, missing = 10 } = core;
             const [first, ...rest] = [10, 20, 30];
 
+            // Multi-property object literal & spread verification
+            const mergedObj = { a: 1, b: 2, ...{ c: 3 } };
+            let objLitSum = mergedObj.a + mergedObj.b + mergedObj.c;
+
             function sumThree(a, b, c) { return a + b + c; }
             let spreadSum = sumThree(5, ...[15, 30]);
             let foldedConst = 2 + 3 * 4 + 10;
@@ -6892,6 +6894,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(vm.get_global("objLitSum"), Some(&JsValue::Number(6.0)));
         assert_eq!(vm.get_global("spreadSum"), Some(&JsValue::Number(50.0)));
         assert_eq!(vm.get_global("foldedConst"), Some(&JsValue::Number(24.0)));
         assert_eq!(vm.get_global("firstSorted"), Some(&JsValue::Number(1.0)));
