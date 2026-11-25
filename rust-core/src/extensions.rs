@@ -166,7 +166,6 @@ impl ExtensionHost {
         let version = json_get_str(&pairs, "version").unwrap_or_else(|| "1.0.0".to_string());
         let manifest_version = json_get_i64(&pairs, "manifest_version").unwrap_or(3).clamp(2, 3) as u8;
 
-        // Resolve Gecko ID (`browser_specific_settings.gecko.id`) or derive safe slug from name
         let gecko_id = json_get(&pairs, "browser_specific_settings")
             .and_then(|v| match v {
                 JsonVal::Obj(p) => json_get(p, "gecko"),
@@ -218,7 +217,6 @@ impl ExtensionHost {
             }
         }
 
-        // Load declarative_net_request rule resources (MV3 ad/tracker blockers)
         let mut blocked_url_patterns = json_get_str_array(&pairs, "manta_block_rules");
         if let Some(JsonVal::Obj(dnr_obj)) = json_get(&pairs, "declarative_net_request") {
             if let Some(JsonVal::Arr(resources)) = json_get(dnr_obj, "rule_resources") {
@@ -295,7 +293,6 @@ impl ExtensionHost {
         }
     }
 
-    /// Collects all matching CSS stylesheets & JS content scripts for `url` from enabled extensions.
     pub fn collect_for_url(&self, url: &str) -> (Vec<String>, Vec<(String, String)>, Vec<(String, String)>) {
         if self.extensions.is_empty() {
             return (Vec::new(), Vec::new(), Vec::new());
@@ -326,7 +323,6 @@ impl ExtensionHost {
         (css_list, start_js, end_js)
     }
 
-    /// Compiles combined host-WebView extension bootstrap script for matching enabled extensions.
     pub fn compile_host_scripts_for_url(&self, url: &str) -> String {
         if self.extensions.is_empty() {
             return String::new();
@@ -350,11 +346,12 @@ impl ExtensionHost {
     }
 
     pub fn ext_storage_set(&mut self, ext_id: &str, key: &str, value: &str) -> bool {
+        let path_opt = self.ext_storage_file(ext_id);
         let Some(ext) = self.extensions.get_mut(ext_id) else {
             return false;
         };
         ext.storage_local.insert(key.to_string(), value.to_string());
-        if let Some(path) = self.ext_storage_file(ext_id) {
+        if let Some(path) = path_opt {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -424,7 +421,6 @@ fn rule_matches_url(rule: &ContentScriptRule, url: &str) -> bool {
         .any(|p| matches_firefox_pattern(p, url))
 }
 
-/// Implements MDN / Firefox WebExtensions match patterns (`<all_urls>`, `*://*.example.com/*`, etc.).
 pub fn matches_firefox_pattern(pattern: &str, url: &str) -> bool {
     let pat = pattern.trim();
     if pat == "<all_urls>" || pat == "*" {
@@ -616,7 +612,6 @@ mod tests {
         let ext_id = host.install_from_dir(ext_dir).unwrap();
         assert_eq!(ext_id, "dark-shield@manta.dev");
 
-        // Subdomain & root domain match per Firefox spec
         assert!(matches_firefox_pattern("*://*.example.com/*", "https://example.com/home"));
         assert!(matches_firefox_pattern("*://*.example.com/*", "https://docs.example.com/a"));
         assert!(!matches_firefox_pattern("*://*.example.com/*", "https://other.org/a"));
@@ -626,7 +621,6 @@ mod tests {
         assert_eq!(end_js.len(), 1);
         assert!(end_js[0].1.contains("dark-shield@manta.dev"));
 
-        // Network tracker blocked before socket opens
         let mut req = InterceptedRequest {
             method: "GET".to_string(),
             url: "https://tracker.ads.net/pixel.js".to_string(),
@@ -637,7 +631,6 @@ mod tests {
             ModuleDecision::Block { .. }
         ));
 
-        // Disabling extension immediately disables blocker
         assert!(host.set_enabled(&ext_id, false));
         assert!(matches!(
             bus.dispatch_before_request(&mut req),
