@@ -25,6 +25,14 @@ void     manta_cpp_arena_free(void* ptr, size_t bytes);
 size_t   manta_cpp_scan_html_delim(const uint8_t* data, size_t len, size_t start);
 int32_t  manta_cpp_ascii_casecmp(const uint8_t* a, const uint8_t* b, size_t len);
 
+/* 64-bit 2-bit Ancestor Bloom Filter bitmask for O(1) CSS selector rejection */
+uint64_t manta_cpp_bloom_bit(const uint8_t* data, size_t len);
+
+/* Batch viewport Y-band spatial culler for linear-time rendering */
+uint32_t manta_cpp_cull_y_bands(const float* y_mins, const float* y_maxs, uint32_t count,
+                                float view_min_y, float view_max_y,
+                                uint32_t* out_indices, uint32_t max_out);
+
 /* Zero-allocation UTF-8-safe text word wrapper for ultra-fast layout */
 uint32_t manta_cpp_wrap_text_lines(const uint8_t* text, size_t len,
                                    float char_w, float max_w,

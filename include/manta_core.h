@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 /**
- * Manta Core v3.1 — Universal Bolt-On C-ABI Header
- * Fixed-Latency Paced Rendering + Transparent Device File Storage
+ * Manta Core v4.0 — Universal Bolt-On C-ABI Header
+ * Linear-Time Bloom CSS + Fixed-Latency Rendering + Optional Firefox WebExtensions + Transparent Files
  */
 
 typedef int32_t (*MantaNetFetchCallback)(
@@ -34,8 +34,14 @@ uint32_t manta_abi_active_tab_id(void);
 uint32_t manta_abi_open_tab_count(void);
 char*    manta_abi_get_memory_stats_json(void);
 
-/* High-Velocity Kernel Script & Web Compatibility Compiler */
+/* High-Velocity Kernel Script, Web Compat & Optional Firefox Extension Script Compiler */
 char*    manta_abi_compile_kernel_script(const char* origin_url);
+
+/* Optional Firefox WebExtensions (MV2 / MV3) Host Controls */
+char*    manta_abi_ext_install_dir(const char* ext_dir_path);
+bool     manta_abi_ext_set_enabled(const char* ext_id, bool enabled);
+bool     manta_abi_ext_uninstall(const char* ext_id);
+char*    manta_abi_ext_list_json(void);
 
 /* Full End-to-End Page Navigation (HTML + External CSS/JS via Keep-Alive) & Chunk Streaming */
 char*    manta_abi_navigate_url(uint32_t tab_id, const char* url);

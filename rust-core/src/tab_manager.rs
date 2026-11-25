@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use crate::clipboard::ClipboardSandbox;
-use crate::css_engine::MicroCssEngine;
+use crate::css_engine::{ComputedStyle, MicroCssEngine};
 use crate::dom_arena::{NodeId, ZeroCopyDomArena};
 use crate::downloads_engine::MantaDownloadManager;
+use crate::extensions::ExtensionHost;
 use crate::html_tokenizer::StreamingHtmlTokenizer;
 use crate::input_forms::{FormControlKind, SerializedFormSubmission};
-use crate::js_vm::MantaJsSandbox;
+use crate::js::MantaJsSandbox;
 use crate::media_stream::resolve_relative_url;
 use crate::module_bus::ModuleBus;
 use crate::net_stream::StreamingNetworkPipe;
@@ -25,7 +26,6 @@ pub enum TabLifecycleState {
     ActiveBackgroundCompacted,
 }
 
-/// Complete fetched page + external subresources bundle fetched off-lock over Keep-Alive.
 pub struct FetchedPageBundle {
     pub final_url: String,
     pub html_bytes: Vec<u8>,
@@ -47,6 +47,9 @@ pub struct TabSandbox {
     pub dom: ZeroCopyDomArena,
     pub css: MicroCssEngine,
     pub js_vm: MantaJsSandbox,
+    pub style_cache: Vec<ComputedStyle>,
+    pub style_cache_gen: u64,
+    pub style_cache_width: f32,
     pub cached_frame: Option<DisplayListFrame>,
     pub cached_frame_gen: u64,
     pub cached_frame_scroll: i32,
@@ -76,6 +79,9 @@ impl TabSandbox {
             dom: ZeroCopyDomArena::new(max_ram_bytes),
             css: MicroCssEngine::new(),
             js_vm,
+            style_cache: Vec::new(),
+            style_cache_gen: 0,
+            style_cache_width: 0.0,
             cached_frame: None,
             cached_frame_gen: 0,
             cached_frame_scroll: -1,
@@ -86,6 +92,7 @@ impl TabSandbox {
     pub fn invalidate_frame_cache(&mut self) {
         self.cached_frame = None;
         self.cached_frame_gen = 0;
+        self.style_cache_gen = 0;
     }
 
     pub fn compact_background_memory(&mut self, vault: &mut VolatileRamVault) {
@@ -93,6 +100,9 @@ impl TabSandbox {
         self.is_hibernated = false;
         self.cached_frame = None;
         self.cached_frame_gen = 0;
+        self.style_cache.clear();
+        self.style_cache.shrink_to_fit();
+        self.style_cache_gen = 0;
         self.tokenizer.shrink_buffers();
         self.dom.release_transient_sources_and_compact();
         TabCompressor::store_tab_snapshot(
@@ -106,6 +116,8 @@ impl TabSandbox {
 
     pub fn release_all(&mut self, vault: &mut VolatileRamVault) {
         self.cached_frame = None;
+        self.style_cache.clear();
+        self.style_cache.shrink_to_fit();
         self.dom.clear_and_shrink();
         self.css.clear();
         self.js_vm.reset();
@@ -253,7 +265,6 @@ impl TabManager {
         }
     }
 
-    /// Standalone lock-free HTTP/HTTPS page + external CSS/JS subresource fetcher using Keep-Alive.
     pub fn fetch_page_bundle(
         url: &str,
         cookie_header: &str,
@@ -348,11 +359,12 @@ impl TabManager {
         vault: &mut VolatileRamVault,
         storage: &mut MantaStorageEngine,
         downloads: &mut MantaDownloadManager,
+        extensions: Option<&ExtensionHost>,
     ) -> Result<DisplayListFrame, &'static str> {
         for cookie_hdr in &bundle.set_cookies {
             storage.set_cookie_from_header(&bundle.final_url, cookie_hdr);
         }
-        self.load_stream_chunk_with_externals(
+        self.load_stream_chunk_full(
             tab_id,
             &bundle.final_url,
             &bundle.html_bytes,
@@ -363,6 +375,7 @@ impl TabManager {
             vault,
             storage,
             downloads,
+            extensions,
         )
     }
 
@@ -488,6 +501,7 @@ impl TabManager {
             .serialize_submission(form_or_control_id, &tab.current_url)
     }
 
+    /// Zero-CSS-recalc viewport scrolling: reuses `tab.style_cache` when DOM & width match!
     pub fn render_viewport_frame(
         &mut self,
         tab_id: TabId,
@@ -511,9 +525,18 @@ impl TabManager {
             }
         }
 
-        let frame = DisplayListFrame::build_paced(
+        if tab.style_cache_gen != tab.dom.generation
+            || (tab.style_cache_width - viewport_w).abs() >= 1.0
+            || tab.style_cache.len() != tab.dom.nodes().len()
+        {
+            tab.style_cache = tab.css.compute_style_tree(&tab.dom, layout_budget / 2);
+            tab.style_cache_gen = tab.dom.generation;
+            tab.style_cache_width = viewport_w;
+        }
+
+        let frame = DisplayListFrame::build_with_styles(
             &tab.dom,
-            &tab.css,
+            &tab.style_cache,
             viewport_w,
             scroll_y,
             viewport_h,
@@ -582,22 +605,13 @@ impl TabManager {
         storage: &mut MantaStorageEngine,
         downloads: &mut MantaDownloadManager,
     ) -> Result<DisplayListFrame, &'static str> {
-        self.load_stream_chunk_with_externals(
-            tab_id,
-            url,
-            chunk,
-            is_eof,
-            &[],
-            &[],
-            modules,
-            vault,
-            storage,
-            downloads,
+        self.load_stream_chunk_full(
+            tab_id, url, chunk, is_eof, &[], &[], modules, vault, storage, downloads, None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn load_stream_chunk_with_externals(
+    pub fn load_stream_chunk_full(
         &mut self,
         tab_id: TabId,
         url: &str,
@@ -609,6 +623,7 @@ impl TabManager {
         vault: &mut VolatileRamVault,
         storage: &mut MantaStorageEngine,
         downloads: &mut MantaDownloadManager,
+        extensions: Option<&ExtensionHost>,
     ) -> Result<DisplayListFrame, &'static str> {
         self.monotonic_tick += 1;
         let tick = self.monotonic_tick;
@@ -671,6 +686,12 @@ impl TabManager {
                 }
             }
 
+            // Collect optional Firefox WebExtensions CSS & content scripts (O(1) no-op if none installed)
+            let (ext_css_list, ext_start_js, ext_end_js) = match extensions {
+                Some(host) if !host.is_empty() => host.collect_for_url(url),
+                _ => (Vec::new(), Vec::new(), Vec::new()),
+            };
+
             for ext_css in external_styles {
                 tab.css.parse_stylesheet(ext_css);
             }
@@ -679,8 +700,25 @@ impl TabManager {
                 tab.css.parse_stylesheet(stylesheet);
             }
             drop(styles);
+            for ext_css in &ext_css_list {
+                tab.css.parse_stylesheet(ext_css);
+            }
 
             let mut temp_clipboard = ClipboardSandbox::new(64 * 1024);
+
+            // 1. Optional Firefox extension `document_start` scripts
+            for (_, ext_js) in &ext_start_js {
+                let _ = tab.js_vm.execute_script_full(
+                    ext_js,
+                    url,
+                    &mut tab.dom,
+                    &mut temp_clipboard,
+                    storage,
+                    downloads,
+                );
+            }
+
+            // 2. Page external + inline scripts
             for ext_js in external_scripts {
                 let mut script = ext_js.clone();
                 if modules.dispatch_before_script(url, &mut script) {
@@ -708,13 +746,29 @@ impl TabManager {
                 }
             }
 
+            // 3. Optional Firefox extension `document_end` / `document_idle` scripts
+            for (_, ext_js) in &ext_end_js {
+                let _ = tab.js_vm.execute_script_full(
+                    ext_js,
+                    url,
+                    &mut tab.dom,
+                    &mut temp_clipboard,
+                    storage,
+                    downloads,
+                );
+            }
+
             tab.dom.release_transient_sources_and_compact();
             modules.dispatch_dom_ready(tab_id, url);
         }
 
-        let frame = DisplayListFrame::build_paced(
+        tab.style_cache = tab.css.compute_style_tree(&tab.dom, layout_budget / 2);
+        tab.style_cache_gen = tab.dom.generation;
+        tab.style_cache_width = 390.0;
+
+        let frame = DisplayListFrame::build_with_styles(
             &tab.dom,
-            &tab.css,
+            &tab.style_cache,
             390.0,
             0.0,
             f32::INFINITY,

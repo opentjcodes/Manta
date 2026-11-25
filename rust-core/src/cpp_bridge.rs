@@ -17,6 +17,16 @@ extern "C" {
     fn manta_cpp_arena_free(ptr: *mut u8, bytes: usize);
     fn manta_cpp_scan_html_delim(data: *const u8, len: usize, start: usize) -> usize;
     fn manta_cpp_ascii_casecmp(a: *const u8, b: *const u8, len: usize) -> i32;
+    fn manta_cpp_bloom_bit(data: *const u8, len: usize) -> u64;
+    fn manta_cpp_cull_y_bands(
+        y_mins: *const f32,
+        y_maxs: *const f32,
+        count: u32,
+        view_min_y: f32,
+        view_max_y: f32,
+        out_indices: *mut u32,
+        max_out: u32,
+    ) -> u32;
     fn manta_cpp_wrap_text_lines(
         text: *const u8,
         len: usize,
@@ -150,6 +160,40 @@ pub fn ascii_casecmp(a: &str, b: &str) -> bool {
         return false;
     }
     unsafe { manta_cpp_ascii_casecmp(a.as_ptr(), b.as_ptr(), a.len()) == 1 }
+}
+
+#[inline]
+pub fn bloom_bit(token: &str) -> u64 {
+    if token.is_empty() {
+        return 0;
+    }
+    unsafe { manta_cpp_bloom_bit(token.as_ptr(), token.len()) }
+}
+
+#[inline]
+pub fn cull_y_bands(
+    y_mins: &[f32],
+    y_maxs: &[f32],
+    view_min_y: f32,
+    view_max_y: f32,
+    out_indices: &mut [u32],
+) -> usize {
+    let count = y_mins.len().min(y_maxs.len()).min(u32::MAX as usize) as u32;
+    let max_out = out_indices.len().min(u32::MAX as usize) as u32;
+    if count == 0 || max_out == 0 {
+        return 0;
+    }
+    unsafe {
+        manta_cpp_cull_y_bands(
+            y_mins.as_ptr(),
+            y_maxs.as_ptr(),
+            count,
+            view_min_y,
+            view_max_y,
+            out_indices.as_mut_ptr(),
+            max_out,
+        ) as usize
+    }
 }
 
 #[inline]
@@ -608,14 +652,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cpp_simd_substr_regex_sort_wrap_and_clock() {
+    fn test_cpp_simd_bloom_cull_wrap_and_clock() {
         let html = b"Hello world this is plain text with <div>tags</div> &amp; entities";
         assert_eq!(scan_html_delim(html, 0), 36);
         assert!(ascii_casecmp("Content-Type", "content-type"));
         assert!(!ascii_casecmp("Content-Type", "content-len"));
         assert!(now_us() > 0);
 
-        // Zero-allocation C++ UTF-8 word wrapping
+        let b_div = bloom_bit("t:div");
+        let b_card = bloom_bit("c:card");
+        let combined = b_div | b_card;
+        assert_eq!(combined & b_div, b_div);
+        assert_eq!(combined & b_card, b_card);
+
+        let y_mins = [0.0f32, 100.0, 500.0, 900.0];
+        let y_maxs = [50.0f32, 200.0, 600.0, 1000.0];
+        let mut vis = [0u32; 4];
+        let n_vis = cull_y_bands(&y_mins, &y_maxs, 90.0, 550.0, &mut vis);
+        assert_eq!(n_vis, 2);
+        assert_eq!(&vis[..2], &[1, 2]);
+
         let sample = "Manta fixed-latency engine wraps UTF-8 text — cleanly across multiple lines!";
         let mut starts = [0u32; 16];
         let mut lens = [0u32; 16];

@@ -51,7 +51,7 @@ inline void write_u32_le(uint8_t* p, uint32_t v) {
 }
 
 inline bool f64_less(double a, double b) {
-    if (!(a == a)) return false; // NaN sorts last
+    if (!(a == a)) return false;
     if (!(b == b)) return true;
     return a < b;
 }
@@ -523,6 +523,30 @@ int32_t manta_cpp_ascii_casecmp(const uint8_t* a, const uint8_t* b, size_t len) 
     return 1;
 }
 
+uint64_t manta_cpp_bloom_bit(const uint8_t* data, size_t len) {
+    uint64_t h = manta_cpp_hash_bytes(data, len);
+    uint64_t b1 = 1ULL << (h & 63ULL);
+    uint64_t b2 = 1ULL << ((h >> 6) & 63ULL);
+    return b1 | b2;
+}
+
+uint32_t manta_cpp_cull_y_bands(const float* y_mins, const float* y_maxs, uint32_t count,
+                                float view_min_y, float view_max_y,
+                                uint32_t* out_indices, uint32_t max_out) {
+    if (!y_mins || !y_maxs || !out_indices || count == 0 || max_out == 0) return 0;
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (y_maxs[i] >= view_min_y && y_mins[i] <= view_max_y) {
+            if (written < max_out) {
+                out_indices[written++] = i;
+            } else {
+                break;
+            }
+        }
+    }
+    return written;
+}
+
 uint32_t manta_cpp_wrap_text_lines(const uint8_t* text, size_t len,
                                    float char_w, float max_w,
                                    uint32_t* out_starts, uint32_t* out_lens,
@@ -552,7 +576,6 @@ uint32_t manta_cpp_wrap_text_lines(const uint8_t* text, size_t len,
             cur_chars = 0;
             continue;
         }
-        // Only count UTF-8 lead bytes (not continuation bytes 10xxxxxx)
         if ((b & 0xC0u) == 0x80u) {
             continue;
         }

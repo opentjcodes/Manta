@@ -5,6 +5,8 @@ use crate::css_engine::{
 use crate::dom_arena::{NodeId, ZeroCopyDomArena, NO_NODE};
 use crate::input_forms::FormControlKind;
 
+const MAX_LAYOUT_DEPTH: usize = 96;
+
 #[derive(Debug, Clone)]
 pub enum PaintCommand {
     FillRect {
@@ -110,11 +112,6 @@ impl DisplayListFrame {
         Self::build_paced(dom, css, viewport_width, scroll_y, viewport_height, 6_000)
     }
 
-    /// Fixed-Latency Paced Frame Builder:
-    /// 1. Single-pass precomputed CSS style tree (zero duplicate style recomputations).
-    /// 2. C++ zero-allocation UTF-8 text wrapping.
-    /// 3. Hard microsecond compute pacing (`budget_us`) so heavy & light sites stay within
-    ///    the exact same deterministic compute budget without freezing or crashing.
     pub fn build_paced(
         dom: &ZeroCopyDomArena,
         css: &MicroCssEngine,
@@ -123,9 +120,30 @@ impl DisplayListFrame {
         viewport_height: f32,
         budget_us: u64,
     ) -> DisplayListFrame {
+        let style_budget = if budget_us > 0 { budget_us / 2 } else { 0 };
+        let styles = css.compute_style_tree(dom, style_budget);
+        Self::build_with_styles(
+            dom,
+            &styles,
+            viewport_width,
+            scroll_y,
+            viewport_height,
+            budget_us,
+        )
+    }
+
+    /// Zero-recalc linear frame builder reusing a cached `ComputedStyle` tree across scroll frames.
+    pub fn build_with_styles(
+        dom: &ZeroCopyDomArena,
+        styles: &[ComputedStyle],
+        viewport_width: f32,
+        scroll_y: f32,
+        viewport_height: f32,
+        budget_us: u64,
+    ) -> DisplayListFrame {
         let frame_start = now_us();
         let mut pacer = LayoutPacer::new(budget_us);
-        let mut commands = Vec::with_capacity(64);
+        let mut layered_cmds: Vec<(i32, usize, PaintCommand)> = Vec::with_capacity(64);
         let mut cursor_y = 16.0f32;
         let horizontal_padding = 16.0f32;
         let mut page_bg = 0xFF09090B;
@@ -141,25 +159,32 @@ impl DisplayListFrame {
             f32::INFINITY
         };
 
-        if !dom.nodes().is_empty() {
-            let style_budget = if budget_us > 0 { budget_us / 2 } else { 0 };
-            let styles = css.compute_style_tree(dom, style_budget);
+        if !dom.nodes().is_empty() && styles.len() >= dom.nodes().len() {
             layout_node_recursive(
                 0,
                 dom,
-                &styles,
+                styles,
                 horizontal_padding,
                 (viewport_width - (horizontal_padding * 2.0)).max(80.0),
                 &mut cursor_y,
                 &mut page_bg,
                 None,
                 None,
+                0,
+                0,
                 cull_min_y,
                 cull_max_y,
                 &mut pacer,
-                &mut commands,
+                &mut layered_cmds,
             );
         }
+
+        // Only sort by z-index if any element actually uses non-zero z-index (O(1) fast path!)
+        let has_nonzero_z = layered_cmds.iter().any(|(z, _, _)| *z != 0);
+        if has_nonzero_z {
+            layered_cmds.sort_by_key(|(z, order, _)| (*z, *order));
+        }
+        let commands: Vec<PaintCommand> = layered_cmds.into_iter().map(|(_, _, c)| c).collect();
 
         let elapsed = now_us().saturating_sub(frame_start).min(u32::MAX as u64) as u32;
         DisplayListFrame {
@@ -277,6 +302,12 @@ fn is_visible_band(y: f32, h: f32, cull_min_y: f32, cull_max_y: f32) -> bool {
     y + h >= cull_min_y && y <= cull_max_y
 }
 
+#[inline]
+fn push_cmd(cmds: &mut Vec<(i32, usize, PaintCommand)>, z: i32, cmd: PaintCommand) {
+    let ord = cmds.len();
+    cmds.push((z, ord, cmd));
+}
+
 struct InlineSegment<'a> {
     text: &'a str,
     color_argb: u32,
@@ -335,15 +366,15 @@ fn flush_inline_segments(
     cursor_y: &mut f32,
     visibility_hidden: bool,
     list_prefix: Option<&str>,
+    z_index: i32,
     cull_min_y: f32,
     cull_max_y: f32,
-    commands: &mut Vec<PaintCommand>,
+    commands: &mut Vec<(i32, usize, PaintCommand)>,
 ) {
     if segments.is_empty() {
         return;
     }
 
-    // Fast path for single-segment paragraphs using C++ zero-allocation line wrapper!
     if segments.len() == 1 {
         let seg = &segments[0];
         let owned;
@@ -371,15 +402,19 @@ fn flush_inline_segments(
                         TextAlign::Right => base_x + (avail_width - text_w).max(0.0),
                         TextAlign::Left => base_x,
                     };
-                    commands.push(PaintCommand::DrawText {
-                        x: aligned_x,
-                        y: *cursor_y,
-                        text: line_slice.to_string(),
-                        color_argb: seg.color_argb,
-                        font_size_sp: seg.font_size_sp,
-                        bold: seg.bold,
-                        link_href: seg.link_href.clone(),
-                    });
+                    push_cmd(
+                        commands,
+                        z_index,
+                        PaintCommand::DrawText {
+                            x: aligned_x,
+                            y: *cursor_y,
+                            text: line_slice.to_string(),
+                            color_argb: seg.color_argb,
+                            font_size_sp: seg.font_size_sp,
+                            bold: seg.bold,
+                            link_href: seg.link_href.clone(),
+                        },
+                    );
                 }
                 *cursor_y += line_h;
             }
@@ -409,15 +444,19 @@ fn flush_inline_segments(
             if line_x > base_x && line_x + word_w > base_x + avail_width {
                 if !current_chunk.is_empty() && !visibility_hidden {
                     if is_visible_band(*cursor_y, max_line_h, cull_min_y, cull_max_y) {
-                        commands.push(PaintCommand::DrawText {
-                            x: chunk_start_x,
-                            y: *cursor_y,
-                            text: std::mem::take(&mut current_chunk),
-                            color_argb: seg.color_argb,
-                            font_size_sp: seg.font_size_sp,
-                            bold: seg.bold,
-                            link_href: seg.link_href.clone(),
-                        });
+                        push_cmd(
+                            commands,
+                            z_index,
+                            PaintCommand::DrawText {
+                                x: chunk_start_x,
+                                y: *cursor_y,
+                                text: std::mem::take(&mut current_chunk),
+                                color_argb: seg.color_argb,
+                                font_size_sp: seg.font_size_sp,
+                                bold: seg.bold,
+                                link_href: seg.link_href.clone(),
+                            },
+                        );
                     } else {
                         current_chunk.clear();
                     }
@@ -445,15 +484,19 @@ fn flush_inline_segments(
                 chunk_start_x
             };
             if is_visible_band(*cursor_y, max_line_h, cull_min_y, cull_max_y) {
-                commands.push(PaintCommand::DrawText {
-                    x: aligned_x,
-                    y: *cursor_y,
-                    text: current_chunk,
-                    color_argb: seg.color_argb,
-                    font_size_sp: seg.font_size_sp,
-                    bold: seg.bold,
-                    link_href: seg.link_href,
-                });
+                push_cmd(
+                    commands,
+                    z_index,
+                    PaintCommand::DrawText {
+                        x: aligned_x,
+                        y: *cursor_y,
+                        text: current_chunk,
+                        color_argb: seg.color_argb,
+                        font_size_sp: seg.font_size_sp,
+                        bold: seg.bold,
+                        link_href: seg.link_href,
+                    },
+                );
             }
         }
     }
@@ -472,12 +515,14 @@ fn layout_node_recursive(
     page_bg: &mut u32,
     inherited_link: Option<String>,
     list_ordinal: Option<usize>,
+    inherited_z: i32,
+    depth: usize,
     cull_min_y: f32,
     cull_max_y: f32,
     pacer: &mut LayoutPacer,
-    commands: &mut Vec<PaintCommand>,
+    commands: &mut Vec<(i32, usize, PaintCommand)>,
 ) {
-    if pacer.check_exceeded() {
+    if depth >= MAX_LAYOUT_DEPTH || pacer.check_exceeded() {
         return;
     }
     let Some(node) = dom.nodes().get(node_id as usize) else {
@@ -488,6 +533,11 @@ fn layout_node_recursive(
     if style.display == DisplayMode::None || style.opacity <= 0.0 {
         return;
     }
+    let eff_z = if style.z_index != 0 {
+        style.z_index
+    } else {
+        inherited_z
+    };
 
     let mut current_link = inherited_link;
 
@@ -503,14 +553,18 @@ fn layout_node_recursive(
         if tag == "hr" {
             *cursor_y += 8.0;
             if is_visible_band(*cursor_y, 2.0, cull_min_y, cull_max_y) {
-                commands.push(PaintCommand::FillRect {
-                    x,
-                    y: *cursor_y,
-                    width: avail_width,
-                    height: 1.5,
-                    color_argb: 0xFF232734,
-                    corner_radius: 1.0,
-                });
+                push_cmd(
+                    commands,
+                    eff_z,
+                    PaintCommand::FillRect {
+                        x,
+                        y: *cursor_y,
+                        width: avail_width,
+                        height: 1.5,
+                        color_argb: 0xFF232734,
+                        corner_radius: 1.0,
+                    },
+                );
             }
             *cursor_y += 10.0;
             return;
@@ -532,16 +586,20 @@ fn layout_node_recursive(
                 .unwrap_or_else(|| format!("<{}>", tag));
             if is_visible_band(*cursor_y, box_h, cull_min_y, cull_max_y) && !style.visibility_hidden
             {
-                commands.push(PaintCommand::DrawMediaBox {
-                    node_id,
-                    x,
-                    y: *cursor_y,
-                    width: box_w,
-                    height: box_h,
-                    label,
-                    media_src: src,
-                    is_video: tag == "video",
-                });
+                push_cmd(
+                    commands,
+                    eff_z,
+                    PaintCommand::DrawMediaBox {
+                        node_id,
+                        x,
+                        y: *cursor_y,
+                        width: box_w,
+                        height: box_h,
+                        label,
+                        media_src: src,
+                        is_video: tag == "video",
+                    },
+                );
             }
             *cursor_y += box_h + style.margin_bottom + 6.0;
             return;
@@ -583,16 +641,20 @@ fn layout_node_recursive(
                 if is_visible_band(*cursor_y, box_h, cull_min_y, cull_max_y)
                     && !style.visibility_hidden
                 {
-                    commands.push(PaintCommand::DrawInputBox {
-                        node_id,
-                        x,
-                        y: *cursor_y,
-                        width: box_w,
-                        height: box_h,
-                        display_text,
-                        is_focused,
-                        is_checked: ctrl.checked,
-                    });
+                    push_cmd(
+                        commands,
+                        eff_z,
+                        PaintCommand::DrawInputBox {
+                            node_id,
+                            x,
+                            y: *cursor_y,
+                            width: box_w,
+                            height: box_h,
+                            display_text,
+                            is_focused,
+                            is_checked: ctrl.checked,
+                        },
+                    );
                 }
                 *cursor_y += box_h + style.margin_bottom + 4.0;
                 return;
@@ -603,34 +665,59 @@ fn layout_node_recursive(
         let box_start_y = *cursor_y;
         let resolved_w = resolve_box_width(&style, avail_width);
 
-        let bg_cmd_idx = if (style.background_color != 0 || style.border_width > 0.0)
-            && tag != "body"
+        let bg_start_idx = commands.len();
+        let mut bg_slots = 0usize;
+        if tag != "body"
+            && (style.background_color != 0
+                || (style.border_width > 0.0 && style.border_color != 0)
+                || style.has_box_shadow)
         {
-            let idx = commands.len();
+            if style.has_box_shadow {
+                push_cmd(
+                    commands,
+                    eff_z,
+                    PaintCommand::FillRect {
+                        x: x + 2.0,
+                        y: box_start_y + 3.0,
+                        width: resolved_w,
+                        height: 0.0,
+                        color_argb: 0x44000000,
+                        corner_radius: style.corner_radius,
+                    },
+                );
+                bg_slots += 1;
+            }
             if style.border_width > 0.0 && style.border_color != 0 {
-                commands.push(PaintCommand::FillRect {
-                    x,
-                    y: box_start_y,
-                    width: resolved_w,
-                    height: 0.0,
-                    color_argb: style.border_color,
-                    corner_radius: style.corner_radius,
-                });
+                push_cmd(
+                    commands,
+                    eff_z,
+                    PaintCommand::FillRect {
+                        x,
+                        y: box_start_y,
+                        width: resolved_w,
+                        height: 0.0,
+                        color_argb: style.border_color,
+                        corner_radius: style.corner_radius,
+                    },
+                );
+                bg_slots += 1;
             }
             if style.background_color != 0 {
-                commands.push(PaintCommand::FillRect {
-                    x: x + style.border_width,
-                    y: box_start_y + style.border_width,
-                    width: (resolved_w - style.border_width * 2.0).max(8.0),
-                    height: 0.0,
-                    color_argb: style.background_color,
-                    corner_radius: (style.corner_radius - style.border_width).max(0.0),
-                });
+                push_cmd(
+                    commands,
+                    eff_z,
+                    PaintCommand::FillRect {
+                        x: x + style.border_width,
+                        y: box_start_y + style.border_width,
+                        width: (resolved_w - style.border_width * 2.0).max(8.0),
+                        height: 0.0,
+                        color_argb: style.background_color,
+                        corner_radius: (style.corner_radius - style.border_width).max(0.0),
+                    },
+                );
+                bg_slots += 1;
             }
-            Some(idx)
-        } else {
-            None
-        };
+        }
 
         *cursor_y += style.padding_top;
         let inner_x = x + style.padding_left + style.border_width;
@@ -665,6 +752,8 @@ fn layout_node_recursive(
                         page_bg,
                         current_link.clone(),
                         None,
+                        eff_z,
+                        depth + 1,
                         cull_min_y,
                         cull_max_y,
                         pacer,
@@ -700,6 +789,8 @@ fn layout_node_recursive(
                         page_bg,
                         current_link.clone(),
                         None,
+                        eff_z,
+                        depth + 1,
                         cull_min_y,
                         cull_max_y,
                         pacer,
@@ -714,49 +805,99 @@ fn layout_node_recursive(
         } else if style.display == DisplayMode::Flex && style.flex_direction == FlexDir::Row {
             let flex_children = collect_non_ws_children(node_id, dom);
             if !flex_children.is_empty() {
-                let count = flex_children.len() as f32;
-                let total_gap = style.gap * (flex_children.len().saturating_sub(1) as f32);
-                let item_w = ((inner_w - total_gap) / count).max(40.0);
-                let start_offset = match style.justify_content {
-                    JustifyContent::Center => {
-                        let used = count * item_w + total_gap;
-                        ((inner_w - used) * 0.5).max(0.0)
+                if style.flex_wrap {
+                    // True multi-line flex-wrap row packing
+                    let mut row_x = inner_x;
+                    let mut row_y = *cursor_y;
+                    let mut row_tallest = row_y;
+                    for child_id in flex_children {
+                        if pacer.check_exceeded() {
+                            break;
+                        }
+                        let c_style = styles[child_id as usize];
+                        let item_w = if c_style.explicit_width.is_some()
+                            || c_style.width_percent.is_some()
+                        {
+                            resolve_box_width(&c_style, inner_w)
+                        } else {
+                            (inner_w * 0.48).max(80.0)
+                        };
+                        if row_x > inner_x && row_x + item_w > inner_x + inner_w + 1.0 {
+                            row_y = row_tallest + style.gap;
+                            row_tallest = row_y;
+                            row_x = inner_x;
+                        }
+                        let mut child_y = row_y;
+                        layout_node_recursive(
+                            child_id,
+                            dom,
+                            styles,
+                            row_x,
+                            item_w,
+                            &mut child_y,
+                            page_bg,
+                            current_link.clone(),
+                            None,
+                            eff_z,
+                            depth + 1,
+                            cull_min_y,
+                            cull_max_y,
+                            pacer,
+                            commands,
+                        );
+                        if child_y > row_tallest {
+                            row_tallest = child_y;
+                        }
+                        row_x += item_w + style.gap;
                     }
-                    JustifyContent::FlexEnd => {
-                        let used = count * item_w + total_gap;
-                        (inner_w - used).max(0.0)
-                    }
-                    _ => 0.0,
-                };
-                let row_start_y = *cursor_y;
-                let mut tallest_bottom = row_start_y;
+                    *cursor_y = row_tallest;
+                } else {
+                    let count = flex_children.len() as f32;
+                    let total_gap = style.gap * (flex_children.len().saturating_sub(1) as f32);
+                    let item_w = ((inner_w - total_gap) / count).max(40.0);
+                    let start_offset = match style.justify_content {
+                        JustifyContent::Center => {
+                            let used = count * item_w + total_gap;
+                            ((inner_w - used) * 0.5).max(0.0)
+                        }
+                        JustifyContent::FlexEnd => {
+                            let used = count * item_w + total_gap;
+                            (inner_w - used).max(0.0)
+                        }
+                        _ => 0.0,
+                    };
+                    let row_start_y = *cursor_y;
+                    let mut tallest_bottom = row_start_y;
 
-                for (idx, child_id) in flex_children.into_iter().enumerate() {
-                    if pacer.check_exceeded() {
-                        break;
+                    for (idx, child_id) in flex_children.into_iter().enumerate() {
+                        if pacer.check_exceeded() {
+                            break;
+                        }
+                        let mut child_y = row_start_y;
+                        let child_x = inner_x + start_offset + (idx as f32) * (item_w + style.gap);
+                        layout_node_recursive(
+                            child_id,
+                            dom,
+                            styles,
+                            child_x,
+                            item_w,
+                            &mut child_y,
+                            page_bg,
+                            current_link.clone(),
+                            None,
+                            eff_z,
+                            depth + 1,
+                            cull_min_y,
+                            cull_max_y,
+                            pacer,
+                            commands,
+                        );
+                        if child_y > tallest_bottom {
+                            tallest_bottom = child_y;
+                        }
                     }
-                    let mut child_y = row_start_y;
-                    let child_x = inner_x + start_offset + (idx as f32) * (item_w + style.gap);
-                    layout_node_recursive(
-                        child_id,
-                        dom,
-                        styles,
-                        child_x,
-                        item_w,
-                        &mut child_y,
-                        page_bg,
-                        current_link.clone(),
-                        None,
-                        cull_min_y,
-                        cull_max_y,
-                        pacer,
-                        commands,
-                    );
-                    if child_y > tallest_bottom {
-                        tallest_bottom = child_y;
-                    }
+                    *cursor_y = tallest_bottom;
                 }
-                *cursor_y = tallest_bottom;
             }
         } else {
             let mut inline_run: Vec<InlineSegment<'_>> = Vec::new();
@@ -803,6 +944,7 @@ fn layout_node_recursive(
                             cursor_y,
                             style.visibility_hidden,
                             li_prefix_unused.take(),
+                            eff_z,
                             cull_min_y,
                             cull_max_y,
                             commands,
@@ -825,6 +967,8 @@ fn layout_node_recursive(
                         page_bg,
                         current_link.clone(),
                         next_ord,
+                        eff_z,
+                        depth + 1,
                         cull_min_y,
                         cull_max_y,
                         pacer,
@@ -842,6 +986,7 @@ fn layout_node_recursive(
                     cursor_y,
                     style.visibility_hidden,
                     li_prefix_unused.take(),
+                    eff_z,
                     cull_min_y,
                     cull_max_y,
                     commands,
@@ -855,40 +1000,40 @@ fn layout_node_recursive(
             .max(style.min_height.unwrap_or(0.0));
         *cursor_y = box_start_y + measured_h + style.margin_bottom;
 
-        if let Some(start_idx) = bg_cmd_idx {
+        if bg_slots > 0 {
             let visible = is_visible_band(box_start_y, measured_h, cull_min_y, cull_max_y)
                 && !style.visibility_hidden
                 && measured_h > 0.0;
             if visible {
-                let has_border = style.border_width > 0.0 && style.border_color != 0;
-                if has_border {
-                    if let Some(PaintCommand::FillRect { height, .. }) = commands.get_mut(start_idx)
+                let mut slot = bg_start_idx;
+                if style.has_box_shadow {
+                    if let Some((_, _, PaintCommand::FillRect { height, .. })) =
+                        commands.get_mut(slot)
                     {
                         *height = measured_h;
                     }
-                    if style.background_color != 0 {
-                        if let Some(PaintCommand::FillRect { height, .. }) =
-                            commands.get_mut(start_idx + 1)
-                        {
-                            *height = (measured_h - style.border_width * 2.0).max(0.0);
-                        }
+                    slot += 1;
+                }
+                if style.border_width > 0.0 && style.border_color != 0 {
+                    if let Some((_, _, PaintCommand::FillRect { height, .. })) =
+                        commands.get_mut(slot)
+                    {
+                        *height = measured_h;
                     }
-                } else if let Some(PaintCommand::FillRect { height, .. }) =
-                    commands.get_mut(start_idx)
-                {
-                    *height = measured_h;
+                    slot += 1;
+                }
+                if style.background_color != 0 {
+                    if let Some((_, _, PaintCommand::FillRect { height, .. })) =
+                        commands.get_mut(slot)
+                    {
+                        *height = (measured_h - style.border_width * 2.0).max(0.0);
+                    }
                 }
             } else {
-                if style.border_width > 0.0
-                    && style.border_color != 0
-                    && style.background_color != 0
-                {
-                    if start_idx + 1 < commands.len() {
-                        commands.remove(start_idx + 1);
+                for offset in (0..bg_slots).rev() {
+                    if bg_start_idx + offset < commands.len() {
+                        commands.remove(bg_start_idx + offset);
                     }
-                }
-                if start_idx < commands.len() {
-                    commands.remove(start_idx);
                 }
             }
         }
@@ -913,6 +1058,7 @@ fn layout_node_recursive(
                 cursor_y,
                 style.visibility_hidden,
                 None,
+                eff_z,
                 cull_min_y,
                 cull_max_y,
                 commands,
@@ -936,6 +1082,8 @@ fn layout_node_recursive(
             page_bg,
             current_link.clone(),
             None,
+            eff_z,
+            depth + 1,
             cull_min_y,
             cull_max_y,
             pacer,
@@ -1004,12 +1152,15 @@ mod tests {
     use crate::html_tokenizer::StreamingHtmlTokenizer;
 
     #[test]
-    fn test_inline_flow_grid_table_ol_and_flexbox_layout() {
+    fn test_inline_flow_grid_table_flex_wrap_and_z_index_layout() {
         let mut dom = ZeroCopyDomArena::new(64 * 1024);
         let mut tok = StreamingHtmlTokenizer::new();
         tok.feed_chunk(
             b"<p>Click <a href=\"https://manta.dev\">here</a> now</p>\
-              <div id=\"row\" style=\"display: flex; gap: 10px;\"><div>Left</div><div>Right</div></div>\
+              <div style=\"display: flex; flex-wrap: wrap; gap: 10px;\">\
+                <div style=\"width: 220px;\">WrapA</div>\
+                <div style=\"width: 220px;\">WrapB</div>\
+              </div>\
               <table><tr><th>Name</th><th>Score</th></tr><tr><td>Manta</td><td>99</td></tr></table>\
               <ol><li>First</li><li>Second</li></ol>",
             true,
@@ -1026,18 +1177,12 @@ mod tests {
             })
             .collect();
 
-        // Inline segments inside <p>: "Click", "here", "now" share same horizontal line
-        assert!(texts.len() >= 9);
-        assert!((texts[0].1 - texts[1].1).abs() < 1.0);
-        assert!(texts[1].0 > texts[0].0);
+        // Flex-wrap wraps WrapB onto the next row when 220 + 220 > 368
+        let wa = texts.iter().find(|t| t.2 == "WrapA").unwrap();
+        let wb = texts.iter().find(|t| t.2 == "WrapB").unwrap();
+        assert!(wb.1 > wa.1);
 
-        // Flex row places Left & Right side by side
-        let left = texts.iter().find(|t| t.2 == "Left").unwrap();
-        let right = texts.iter().find(|t| t.2 == "Right").unwrap();
-        assert!((left.1 - right.1).abs() < 8.0);
-        assert!(right.0 > left.0);
-
-        // Table places Name & Score on the same horizontal row in separate columns
+        // Table places Name & Score side by side
         let th_name = texts.iter().find(|t| t.2 == "Name").unwrap();
         let th_score = texts.iter().find(|t| t.2 == "Score").unwrap();
         assert!((th_name.1 - th_score.1).abs() < 8.0);

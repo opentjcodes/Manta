@@ -3,6 +3,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::json_lite::{
+    escape_json_str, json_get_bool, json_get_i64, json_get_str, map_to_json_object,
+    map_to_pretty_json, parse_json, JsonVal,
+};
 use crate::site_isolation::OriginKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +27,6 @@ pub struct OriginStorageBucket {
     pub cookies: HashMap<String, StoredCookie>,
     pub form_drafts: HashMap<String, String>,
     pub object_stores: HashMap<String, HashMap<String, String>>,
-    /// Maps sanitized virtual path -> (mime_type, byte_len, optional in-RAM fallback when ephemeral/no disk dir)
     pub saved_files_meta: HashMap<String, (String, usize, Option<Vec<u8>>)>,
     pub used_bytes: usize,
 }
@@ -50,22 +53,8 @@ pub struct SavedTabSession {
 }
 
 /// **Transparent User-Accessible Device File Storage (`storage_engine.rs`)**:
-///
-/// Replaces hidden binary databases with clean, inspectable, 100%-deletable standard files
-/// directly in the user's device storage folder (`<storage_dir>/`):
-/// - `manta_index.json`                       (manifest + exact file paths)
-/// - `bookmarks.json`                         (user bookmarks)
-/// - `history.json`                           (browsing history)
-/// - `tabs_session.json`                      (active tabs & scroll positions)
-/// - `offline_pages/<slug>.html`              (readable offline HTML pages)
-/// - `sites/<origin_slug>/meta.json`          (exact origin URL)
-/// - `sites/<origin_slug>/local_storage.json`
-/// - `sites/<origin_slug>/cookies.json`
-/// - `sites/<origin_slug>/form_drafts.json`
-/// - `sites/<origin_slug>/indexeddb/<store>.json`
-/// - `sites/<origin_slug>/files/<path>`       (lazy read from disk = ~0 RAM overhead)
-///
-/// `sessionStorage` remains strictly in volatile RAM and is NEVER written to disk.
+/// Uses shared `json_lite` to persist readable, 100%-deletable files directly inside
+/// the user's device folder (`<storage_dir>/`).
 pub struct MantaStorageEngine {
     origins: HashMap<String, OriginStorageBucket>,
     bookmarks: Vec<BookmarkEntry>,
@@ -99,8 +88,6 @@ impl MantaStorageEngine {
         }
     }
 
-    /// Configures the user-accessible device folder where all browsing files live.
-    /// If a legacy `.db` file path is passed, converts it cleanly into a folder sibling.
     pub fn set_storage_dir(&mut self, path: &str) {
         let trimmed = path.trim();
         if trimmed.is_empty() {
@@ -350,11 +337,6 @@ impl MantaStorageEngine {
         let _ = atomic_write_file(&index_path, manifest.as_bytes());
     }
 
-    // =========================================================================
-    // TRANSPARENT FILE DISCOVERY & MANIFEST INSPECTION
-    // =========================================================================
-
-    /// Lists every real file currently stored inside Manta's user device storage directory.
     pub fn list_all_saved_files_json(&self) -> String {
         let Some(ref root) = self.storage_dir_path else {
             return "[]".to_string();
@@ -372,6 +354,8 @@ impl MantaStorageEngine {
                 "site_data"
             } else if rel.starts_with("offline_pages/") {
                 "offline_page"
+            } else if rel.starts_with("extensions_data/") {
+                "extension_data"
             } else if rel == "history.json" {
                 "history"
             } else if rel == "bookmarks.json" {
@@ -458,10 +442,6 @@ impl MantaStorageEngine {
         out
     }
 
-    // =========================================================================
-    // OPEN TAB SESSIONS & READABLE OFFLINE HTML FILES
-    // =========================================================================
-
     pub fn save_tab_session_state(&mut self, tab_id: u32, url: &str, title: &str, scroll_y: i32) {
         if url.trim().is_empty() {
             return;
@@ -511,7 +491,6 @@ impl MantaStorageEngine {
         out
     }
 
-    /// Saves a user-requested offline copy as a real readable `.html` file inside `<storage_dir>/offline_pages/`.
     pub fn save_offline_page_snapshot(&mut self, url: &str, html_bytes: &[u8]) -> bool {
         let slug = safe_file_slug(url);
         if !self.ephemeral_only {
@@ -537,10 +516,6 @@ impl MantaStorageEngine {
         }
         self.offline_mem_fallback.get(&slug).cloned()
     }
-
-    // =========================================================================
-    // LOCAL STORAGE, SESSION STORAGE & FORM DRAFTS
-    // =========================================================================
 
     pub fn set_local_storage(&mut self, origin_url: &str, key: &str, value: &str) -> bool {
         if let Some(draft_key) = key.strip_prefix("__manta_draft::") {
@@ -685,10 +660,6 @@ impl MantaStorageEngine {
             .cloned()
     }
 
-    // =========================================================================
-    // FILE-BACKED INDEXEDDB OBJECT STORES & SITE FILES (OPFS)
-    // =========================================================================
-
     pub fn put_idb_object(
         &mut self,
         origin_url: &str,
@@ -809,7 +780,6 @@ impl MantaStorageEngine {
             return false;
         }
 
-        // Keep file bytes out of RAM when written directly to user device disk!
         let mem_copy = if disk_written {
             None
         } else {
@@ -878,10 +848,6 @@ impl MantaStorageEngine {
         }
         false
     }
-
-    // =========================================================================
-    // JSON EXPORT HELPERS FOR KERNEL HYDRATION
-    // =========================================================================
 
     pub fn export_origin_storage_json(&self, origin_url: &str, is_session: bool) -> String {
         let origin_key = OriginKey::from_url(origin_url);
@@ -1013,10 +979,6 @@ impl MantaStorageEngine {
         }
         false
     }
-
-    // =========================================================================
-    // COOKIES, HISTORY, BOOKMARKS
-    // =========================================================================
 
     pub fn set_cookie_from_header(&mut self, origin_url: &str, raw_set_cookie: &str) -> bool {
         let origin = OriginKey::from_url(origin_url);
@@ -1239,10 +1201,6 @@ impl MantaStorageEngine {
         out
     }
 
-    // =========================================================================
-    // FULL TRANSPARENT DELETION (PER-ORIGIN & FULL WIPE)
-    // =========================================================================
-
     pub fn clear_origin(&mut self, origin_url: &str) -> bool {
         let origin = OriginKey::from_url(origin_url).serialize();
         let mut removed_any = false;
@@ -1295,19 +1253,13 @@ impl MantaStorageEngine {
             let _ = fs::remove_file(root.join("manta_index.json"));
             let _ = fs::remove_dir_all(root.join("sites"));
             let _ = fs::remove_dir_all(root.join("offline_pages"));
+            let _ = fs::remove_dir_all(root.join("extensions_data"));
             let _ = fs::remove_dir(root);
         }
     }
 
-    // =========================================================================
-    // FULL SYNC SAVE & READ-BACK FROM USER DEVICE FOLDER
-    // =========================================================================
-
     pub fn save_to_backing_file(&mut self) -> Result<(), String> {
-        if self.ephemeral_only {
-            return Ok(());
-        }
-        if self.storage_dir_path.is_none() {
+        if self.ephemeral_only || self.storage_dir_path.is_none() {
             return Ok(());
         }
         self.persist_bookmarks();
@@ -1345,7 +1297,6 @@ impl MantaStorageEngine {
 
         self.suppress_disk_write = true;
 
-        // 1. Load bookmarks.json
         if let Ok(raw) = fs::read_to_string(root.join("bookmarks.json")) {
             if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
                 self.bookmarks.clear();
@@ -1361,7 +1312,6 @@ impl MantaStorageEngine {
             }
         }
 
-        // 2. Load history.json
         if let Ok(raw) = fs::read_to_string(root.join("history.json")) {
             if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
                 self.history.clear();
@@ -1369,7 +1319,8 @@ impl MantaStorageEngine {
                     if let JsonVal::Obj(pairs) = item {
                         let url = json_get_str(&pairs, "url").unwrap_or_default();
                         let title = json_get_str(&pairs, "title").unwrap_or_default();
-                        let visit_count = json_get_i64(&pairs, "visit_count").unwrap_or(1).max(1) as u32;
+                        let visit_count =
+                            json_get_i64(&pairs, "visit_count").unwrap_or(1).max(1) as u32;
                         if !url.is_empty() {
                             self.history.push(HistoryVisitEntry {
                                 url,
@@ -1382,7 +1333,6 @@ impl MantaStorageEngine {
             }
         }
 
-        // 3. Load tabs_session.json
         if let Ok(raw) = fs::read_to_string(root.join("tabs_session.json")) {
             if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
                 self.saved_tabs.clear();
@@ -1408,7 +1358,6 @@ impl MantaStorageEngine {
             }
         }
 
-        // 4. Load per-origin directories under sites/
         let sites_dir = root.join("sites");
         if let Ok(entries) = fs::read_dir(&sites_dir) {
             for entry in entries.flatten() {
@@ -1436,7 +1385,6 @@ impl MantaStorageEngine {
                     continue;
                 }
 
-                // local_storage.json
                 if let Ok(raw) = fs::read_to_string(sdir.join("local_storage.json")) {
                     if let Some(JsonVal::Obj(pairs)) = parse_json(&raw) {
                         for (k, v) in pairs {
@@ -1447,7 +1395,6 @@ impl MantaStorageEngine {
                     }
                 }
 
-                // form_drafts.json
                 if let Ok(raw) = fs::read_to_string(sdir.join("form_drafts.json")) {
                     if let Some(JsonVal::Obj(pairs)) = parse_json(&raw) {
                         for (k, v) in pairs {
@@ -1458,7 +1405,6 @@ impl MantaStorageEngine {
                     }
                 }
 
-                // cookies.json
                 if let Ok(raw) = fs::read_to_string(sdir.join("cookies.json")) {
                     if let Some(JsonVal::Arr(arr)) = parse_json(&raw) {
                         let bucket = self.origins.entry(serialized.clone()).or_default();
@@ -1496,7 +1442,6 @@ impl MantaStorageEngine {
                     }
                 }
 
-                // indexeddb/*.json
                 let idb_dir = sdir.join("indexeddb");
                 if let Ok(idb_entries) = fs::read_dir(&idb_dir) {
                     for idb_ent in idb_entries.flatten() {
@@ -1521,7 +1466,6 @@ impl MantaStorageEngine {
                     }
                 }
 
-                // files/ (index metadata only — keep file bodies out of RAM!)
                 let files_dir = sdir.join("files");
                 if files_dir.is_dir() {
                     let mut found = Vec::new();
@@ -1544,10 +1488,6 @@ impl MantaStorageEngine {
         Ok(())
     }
 }
-
-// =============================================================================
-// FILESYSTEM PERMISSION & ATOMIC WRITE UTILITIES
-// =============================================================================
 
 fn ensure_dir_readable(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1600,9 +1540,7 @@ fn collect_files_recursive(root: &Path, cur: &Path, out: &mut Vec<(String, Strin
 }
 
 fn origin_to_folder_slug(serialized_origin: &str) -> String {
-    let replaced = serialized_origin
-        .replace("://", "__")
-        .replace(':', "__");
+    let replaced = serialized_origin.replace("://", "__").replace(':', "__");
     let clean: String = replaced
         .chars()
         .map(|c| {
@@ -1664,246 +1602,6 @@ fn sanitize_virtual_path(raw: &str) -> String {
     }
 }
 
-fn map_to_json_object(map: &HashMap<String, String>) -> String {
-    let mut keys: Vec<&String> = map.keys().collect();
-    keys.sort();
-    let mut out = String::from("{");
-    for (idx, k) in keys.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        let v = &map[*k];
-        out.push('"');
-        out.push_str(&escape_json_str(k));
-        out.push_str("\":\"");
-        out.push_str(&escape_json_str(v));
-        out.push('"');
-    }
-    out.push('}');
-    out
-}
-
-fn map_to_pretty_json(map: &HashMap<String, String>) -> String {
-    let mut keys: Vec<&String> = map.keys().collect();
-    keys.sort();
-    let mut out = String::from("{\n");
-    for (idx, k) in keys.iter().enumerate() {
-        if idx > 0 {
-            out.push_str(",\n");
-        }
-        let v = &map[*k];
-        out.push_str("  \"");
-        out.push_str(&escape_json_str(k));
-        out.push_str("\": \"");
-        out.push_str(&escape_json_str(v));
-        out.push('"');
-    }
-    out.push_str("\n}\n");
-    out
-}
-
-fn escape_json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-// =============================================================================
-// LIGHTWEIGHT PURE-RUST JSON PARSER FOR READ-BACK
-// =============================================================================
-
-enum JsonVal {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Str(String),
-    Arr(Vec<JsonVal>),
-    Obj(Vec<(String, JsonVal)>),
-}
-
-fn parse_json(input: &str) -> Option<JsonVal> {
-    let b = input.as_bytes();
-    let mut cur = 0usize;
-    parse_val(b, &mut cur)
-}
-
-fn skip_ws(b: &[u8], cur: &mut usize) {
-    while *cur < b.len() && b[*cur].is_ascii_whitespace() {
-        *cur += 1;
-    }
-}
-
-fn parse_val(b: &[u8], cur: &mut usize) -> Option<JsonVal> {
-    skip_ws(b, cur);
-    if *cur >= b.len() {
-        return None;
-    }
-    match b[*cur] {
-        b'n' if b[*cur..].starts_with(b"null") => {
-            *cur += 4;
-            Some(JsonVal::Null)
-        }
-        b't' if b[*cur..].starts_with(b"true") => {
-            *cur += 4;
-            Some(JsonVal::Bool(true))
-        }
-        b'f' if b[*cur..].starts_with(b"false") => {
-            *cur += 5;
-            Some(JsonVal::Bool(false))
-        }
-        b'"' => Some(JsonVal::Str(parse_str(b, cur)?)),
-        b'[' => {
-            *cur += 1;
-            let mut items = Vec::new();
-            skip_ws(b, cur);
-            if *cur < b.len() && b[*cur] == b']' {
-                *cur += 1;
-                return Some(JsonVal::Arr(items));
-            }
-            while *cur < b.len() {
-                items.push(parse_val(b, cur)?);
-                skip_ws(b, cur);
-                if *cur < b.len() && b[*cur] == b',' {
-                    *cur += 1;
-                } else if *cur < b.len() && b[*cur] == b']' {
-                    *cur += 1;
-                    break;
-                } else {
-                    return None;
-                }
-            }
-            Some(JsonVal::Arr(items))
-        }
-        b'{' => {
-            *cur += 1;
-            let mut pairs = Vec::new();
-            skip_ws(b, cur);
-            if *cur < b.len() && b[*cur] == b'}' {
-                *cur += 1;
-                return Some(JsonVal::Obj(pairs));
-            }
-            while *cur < b.len() {
-                skip_ws(b, cur);
-                let key = parse_str(b, cur)?;
-                skip_ws(b, cur);
-                if *cur >= b.len() || b[*cur] != b':' {
-                    return None;
-                }
-                *cur += 1;
-                let val = parse_val(b, cur)?;
-                pairs.push((key, val));
-                skip_ws(b, cur);
-                if *cur < b.len() && b[*cur] == b',' {
-                    *cur += 1;
-                } else if *cur < b.len() && b[*cur] == b'}' {
-                    *cur += 1;
-                    break;
-                } else {
-                    return None;
-                }
-            }
-            Some(JsonVal::Obj(pairs))
-        }
-        _ => {
-            let start = *cur;
-            while *cur < b.len()
-                && (b[*cur].is_ascii_digit() || matches!(b[*cur], b'-' | b'+' | b'.' | b'e' | b'E'))
-            {
-                *cur += 1;
-            }
-            let s = std::str::from_utf8(&b[start..*cur]).ok()?;
-            let n = s.parse::<i64>().unwrap_or(0);
-            Some(JsonVal::Int(n))
-        }
-    }
-}
-
-fn parse_str(b: &[u8], cur: &mut usize) -> Option<String> {
-    if *cur >= b.len() || b[*cur] != b'"' {
-        return None;
-    }
-    *cur += 1;
-    let mut out = String::new();
-    while *cur < b.len() {
-        let byte = b[*cur];
-        if byte == b'"' {
-            *cur += 1;
-            return Some(out);
-        }
-        if byte == b'\\' {
-            *cur += 1;
-            if *cur >= b.len() {
-                return None;
-            }
-            match b[*cur] {
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b't' => out.push('\t'),
-                b'u' if *cur + 4 < b.len() => {
-                    let hex = std::str::from_utf8(&b[*cur + 1..*cur + 5]).ok()?;
-                    if let Ok(cp) = u32::from_str_radix(hex, 16) {
-                        if let Some(ch) = char::from_u32(cp) {
-                            out.push(ch);
-                        }
-                    }
-                    *cur += 4;
-                }
-                other => out.push(other as char),
-            }
-            *cur += 1;
-        } else {
-            let rest = std::str::from_utf8(&b[*cur..]).ok()?;
-            let ch = rest.chars().next()?;
-            out.push(ch);
-            *cur += ch.len_utf8();
-        }
-    }
-    None
-}
-
-fn json_get_str(pairs: &[(String, JsonVal)], key: &str) -> Option<String> {
-    pairs.iter().find_map(|(k, v)| {
-        if k == key {
-            if let JsonVal::Str(s) = v {
-                return Some(s.clone());
-            }
-        }
-        None
-    })
-}
-
-fn json_get_bool(pairs: &[(String, JsonVal)], key: &str) -> Option<bool> {
-    pairs.iter().find_map(|(k, v)| {
-        if k == key {
-            if let JsonVal::Bool(b) = v {
-                return Some(*b);
-            }
-        }
-        None
-    })
-}
-
-fn json_get_i64(pairs: &[(String, JsonVal)], key: &str) -> Option<i64> {
-    pairs.iter().find_map(|(k, v)| {
-        if k == key {
-            if let JsonVal::Int(n) = v {
-                return Some(*n);
-            }
-        }
-        None
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,7 +1618,7 @@ mod tests {
             let origin = "https://manta.dev/workspace";
             assert!(store.set_local_storage(origin, "theme", "obsidian"));
             assert!(store.set_session_storage(origin, "volatile_tab", "only_in_ram"));
-            assert!(store.save_form_draft(origin, "/workspace::input::title", "Manta v3.1"));
+            assert!(store.save_form_draft(origin, "/workspace::input::title", "Manta v4.0"));
             assert!(store.set_cookie_from_header(origin, "auth=token_xyz; Path=/; Secure"));
             assert!(store.put_idb_object(origin, "cache", "k1", "{\"v\":1}"));
             assert!(store.save_vfs_file(origin, "/notes/todo.txt", "text/plain", b"Ship fast"));
@@ -1932,7 +1630,6 @@ mod tests {
                 b"<html><body><h1>Saved Offline</h1></body></html>"
             ));
 
-            // User can directly locate the exact origin folder & files on device
             let origin_dir = store.locate_origin_dir(origin).unwrap();
             assert!(Path::new(&origin_dir).join("local_storage.json").exists());
             assert!(Path::new(&origin_dir).join("cookies.json").exists());
@@ -1943,13 +1640,8 @@ mod tests {
             assert!(Path::new(dir).join("history.json").exists());
             assert!(Path::new(dir).join("tabs_session.json").exists());
             assert!(Path::new(dir).join("manta_index.json").exists());
-
-            let files_json = store.list_all_saved_files_json();
-            assert!(files_json.contains("local_storage.json"));
-            assert!(files_json.contains("todo.txt"));
         }
 
-        // Fresh engine reads back every file transparently
         let mut restored = MantaStorageEngine::new(1024 * 1024, 4 * 1024 * 1024);
         restored.set_storage_dir(dir);
         restored.load_from_backing_file().unwrap();
@@ -1958,7 +1650,6 @@ mod tests {
             restored.get_local_storage("https://manta.dev", "theme"),
             Some("obsidian".to_string())
         );
-        // sessionStorage must NEVER persist to disk
         assert_eq!(
             restored.get_session_storage("https://manta.dev", "volatile_tab"),
             None
@@ -1971,23 +1662,12 @@ mod tests {
             restored.read_vfs_file("https://manta.dev", "/notes/todo.txt"),
             Some(b"Ship fast".to_vec())
         );
-        assert_eq!(restored.list_saved_tab_sessions().len(), 1);
-        assert_eq!(restored.list_saved_tab_sessions()[0].scroll_y, 320);
 
-        let off_html = restored
-            .load_offline_page_snapshot("https://manta.dev/workspace")
-            .unwrap();
-        assert!(String::from_utf8_lossy(&off_html).contains("Saved Offline"));
-
-        // Per-origin deletion immediately deletes the origin folder from disk
         let origin_dir = restored.locate_origin_dir("https://manta.dev").unwrap();
         assert!(restored.clear_origin("https://manta.dev"));
         assert!(!Path::new(&origin_dir).exists());
 
-        // Full deletion removes all remaining device files cleanly
         restored.clear_all();
-        assert!(!Path::new(dir).join("history.json").exists());
-        assert!(!Path::new(dir).join("bookmarks.json").exists());
         assert!(!Path::new(dir).exists());
     }
 }

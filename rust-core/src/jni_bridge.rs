@@ -80,6 +80,62 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeInit
 }
 
 #[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeExtInstallDir(
+    env: JNIEnv,
+    _class: JClass,
+    j_ext_dir: JString,
+) -> JString {
+    let dir = unsafe { env.get_rust_string(j_ext_dir) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("") };
+    };
+    let res = match engine.extensions.install_from_dir(&dir) {
+        Ok(id) => id,
+        Err(e) => format!("ERR:{}", e),
+    };
+    unsafe { env.new_java_string(&res) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeExtSetEnabled(
+    env: JNIEnv,
+    _class: JClass,
+    j_ext_id: JString,
+    enabled: JBoolean,
+) -> JBoolean {
+    let id = unsafe { env.get_rust_string(j_ext_id) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    u8::from(engine.extensions.set_enabled(&id, enabled != 0))
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeExtUninstall(
+    env: JNIEnv,
+    _class: JClass,
+    j_ext_id: JString,
+) -> JBoolean {
+    let id = unsafe { env.get_rust_string(j_ext_id) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return 0;
+    };
+    u8::from(engine.extensions.uninstall(&id))
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeExtListJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return unsafe { env.new_java_string("[]") };
+    };
+    let json = engine.extensions.list_extensions_json();
+    unsafe { env.new_java_string(&json) }
+}
+
+#[no_mangle]
 pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetStorageDir(
     env: JNIEnv,
     _class: JClass,
@@ -170,17 +226,23 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeNavi
     j_url: JString,
 ) -> JString {
     let raw_url = unsafe { env.get_rust_string(j_url) };
-    let (resolved_url, cookie_hdr, max_bytes) = {
+    let (resolved_url, cookie_hdr, max_bytes, ext_net_mod) = {
         let Ok(engine) = MantaEngine::global().lock() else {
             return unsafe { env.new_java_string("MANTA_ERR|Engine Lock Poisoned") };
         };
         let resolved = engine.controls.settings.resolve_omnibox_input(&raw_url);
         let cookies = engine.storage.get_cookie_header_for_url(&resolved, true);
-        (resolved, cookies, engine.config.per_tab_ram_ceiling_bytes)
+        (
+            resolved,
+            cookies,
+            engine.config.per_tab_ram_ceiling_bytes,
+            engine.extensions.create_net_module(),
+        )
     };
 
     let mut standalone_modules = ModuleBus::new();
     standalone_modules.register(Box::new(SiteIsolationModule::new()));
+    standalone_modules.register(ext_net_mod);
 
     let bundle = match TabManager::fetch_page_bundle(
         &resolved_url,
@@ -204,6 +266,7 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeNavi
         &mut engine_ref.vault,
         &mut engine_ref.storage,
         &mut engine_ref.downloads,
+        Some(&engine_ref.extensions),
     ) {
         Ok(frame) => {
             engine_ref
@@ -518,10 +581,11 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeGetR
     let Ok(engine) = MantaEngine::global().lock() else {
         return unsafe { env.new_java_string("") };
     };
-    let script = PageRuntimeCompiler::compile_runtime_script_with_settings(
+    let script = PageRuntimeCompiler::compile_runtime_script_full(
         &origin_url,
         &engine.storage,
         &engine.controls.settings,
+        Some(&engine.extensions),
     );
     unsafe { env.new_java_string(&script) }
 }
@@ -702,15 +766,18 @@ pub unsafe extern "system" fn Java_app_manta_browser_core_MantaNative_nativeStre
     }
 
     let engine_ref = &mut *engine;
-    match engine_ref.tabs.load_stream_chunk(
+    match engine_ref.tabs.load_stream_chunk_full(
         tab_id as u32,
         &url,
         chunk_str.as_bytes(),
         is_eof != 0,
+        &[],
+        &[],
         &mut engine_ref.modules,
         &mut engine_ref.vault,
         &mut engine_ref.storage,
         &mut engine_ref.downloads,
+        Some(&engine_ref.extensions),
     ) {
         Ok(frame) => {
             if is_eof != 0 && !url.is_empty() {

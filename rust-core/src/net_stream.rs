@@ -182,7 +182,6 @@ fn pool_put(key: String, stream: TransportStream) {
     });
 }
 
-/// Immediately drops and closes all idle pooled TCP/TLS connections (called on shred/wipe).
 pub fn clear_keep_alive_pool() {
     if let Some(lock) = KEEP_ALIVE_POOL.get() {
         if let Ok(mut pool) = lock.lock() {
@@ -273,6 +272,21 @@ impl StreamingNetworkPipe {
         extra_headers: HashMap<String, String>,
         modules: &ModuleBus,
         max_bytes: usize,
+        on_chunk: F,
+    ) -> Result<StreamFetchOutcome, String>
+    where
+        F: FnMut(&[u8], bool),
+    {
+        Self::stream_http_with_body(method, url, extra_headers, None, modules, max_bytes, on_chunk)
+    }
+
+    pub fn stream_http_with_body<F>(
+        method: &str,
+        url: &str,
+        extra_headers: HashMap<String, String>,
+        request_body: Option<&[u8]>,
+        modules: &ModuleBus,
+        max_bytes: usize,
         mut on_chunk: F,
     ) -> Result<StreamFetchOutcome, String>
     where
@@ -285,6 +299,7 @@ impl StreamingNetworkPipe {
         let mut current_method = method.trim().to_ascii_uppercase();
         let mut current_url = url.trim().to_string();
         let mut current_headers = sanitize_headers(extra_headers)?;
+        let mut current_body = request_body;
         let initial_origin = OriginKey::from_url(&current_url);
         let mut redirects_left = 6u8;
 
@@ -297,7 +312,7 @@ impl StreamingNetworkPipe {
 
             match modules.dispatch_before_request(&mut req) {
                 ModuleDecision::Block { reason } => {
-                    return Err(format!("Site isolation blocked request: {}", reason));
+                    return Err(format!("Blocked request: {}", reason));
                 }
                 ModuleDecision::SynthesizeResponse(mut synth) => {
                     modules.dispatch_response_headers(&req, &mut synth);
@@ -372,15 +387,21 @@ impl StreamingNetworkPipe {
             };
 
             let mut raw_request = format!(
-                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Manta/3.1\r\nConnection: keep-alive\r\nAccept-Encoding: gzip, deflate\r\n",
+                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Manta/4.0\r\nConnection: keep-alive\r\nAccept-Encoding: gzip, deflate\r\n",
                 req.method, parsed.path_and_query, host_header
             );
             for (k, v) in &req.headers {
                 if !k.eq_ignore_ascii_case("Host")
                     && !k.eq_ignore_ascii_case("Connection")
                     && !k.eq_ignore_ascii_case("Accept-Encoding")
+                    && !k.eq_ignore_ascii_case("Content-Length")
                 {
                     raw_request.push_str(&format!("{}: {}\r\n", k, v));
+                }
+            }
+            if let Some(body) = current_body {
+                if !body.is_empty() {
+                    raw_request.push_str(&format!("Content-Length: {}\r\n", body.len()));
                 }
             }
             raw_request.push_str("\r\n");
@@ -396,7 +417,12 @@ impl StreamingNetworkPipe {
                     None => (open_fresh_transport(&parsed, &req, &initial_origin)?, false),
                 };
 
-                if stream.write_all(raw_request.as_bytes()).is_err() {
+                let write_ok = stream.write_all(raw_request.as_bytes()).is_ok()
+                    && match current_body {
+                        Some(b) if !b.is_empty() => stream.write_all(b).is_ok(),
+                        _ => true,
+                    };
+                if !write_ok {
                     if was_pooled {
                         attempt_pooled = false;
                         continue;
@@ -653,6 +679,7 @@ impl StreamingNetworkPipe {
 
                 if matches!(status, 301 | 302 | 303) && current_method == "POST" {
                     current_method = "GET".to_string();
+                    current_body = None;
                 }
 
                 current_url = resolved;

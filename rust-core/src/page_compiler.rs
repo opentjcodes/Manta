@@ -1,21 +1,13 @@
 use crate::browser_controls::MantaSettings;
+use crate::extensions::ExtensionHost;
 use crate::kernel_scripts::MantaKernelScripts;
 use crate::site_isolation::OriginKey;
 use crate::storage_engine::MantaStorageEngine;
 use crate::web_compat_engine::WebCompatEngine;
 
-/// **Manta Page Runtime Compiler & Pre-Scanner (`page_compiler.rs`)**:
-/// 1. Compiles the combined **99% Web Compatibility Layer (`WebCompatEngine`)** +
-///    **High-Velocity Custom Kernel Script (`MantaKernelScripts`)** for any target origin.
-/// 2. Automatically bypasses script injection on cryptographic verification challenges
-///    (Cloudflare Turnstile, hCaptcha, reCAPTCHA) so challenges pass with zero friction.
-/// 3. Pre-scans HTML streams for `<link rel="preconnect">`, `<link rel="dns-prefetch">`,
-///    and `<script src="...">` hosts so `MantaWorkerPool` pre-warms DNS in parallel.
 pub struct PageRuntimeCompiler;
 
 impl PageRuntimeCompiler {
-    /// Returns true if the URL belongs to a cryptographic challenge endpoint
-    /// (Cloudflare Turnstile, hCaptcha, reCAPTCHA).
     pub fn is_verification_challenge_url(url: &str) -> bool {
         let lower = url.to_ascii_lowercase();
         lower.contains("challenges.cloudflare.com")
@@ -28,7 +20,6 @@ impl PageRuntimeCompiler {
             || lower.contains("gstatic.com/recaptcha")
     }
 
-    /// Generates the complete Manta Web Runtime & Kernel script for a specific origin.
     pub fn compile_runtime_script_for_origin(
         origin_url: &str,
         storage: &MantaStorageEngine,
@@ -36,11 +27,19 @@ impl PageRuntimeCompiler {
         Self::compile_runtime_script_with_settings(origin_url, storage, &MantaSettings::default())
     }
 
-    /// Generates the complete Manta Web Runtime & Kernel script using live `MantaSettings`.
     pub fn compile_runtime_script_with_settings(
         origin_url: &str,
         storage: &MantaStorageEngine,
         settings: &MantaSettings,
+    ) -> String {
+        Self::compile_runtime_script_full(origin_url, storage, settings, None)
+    }
+
+    pub fn compile_runtime_script_full(
+        origin_url: &str,
+        storage: &MantaStorageEngine,
+        settings: &MantaSettings,
+        extensions: Option<&ExtensionHost>,
     ) -> String {
         let origin = OriginKey::from_url(origin_url);
         if origin.is_opaque || Self::is_verification_challenge_url(origin_url) {
@@ -55,6 +54,15 @@ impl PageRuntimeCompiler {
         script.push_str(&MantaKernelScripts::compile_origin_kernel(
             origin_url, storage, settings,
         ));
+        if let Some(ext_host) = extensions {
+            if !ext_host.is_empty() {
+                let ext_js = ext_host.compile_host_scripts_for_url(origin_url);
+                if !ext_js.is_empty() {
+                    script.push('\n');
+                    script.push_str(&ext_js);
+                }
+            }
+        }
         script
     }
 

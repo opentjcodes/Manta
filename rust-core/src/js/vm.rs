@@ -1,12 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::compiler::JsBytecodeCompiler;
+use super::value::{abstract_eq, CompiledJsProgram, JsValue, OpCode};
 use crate::clipboard::ClipboardSandbox;
 use crate::cpp_bridge::{
     base64_decode, base64_encode, fast_f64_dot, fast_f64_max, fast_f64_min, fast_f64_scale_add,
     fast_f64_sort, fast_f64_sum, find_substr, json_escape_str, now_us, regex_find,
 };
-use crate::dom_arena::{NodeId, ZeroCopyDomArena, NO_NODE};
+use crate::crypto_vault::{generate_volatile_entropy_32, sha256};
+use crate::dom_arena::{ZeroCopyDomArena, NO_NODE};
 use crate::downloads_engine::MantaDownloadManager;
 use crate::module_bus::ModuleBus;
 use crate::net_stream::StreamingNetworkPipe;
@@ -15,2412 +18,6 @@ use crate::storage_engine::MantaStorageEngine;
 
 const MAX_VM_SCOPES: usize = 32_768;
 const MAX_VM_HEAP_CONTAINERS: usize = 16_384;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum JsValue {
-    Undefined,
-    Null,
-    Bool(bool),
-    Number(f64),
-    Str(String),
-    Object(u32),
-    Array(u32),
-    DomNode(NodeId),
-    Fn(u32),
-    Regex(u32),
-    Map(u32),
-    Set(u32),
-    TypedArray(u32),
-}
-
-impl JsValue {
-    pub fn as_str(&self) -> String {
-        match self {
-            JsValue::Undefined => "undefined".to_string(),
-            JsValue::Null => "null".to_string(),
-            JsValue::Bool(b) => b.to_string(),
-            JsValue::Number(n) => {
-                if n.is_nan() {
-                    "NaN".to_string()
-                } else if n.is_infinite() {
-                    if *n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
-                } else if n.fract() == 0.0 && n.abs() < 1e15 {
-                    format!("{:.0}", n)
-                } else {
-                    n.to_string()
-                }
-            }
-            JsValue::Str(s) => s.clone(),
-            JsValue::Object(_) => "[object Object]".to_string(),
-            JsValue::Array(_) => "[object Array]".to_string(),
-            JsValue::DomNode(id) => format!("[object Element#{}]", id),
-            JsValue::Fn(_) => "function() { [manta bytecode] }".to_string(),
-            JsValue::Regex(_) => "/RegExp/".to_string(),
-            JsValue::Map(_) => "[object Map]".to_string(),
-            JsValue::Set(_) => "[object Set]".to_string(),
-            JsValue::TypedArray(_) => "[object Float64Array]".to_string(),
-        }
-    }
-
-    pub fn as_number(&self) -> f64 {
-        match self {
-            JsValue::Undefined => f64::NAN,
-            JsValue::Null | JsValue::Bool(false) => 0.0,
-            JsValue::Bool(true) => 1.0,
-            JsValue::Number(n) => *n,
-            JsValue::Str(s) => {
-                let t = s.trim();
-                if t.is_empty() {
-                    0.0
-                } else {
-                    t.parse::<f64>().unwrap_or(f64::NAN)
-                }
-            }
-            _ => f64::NAN,
-        }
-    }
-
-    pub fn as_i32(&self) -> i32 {
-        let n = self.as_number();
-        if n.is_nan() || n.is_infinite() || n == 0.0 {
-            0
-        } else {
-            n.trunc() as i64 as i32
-        }
-    }
-
-    pub fn is_truthy(&self) -> bool {
-        match self {
-            JsValue::Undefined | JsValue::Null => false,
-            JsValue::Bool(b) => *b,
-            JsValue::Number(n) => *n != 0.0 && !n.is_nan(),
-            JsValue::Str(s) => !s.is_empty(),
-            _ => true,
-        }
-    }
-
-    pub fn type_of(&self) -> &'static str {
-        match self {
-            JsValue::Undefined => "undefined",
-            JsValue::Null => "object",
-            JsValue::Bool(_) => "boolean",
-            JsValue::Number(_) => "number",
-            JsValue::Str(_) => "string",
-            JsValue::Fn(_) => "function",
-            _ => "object",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct JsParam {
-    pub name_id: u16,
-    pub default_pc: Option<usize>,
-    pub is_rest: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct JsFunctionDef {
-    pub name: Option<String>,
-    pub params: Vec<JsParam>,
-    pub entry_pc: usize,
-    pub is_async: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum OpCode {
-    LoadConst(u16),
-    LoadIdent(u16),
-    DeclVar(u16),
-    StoreVar(u16),
-    MakeArray(u16),
-    ArrayPush,
-    ArraySpread,
-    MakeObject(u16),
-    ObjectSpread,
-    MakeClosure(u16),
-    MakeRegex { pat_id: u16, flags_id: u16 },
-    BuildClass { has_parent: bool, method_count: u16 },
-    GetProp(u16),
-    GetPropOpt(u16),
-    SetProp(u16),
-    DeleteProp(u16),
-    GetIndex,
-    SetIndex,
-    DestructureObj { pairs: Vec<(u16, u16, bool)> },
-    DestructureArr { targets: Vec<(u16, bool)> },
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Pow,
-    BitAnd,
-    BitOr,
-    BitXor,
-    BitNot,
-    Shl,
-    Shr,
-    UShr,
-    Neg,
-    Not,
-    TypeOf,
-    InOp,
-    InstanceOf,
-    Eq,
-    Neq,
-    StrictEq,
-    StrictNeq,
-    Lt,
-    Lte,
-    Gt,
-    Gte,
-    And,
-    Or,
-    Nullish,
-    Jump(usize),
-    JumpIfFalse(usize),
-    JumpIfTrue(usize),
-    PushTry(usize),
-    PopTry,
-    Throw,
-    Await,
-    Construct { argc: u8 },
-    CallValue { argc: u8 },
-    CallValueArray,
-    CallMethod { prop_id: u16, argc: u8 },
-    CallMethodArray { prop_id: u16 },
-    KeysArray,
-    Return,
-    Pop,
-    Dup,
-    Halt,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CompiledJsProgram {
-    pub constants: Vec<JsValue>,
-    pub identifiers: Vec<String>,
-    pub functions: Vec<JsFunctionDef>,
-    pub instructions: Vec<OpCode>,
-}
-
-impl CompiledJsProgram {
-    fn add_const(&mut self, val: JsValue) -> u16 {
-        if let Some(pos) = self.constants.iter().position(|c| c == &val) {
-            return pos as u16;
-        }
-        let idx = self.constants.len() as u16;
-        self.constants.push(val);
-        idx
-    }
-
-    fn add_ident(&mut self, name: &str) -> u16 {
-        if let Some(pos) = self.identifiers.iter().position(|i| i == name) {
-            return pos as u16;
-        }
-        let idx = self.identifiers.len() as u16;
-        self.identifiers.push(name.to_string());
-        idx
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    Ident(String),
-    Number(f64),
-    Str(String),
-    Regex(String, String),
-    KeywordFunction,
-    KeywordAsync,
-    KeywordAwait,
-    KeywordClass,
-    KeywordExtends,
-    KeywordLet,
-    KeywordIf,
-    KeywordElse,
-    KeywordWhile,
-    KeywordDo,
-    KeywordFor,
-    KeywordOf,
-    KeywordIn,
-    KeywordBreak,
-    KeywordContinue,
-    KeywordSwitch,
-    KeywordCase,
-    KeywordDefault,
-    KeywordTry,
-    KeywordCatch,
-    KeywordFinally,
-    KeywordThrow,
-    KeywordReturn,
-    KeywordTypeof,
-    KeywordDelete,
-    KeywordInstanceof,
-    KeywordNew,
-    KeywordTrue,
-    KeywordFalse,
-    KeywordNull,
-    KeywordUndefined,
-    LParen,
-    RParen,
-    LBrace,
-    RBrace,
-    LBracket,
-    RBracket,
-    Dot,
-    Spread,
-    OptChain,
-    Comma,
-    Colon,
-    Question,
-    Nullish,
-    Semicolon,
-    Arrow,
-    Assign,
-    PlusAssign,
-    MinusAssign,
-    MulAssign,
-    DivAssign,
-    PlusPlus,
-    MinusMinus,
-    Plus,
-    Minus,
-    Star,
-    Pow,
-    Slash,
-    Percent,
-    EqEq,
-    EqEqEq,
-    NotEq,
-    NotEqEq,
-    Lt,
-    Lte,
-    Gt,
-    Gte,
-    AndAnd,
-    OrOr,
-    BitAnd,
-    BitOr,
-    BitXor,
-    BitNot,
-    Shl,
-    Shr,
-    UShr,
-    Bang,
-    Eof,
-}
-
-impl Token {
-    fn can_end_expr(&self) -> bool {
-        matches!(
-            self,
-            Token::Ident(_)
-                | Token::Number(_)
-                | Token::Str(_)
-                | Token::Regex(_, _)
-                | Token::KeywordTrue
-                | Token::KeywordFalse
-                | Token::KeywordNull
-                | Token::KeywordUndefined
-                | Token::RParen
-                | Token::RBracket
-                | Token::PlusPlus
-                | Token::MinusMinus
-        )
-    }
-}
-
-struct JsLexer<'a> {
-    src: &'a str,
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsLexer<'a> {
-    fn new(src: &'a str) -> Self {
-        Self {
-            src,
-            bytes: src.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn tokenize(&mut self) -> Vec<Token> {
-        let mut tokens = Vec::with_capacity(64);
-        self.lex_until_brace_depth(&mut tokens, None);
-        tokens.push(Token::Eof);
-        tokens
-    }
-
-    fn lex_until_brace_depth(
-        &mut self,
-        tokens: &mut Vec<Token>,
-        stop_on_rbrace_depth: Option<usize>,
-    ) {
-        let mut brace_depth = 0usize;
-
-        while self.pos < self.bytes.len() {
-            let b = self.bytes[self.pos];
-            if b.is_ascii_whitespace() {
-                self.pos += 1;
-                continue;
-            }
-            if b == b'/' && self.pos + 1 < self.bytes.len() {
-                if self.bytes[self.pos + 1] == b'/' {
-                    self.pos += 2;
-                    while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
-                        self.pos += 1;
-                    }
-                    continue;
-                }
-                if self.bytes[self.pos + 1] == b'*' {
-                    self.pos += 2;
-                    while self.pos + 1 < self.bytes.len()
-                        && !(self.bytes[self.pos] == b'*' && self.bytes[self.pos + 1] == b'/')
-                    {
-                        self.pos += 1;
-                    }
-                    self.pos = (self.pos + 2).min(self.bytes.len());
-                    continue;
-                }
-            }
-
-            if b == b'`' {
-                self.pos += 1;
-                self.lex_template_literal(tokens);
-                continue;
-            }
-
-            if b == b'"' || b == b'\'' {
-                let quote = b;
-                self.pos += 1;
-                let mut s = String::new();
-                while self.pos < self.bytes.len() {
-                    let ch = self.src[self.pos..].chars().next().unwrap();
-                    self.pos += ch.len_utf8();
-                    if ch.len_utf8() == 1 && ch as u8 == quote {
-                        break;
-                    }
-                    if ch == '\\' && self.pos < self.bytes.len() {
-                        let esc = self.src[self.pos..].chars().next().unwrap();
-                        self.pos += esc.len_utf8();
-                        match esc {
-                            'n' => s.push('\n'),
-                            'r' => s.push('\r'),
-                            't' => s.push('\t'),
-                            _ => s.push(esc),
-                        }
-                    } else {
-                        s.push(ch);
-                    }
-                }
-                tokens.push(Token::Str(s));
-                continue;
-            }
-
-            if b == b'/' {
-                let is_div = tokens.last().map(|t| t.can_end_expr()).unwrap_or(false);
-                if !is_div {
-                    self.pos += 1;
-                    let mut pat = String::new();
-                    let mut in_class = false;
-                    while self.pos < self.bytes.len() {
-                        let ch = self.src[self.pos..].chars().next().unwrap();
-                        self.pos += ch.len_utf8();
-                        if ch == '\\' && self.pos < self.bytes.len() {
-                            pat.push(ch);
-                            let esc = self.src[self.pos..].chars().next().unwrap();
-                            self.pos += esc.len_utf8();
-                            pat.push(esc);
-                            continue;
-                        }
-                        if ch == '[' {
-                            in_class = true;
-                        } else if ch == ']' {
-                            in_class = false;
-                        } else if ch == '/' && !in_class {
-                            break;
-                        }
-                        pat.push(ch);
-                    }
-                    let mut flags = String::new();
-                    while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_alphabetic()
-                    {
-                        flags.push(self.bytes[self.pos] as char);
-                        self.pos += 1;
-                    }
-                    tokens.push(Token::Regex(pat, flags));
-                    continue;
-                }
-            }
-
-            if b.is_ascii_digit() {
-                let start = self.pos;
-                if b == b'0' && self.pos + 1 < self.bytes.len() {
-                    let next = self.bytes[self.pos + 1];
-                    if next == b'x' || next == b'X' {
-                        self.pos += 2;
-                        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_hexdigit()
-                        {
-                            self.pos += 1;
-                        }
-                        let val = u64::from_str_radix(&self.src[start + 2..self.pos], 16)
-                            .unwrap_or(0) as f64;
-                        tokens.push(Token::Number(val));
-                        continue;
-                    }
-                    if next == b'b' || next == b'B' {
-                        self.pos += 2;
-                        while self.pos < self.bytes.len()
-                            && matches!(self.bytes[self.pos], b'0' | b'1')
-                        {
-                            self.pos += 1;
-                        }
-                        let val = u64::from_str_radix(&self.src[start + 2..self.pos], 2)
-                            .unwrap_or(0) as f64;
-                        tokens.push(Token::Number(val));
-                        continue;
-                    }
-                }
-                while self.pos < self.bytes.len()
-                    && (self.bytes[self.pos].is_ascii_digit() || self.bytes[self.pos] == b'.')
-                {
-                    self.pos += 1;
-                }
-                if self.pos < self.bytes.len() && matches!(self.bytes[self.pos], b'e' | b'E') {
-                    self.pos += 1;
-                    if self.pos < self.bytes.len() && matches!(self.bytes[self.pos], b'+' | b'-') {
-                        self.pos += 1;
-                    }
-                    while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                        self.pos += 1;
-                    }
-                }
-                let val = self.src[start..self.pos].parse::<f64>().unwrap_or(0.0);
-                tokens.push(Token::Number(val));
-                continue;
-            }
-
-            if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
-                let start = self.pos;
-                while self.pos < self.bytes.len()
-                    && (self.bytes[self.pos].is_ascii_alphanumeric()
-                        || self.bytes[self.pos] == b'_'
-                        || self.bytes[self.pos] == b'$')
-                {
-                    self.pos += 1;
-                }
-                let ident = &self.src[start..self.pos];
-                let tok = match ident {
-                    "function" => Token::KeywordFunction,
-                    "async" => Token::KeywordAsync,
-                    "await" => Token::KeywordAwait,
-                    "class" => Token::KeywordClass,
-                    "extends" => Token::KeywordExtends,
-                    "let" | "const" | "var" => Token::KeywordLet,
-                    "if" => Token::KeywordIf,
-                    "else" => Token::KeywordElse,
-                    "while" => Token::KeywordWhile,
-                    "do" => Token::KeywordDo,
-                    "for" => Token::KeywordFor,
-                    "of" => Token::KeywordOf,
-                    "in" => Token::KeywordIn,
-                    "break" => Token::KeywordBreak,
-                    "continue" => Token::KeywordContinue,
-                    "switch" => Token::KeywordSwitch,
-                    "case" => Token::KeywordCase,
-                    "default" => Token::KeywordDefault,
-                    "try" => Token::KeywordTry,
-                    "catch" => Token::KeywordCatch,
-                    "finally" => Token::KeywordFinally,
-                    "throw" => Token::KeywordThrow,
-                    "return" => Token::KeywordReturn,
-                    "typeof" => Token::KeywordTypeof,
-                    "delete" => Token::KeywordDelete,
-                    "instanceof" => Token::KeywordInstanceof,
-                    "new" => Token::KeywordNew,
-                    "true" => Token::KeywordTrue,
-                    "false" => Token::KeywordFalse,
-                    "null" => Token::KeywordNull,
-                    "undefined" => Token::KeywordUndefined,
-                    _ => Token::Ident(ident.to_string()),
-                };
-                tokens.push(tok);
-                continue;
-            }
-
-            if b == b'{' {
-                brace_depth += 1;
-                self.pos += 1;
-                tokens.push(Token::LBrace);
-                continue;
-            }
-            if b == b'}' {
-                if let Some(stop_d) = stop_on_rbrace_depth {
-                    if brace_depth == stop_d {
-                        self.pos += 1;
-                        return;
-                    }
-                }
-                brace_depth = brace_depth.saturating_sub(1);
-                self.pos += 1;
-                tokens.push(Token::RBrace);
-                continue;
-            }
-
-            self.pos += 1;
-            let peek = self.bytes.get(self.pos).copied();
-            match b {
-                b'(' => tokens.push(Token::LParen),
-                b')' => tokens.push(Token::RParen),
-                b'[' => tokens.push(Token::LBracket),
-                b']' => tokens.push(Token::RBracket),
-                b'.' => {
-                    if peek == Some(b'.') && self.bytes.get(self.pos + 1) == Some(&b'.') {
-                        self.pos += 2;
-                        tokens.push(Token::Spread);
-                    } else {
-                        tokens.push(Token::Dot);
-                    }
-                }
-                b',' => tokens.push(Token::Comma),
-                b':' => tokens.push(Token::Colon),
-                b'?' => {
-                    if peek == Some(b'?') {
-                        self.pos += 1;
-                        tokens.push(Token::Nullish);
-                    } else if peek == Some(b'.') {
-                        self.pos += 1;
-                        tokens.push(Token::OptChain);
-                    } else {
-                        tokens.push(Token::Question);
-                    }
-                }
-                b';' => tokens.push(Token::Semicolon),
-                b'+' => {
-                    if peek == Some(b'+') {
-                        self.pos += 1;
-                        tokens.push(Token::PlusPlus);
-                    } else if peek == Some(b'=') {
-                        self.pos += 1;
-                        tokens.push(Token::PlusAssign);
-                    } else {
-                        tokens.push(Token::Plus);
-                    }
-                }
-                b'-' => {
-                    if peek == Some(b'-') {
-                        self.pos += 1;
-                        tokens.push(Token::MinusMinus);
-                    } else if peek == Some(b'=') {
-                        self.pos += 1;
-                        tokens.push(Token::MinusAssign);
-                    } else {
-                        tokens.push(Token::Minus);
-                    }
-                }
-                b'*' => {
-                    if peek == Some(b'*') {
-                        self.pos += 1;
-                        tokens.push(Token::Pow);
-                    } else if peek == Some(b'=') {
-                        self.pos += 1;
-                        tokens.push(Token::MulAssign);
-                    } else {
-                        tokens.push(Token::Star);
-                    }
-                }
-                b'/' => {
-                    if peek == Some(b'=') {
-                        self.pos += 1;
-                        tokens.push(Token::DivAssign);
-                    } else {
-                        tokens.push(Token::Slash);
-                    }
-                }
-                b'%' => tokens.push(Token::Percent),
-                b'~' => tokens.push(Token::BitNot),
-                b'^' => tokens.push(Token::BitXor),
-                b'=' => {
-                    if peek == Some(b'>') {
-                        self.pos += 1;
-                        tokens.push(Token::Arrow);
-                    } else if peek == Some(b'=') {
-                        self.pos += 1;
-                        if self.bytes.get(self.pos).copied() == Some(b'=') {
-                            self.pos += 1;
-                            tokens.push(Token::EqEqEq);
-                        } else {
-                            tokens.push(Token::EqEq);
-                        }
-                    } else {
-                        tokens.push(Token::Assign);
-                    }
-                }
-                b'!' => {
-                    if peek == Some(b'=') {
-                        self.pos += 1;
-                        if self.bytes.get(self.pos).copied() == Some(b'=') {
-                            self.pos += 1;
-                            tokens.push(Token::NotEqEq);
-                        } else {
-                            tokens.push(Token::NotEq);
-                        }
-                    } else {
-                        tokens.push(Token::Bang);
-                    }
-                }
-                b'<' => {
-                    if peek == Some(b'<') {
-                        self.pos += 1;
-                        tokens.push(Token::Shl);
-                    } else if peek == Some(b'=') {
-                        self.pos += 1;
-                        tokens.push(Token::Lte);
-                    } else {
-                        tokens.push(Token::Lt);
-                    }
-                }
-                b'>' => {
-                    if peek == Some(b'>') {
-                        self.pos += 1;
-                        if self.bytes.get(self.pos).copied() == Some(b'>') {
-                            self.pos += 1;
-                            tokens.push(Token::UShr);
-                        } else {
-                            tokens.push(Token::Shr);
-                        }
-                    } else if peek == Some(b'=') {
-                        self.pos += 1;
-                        tokens.push(Token::Gte);
-                    } else {
-                        tokens.push(Token::Gt);
-                    }
-                }
-                b'&' => {
-                    if peek == Some(b'&') {
-                        self.pos += 1;
-                        tokens.push(Token::AndAnd);
-                    } else {
-                        tokens.push(Token::BitAnd);
-                    }
-                }
-                b'|' => {
-                    if peek == Some(b'|') {
-                        self.pos += 1;
-                        tokens.push(Token::OrOr);
-                    } else {
-                        tokens.push(Token::BitOr);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn lex_template_literal(&mut self, tokens: &mut Vec<Token>) {
-        tokens.push(Token::LParen);
-        let mut first_part = true;
-        let mut s = String::new();
-
-        while self.pos < self.bytes.len() {
-            let ch = self.src[self.pos..].chars().next().unwrap();
-            if ch == '`' {
-                self.pos += 1;
-                break;
-            }
-            if ch == '$' && self.bytes.get(self.pos + 1) == Some(&b'{') {
-                if !first_part {
-                    tokens.push(Token::Plus);
-                }
-                first_part = false;
-                tokens.push(Token::Str(std::mem::take(&mut s)));
-                tokens.push(Token::Plus);
-                tokens.push(Token::LParen);
-                self.pos += 2;
-                self.lex_until_brace_depth(tokens, Some(0));
-                tokens.push(Token::RParen);
-                continue;
-            }
-            self.pos += ch.len_utf8();
-            if ch == '\\' && self.pos < self.bytes.len() {
-                let esc = self.src[self.pos..].chars().next().unwrap();
-                self.pos += esc.len_utf8();
-                match esc {
-                    'n' => s.push('\n'),
-                    'r' => s.push('\r'),
-                    't' => s.push('\t'),
-                    _ => s.push(esc),
-                }
-            } else {
-                s.push(ch);
-            }
-        }
-
-        if !first_part {
-            tokens.push(Token::Plus);
-        }
-        tokens.push(Token::Str(s));
-        tokens.push(Token::RParen);
-    }
-}
-
-#[derive(Debug, Clone)]
-enum LValue {
-    Var(u16),
-    Prop { prop_id: u16 },
-    Index,
-}
-
-struct LoopPatchContext {
-    break_jumps: Vec<usize>,
-    continue_jumps: Vec<usize>,
-}
-
-pub struct JsBytecodeCompiler {
-    tokens: Vec<Token>,
-    pos: usize,
-    program: CompiledJsProgram,
-    loop_stack: Vec<LoopPatchContext>,
-}
-
-impl JsBytecodeCompiler {
-    pub fn compile(source: &str) -> Result<CompiledJsProgram, &'static str> {
-        let mut lexer = JsLexer::new(source);
-        let tokens = lexer.tokenize();
-        let mut compiler = Self {
-            tokens,
-            pos: 0,
-            program: CompiledJsProgram::default(),
-            loop_stack: Vec::new(),
-        };
-
-        while compiler.peek() != &Token::Eof {
-            let before = compiler.pos;
-            compiler.compile_statement()?;
-            if compiler.pos == before {
-                compiler.advance();
-            }
-        }
-        compiler.program.instructions.push(OpCode::Halt);
-        compiler.optimize_program();
-        Ok(compiler.program)
-    }
-
-    fn optimize_program(&mut self) {
-        let mut jump_targets = HashSet::new();
-        for op in &self.program.instructions {
-            match *op {
-                OpCode::Jump(t)
-                | OpCode::JumpIfFalse(t)
-                | OpCode::JumpIfTrue(t)
-                | OpCode::PushTry(t) => {
-                    jump_targets.insert(t);
-                }
-                _ => {}
-            }
-        }
-        for f in &self.program.functions {
-            jump_targets.insert(f.entry_pc);
-            for p in &f.params {
-                if let Some(d) = p.default_pc {
-                    jump_targets.insert(d);
-                }
-            }
-        }
-
-        let mut changed = true;
-        let mut passes = 0;
-        while changed && passes < 6 {
-            changed = false;
-            passes += 1;
-            let len = self.program.instructions.len();
-            let mut i = 0usize;
-            while i + 2 < len {
-                if !jump_targets.contains(&(i + 1)) && !jump_targets.contains(&(i + 2)) {
-                    let op0 = self.program.instructions[i].clone();
-                    let op1 = self.program.instructions[i + 1].clone();
-                    let op2 = self.program.instructions[i + 2].clone();
-                    if let (OpCode::LoadConst(a_id), OpCode::LoadConst(b_id)) = (op0, op1) {
-                        let a = self.program.constants[a_id as usize].clone();
-                        let b = self.program.constants[b_id as usize].clone();
-                        let folded = match (a, b, op2) {
-                            (JsValue::Number(x), JsValue::Number(y), OpCode::Add) => {
-                                Some(JsValue::Number(x + y))
-                            }
-                            (JsValue::Number(x), JsValue::Number(y), OpCode::Sub) => {
-                                Some(JsValue::Number(x - y))
-                            }
-                            (JsValue::Number(x), JsValue::Number(y), OpCode::Mul) => {
-                                Some(JsValue::Number(x * y))
-                            }
-                            (JsValue::Number(x), JsValue::Number(y), OpCode::Div) if y != 0.0 => {
-                                Some(JsValue::Number(x / y))
-                            }
-                            (JsValue::Number(x), JsValue::Number(y), OpCode::Pow) => {
-                                Some(JsValue::Number(x.powf(y)))
-                            }
-                            (JsValue::Str(x), JsValue::Str(y), OpCode::Add) => {
-                                Some(JsValue::Str(format!("{}{}", x, y)))
-                            }
-                            _ => None,
-                        };
-                        if let Some(val) = folded {
-                            let c_id = self.program.add_const(val);
-                            self.program.instructions[i] = OpCode::LoadConst(c_id);
-                            self.program.instructions[i + 1] = OpCode::Jump(i + 3);
-                            self.program.instructions[i + 2] = OpCode::Pop;
-                            jump_targets.insert(i + 3);
-                            changed = true;
-                            i += 3;
-                            continue;
-                        }
-                    }
-                }
-                i += 1;
-            }
-        }
-    }
-
-    fn peek(&self) -> &Token {
-        self.tokens.get(self.pos).unwrap_or(&Token::Eof)
-    }
-
-    fn peek_at(&self, offset: usize) -> &Token {
-        self.tokens.get(self.pos + offset).unwrap_or(&Token::Eof)
-    }
-
-    fn advance(&mut self) -> Token {
-        let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
-        if self.pos < self.tokens.len() {
-            self.pos += 1;
-        }
-        tok
-    }
-
-    fn consume_optional_semicolons(&mut self) {
-        while self.peek() == &Token::Semicolon {
-            self.advance();
-        }
-    }
-
-    fn compile_statement(&mut self) -> Result<(), &'static str> {
-        self.consume_optional_semicolons();
-        match self.peek().clone() {
-            Token::Eof | Token::RBrace => Ok(()),
-            Token::KeywordAsync if self.peek_at(1) == &Token::KeywordFunction => {
-                self.advance();
-                self.advance();
-                let fn_name = if let Token::Ident(n) = self.peek().clone() {
-                    self.advance();
-                    Some(n)
-                } else {
-                    None
-                };
-                let fn_idx = self.compile_function_body(fn_name.clone(), true)?;
-                self.program.instructions.push(OpCode::MakeClosure(fn_idx));
-                if let Some(name) = fn_name {
-                    let id = self.program.add_ident(&name);
-                    self.program.instructions.push(OpCode::DeclVar(id));
-                }
-                self.program.instructions.push(OpCode::Pop);
-                Ok(())
-            }
-            Token::KeywordFunction => {
-                self.advance();
-                let fn_name = if let Token::Ident(n) = self.peek().clone() {
-                    self.advance();
-                    Some(n)
-                } else {
-                    None
-                };
-                let fn_idx = self.compile_function_body(fn_name.clone(), false)?;
-                self.program.instructions.push(OpCode::MakeClosure(fn_idx));
-                if let Some(name) = fn_name {
-                    let id = self.program.add_ident(&name);
-                    self.program.instructions.push(OpCode::DeclVar(id));
-                }
-                self.program.instructions.push(OpCode::Pop);
-                Ok(())
-            }
-            Token::KeywordClass => self.compile_class_declaration(),
-            Token::LBrace => {
-                self.advance();
-                while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-                    let before = self.pos;
-                    self.compile_statement()?;
-                    if self.pos == before {
-                        self.advance();
-                    }
-                }
-                if self.peek() == &Token::RBrace {
-                    self.advance();
-                }
-                Ok(())
-            }
-            Token::KeywordLet => {
-                self.advance();
-                loop {
-                    if self.peek() == &Token::LBrace {
-                        self.compile_object_destructure_decl()?;
-                    } else if self.peek() == &Token::LBracket {
-                        self.compile_array_destructure_decl()?;
-                    } else {
-                        let Token::Ident(var_name) = self.advance() else {
-                            return Err("Expected variable identifier");
-                        };
-                        let var_id = self.program.add_ident(&var_name);
-                        if self.peek() == &Token::Assign {
-                            self.advance();
-                            self.compile_expr()?;
-                        } else {
-                            let undef_id = self.program.add_const(JsValue::Undefined);
-                            self.program.instructions.push(OpCode::LoadConst(undef_id));
-                        }
-                        self.program.instructions.push(OpCode::DeclVar(var_id));
-                        self.program.instructions.push(OpCode::Pop);
-                    }
-                    if self.peek() == &Token::Comma {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-                self.consume_optional_semicolons();
-                Ok(())
-            }
-            Token::KeywordIf => {
-                self.advance();
-                if self.peek() == &Token::LParen {
-                    self.advance();
-                }
-                self.compile_expr()?;
-                if self.peek() == &Token::RParen {
-                    self.advance();
-                }
-                let jump_false_idx = self.program.instructions.len();
-                self.program.instructions.push(OpCode::JumpIfFalse(0));
-
-                self.compile_statement()?;
-
-                if self.peek() == &Token::KeywordElse {
-                    self.advance();
-                    let jump_end_idx = self.program.instructions.len();
-                    self.program.instructions.push(OpCode::Jump(0));
-                    let else_start = self.program.instructions.len();
-                    self.program.instructions[jump_false_idx] = OpCode::JumpIfFalse(else_start);
-                    self.compile_statement()?;
-                    let after_else = self.program.instructions.len();
-                    self.program.instructions[jump_end_idx] = OpCode::Jump(after_else);
-                } else {
-                    let after_then = self.program.instructions.len();
-                    self.program.instructions[jump_false_idx] = OpCode::JumpIfFalse(after_then);
-                }
-                Ok(())
-            }
-            Token::KeywordWhile => {
-                self.advance();
-                let loop_start = self.program.instructions.len();
-                if self.peek() == &Token::LParen {
-                    self.advance();
-                }
-                self.compile_expr()?;
-                if self.peek() == &Token::RParen {
-                    self.advance();
-                }
-                let exit_jump_idx = self.program.instructions.len();
-                self.program.instructions.push(OpCode::JumpIfFalse(0));
-
-                self.loop_stack.push(LoopPatchContext {
-                    break_jumps: Vec::new(),
-                    continue_jumps: Vec::new(),
-                });
-                self.compile_statement()?;
-                let ctx = self.loop_stack.pop().unwrap();
-
-                for cj in ctx.continue_jumps {
-                    self.program.instructions[cj] = OpCode::Jump(loop_start);
-                }
-                self.program.instructions.push(OpCode::Jump(loop_start));
-                let loop_end = self.program.instructions.len();
-                self.program.instructions[exit_jump_idx] = OpCode::JumpIfFalse(loop_end);
-                for bj in ctx.break_jumps {
-                    self.program.instructions[bj] = OpCode::Jump(loop_end);
-                }
-                Ok(())
-            }
-            Token::KeywordDo => {
-                self.advance();
-                let body_start = self.program.instructions.len();
-                self.loop_stack.push(LoopPatchContext {
-                    break_jumps: Vec::new(),
-                    continue_jumps: Vec::new(),
-                });
-                self.compile_statement()?;
-                let ctx = self.loop_stack.pop().unwrap();
-                let cond_pc = self.program.instructions.len();
-                for cj in ctx.continue_jumps {
-                    self.program.instructions[cj] = OpCode::Jump(cond_pc);
-                }
-                if self.peek() == &Token::KeywordWhile {
-                    self.advance();
-                }
-                if self.peek() == &Token::LParen {
-                    self.advance();
-                }
-                self.compile_expr()?;
-                if self.peek() == &Token::RParen {
-                    self.advance();
-                }
-                self.program.instructions.push(OpCode::JumpIfTrue(body_start));
-                let loop_end = self.program.instructions.len();
-                for bj in ctx.break_jumps {
-                    self.program.instructions[bj] = OpCode::Jump(loop_end);
-                }
-                self.consume_optional_semicolons();
-                Ok(())
-            }
-            Token::KeywordFor => self.compile_for_statement(),
-            Token::KeywordBreak => {
-                self.advance();
-                let j_idx = self.program.instructions.len();
-                self.program.instructions.push(OpCode::Jump(0));
-                if let Some(ctx) = self.loop_stack.last_mut() {
-                    ctx.break_jumps.push(j_idx);
-                }
-                self.consume_optional_semicolons();
-                Ok(())
-            }
-            Token::KeywordContinue => {
-                self.advance();
-                let j_idx = self.program.instructions.len();
-                self.program.instructions.push(OpCode::Jump(0));
-                if let Some(ctx) = self.loop_stack.last_mut() {
-                    ctx.continue_jumps.push(j_idx);
-                }
-                self.consume_optional_semicolons();
-                Ok(())
-            }
-            Token::KeywordSwitch => self.compile_switch_statement(),
-            Token::KeywordTry => {
-                self.advance();
-                let try_idx = self.program.instructions.len();
-                self.program.instructions.push(OpCode::PushTry(0));
-                self.compile_statement()?;
-                self.program.instructions.push(OpCode::PopTry);
-                let jump_after_catch = self.program.instructions.len();
-                self.program.instructions.push(OpCode::Jump(0));
-
-                if self.peek() == &Token::KeywordCatch {
-                    let catch_pc = self.program.instructions.len();
-                    self.program.instructions[try_idx] = OpCode::PushTry(catch_pc);
-                    self.advance();
-                    if self.peek() == &Token::LParen {
-                        self.advance();
-                        if let Token::Ident(err_name) = self.advance() {
-                            let err_id = self.program.add_ident(&err_name);
-                            self.program.instructions.push(OpCode::DeclVar(err_id));
-                        }
-                        if self.peek() == &Token::RParen {
-                            self.advance();
-                        }
-                    }
-                    self.program.instructions.push(OpCode::Pop);
-                    self.compile_statement()?;
-                } else {
-                    let after_pc = self.program.instructions.len();
-                    self.program.instructions[try_idx] = OpCode::PushTry(after_pc);
-                    self.program.instructions.push(OpCode::Pop);
-                }
-                let end_pc = self.program.instructions.len();
-                self.program.instructions[jump_after_catch] = OpCode::Jump(end_pc);
-                if self.peek() == &Token::KeywordFinally {
-                    self.advance();
-                    self.compile_statement()?;
-                }
-                Ok(())
-            }
-            Token::KeywordThrow => {
-                self.advance();
-                self.compile_expr()?;
-                self.program.instructions.push(OpCode::Throw);
-                self.consume_optional_semicolons();
-                Ok(())
-            }
-            Token::KeywordReturn => {
-                self.advance();
-                if self.peek() != &Token::Semicolon
-                    && self.peek() != &Token::RBrace
-                    && self.peek() != &Token::Eof
-                {
-                    self.compile_expr()?;
-                } else {
-                    let c = self.program.add_const(JsValue::Undefined);
-                    self.program.instructions.push(OpCode::LoadConst(c));
-                }
-                self.program.instructions.push(OpCode::Return);
-                self.consume_optional_semicolons();
-                Ok(())
-            }
-            _ => {
-                self.compile_expr()?;
-                self.program.instructions.push(OpCode::Pop);
-                self.consume_optional_semicolons();
-                Ok(())
-            }
-        }
-    }
-
-    fn compile_object_destructure_decl(&mut self) -> Result<(), &'static str> {
-        self.advance();
-        let mut pairs = Vec::new();
-        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-            let Token::Ident(prop_name) = self.advance() else {
-                break;
-            };
-            let prop_id = self.program.add_ident(&prop_name);
-            let target_id = if self.peek() == &Token::Colon {
-                self.advance();
-                if let Token::Ident(alias) = self.advance() {
-                    self.program.add_ident(&alias)
-                } else {
-                    prop_id
-                }
-            } else {
-                prop_id
-            };
-            let has_default = if self.peek() == &Token::Assign {
-                self.advance();
-                self.compile_expr()?;
-                true
-            } else {
-                false
-            };
-            pairs.push((prop_id, target_id, has_default));
-            if self.peek() == &Token::Comma {
-                self.advance();
-            }
-        }
-        if self.peek() == &Token::RBrace {
-            self.advance();
-        }
-        if self.peek() == &Token::Assign {
-            self.advance();
-        }
-        self.compile_expr()?;
-        self.program
-            .instructions
-            .push(OpCode::DestructureObj { pairs });
-        self.program.instructions.push(OpCode::Pop);
-        Ok(())
-    }
-
-    fn compile_array_destructure_decl(&mut self) -> Result<(), &'static str> {
-        self.advance();
-        let mut targets = Vec::new();
-        while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
-            let is_rest = if self.peek() == &Token::Spread {
-                self.advance();
-                true
-            } else {
-                false
-            };
-            if let Token::Ident(vname) = self.advance() {
-                targets.push((self.program.add_ident(&vname), is_rest));
-            }
-            if self.peek() == &Token::Comma {
-                self.advance();
-            }
-        }
-        if self.peek() == &Token::RBracket {
-            self.advance();
-        }
-        if self.peek() == &Token::Assign {
-            self.advance();
-        }
-        self.compile_expr()?;
-        self.program
-            .instructions
-            .push(OpCode::DestructureArr { targets });
-        self.program.instructions.push(OpCode::Pop);
-        Ok(())
-    }
-
-    fn compile_class_declaration(&mut self) -> Result<(), &'static str> {
-        self.advance();
-        let Token::Ident(class_name) = self.advance() else {
-            return Err("Expected class name");
-        };
-        let class_id = self.program.add_ident(&class_name);
-        let has_parent = if self.peek() == &Token::KeywordExtends {
-            self.advance();
-            self.compile_primary()?;
-            true
-        } else {
-            false
-        };
-
-        if self.peek() == &Token::LBrace {
-            self.advance();
-        }
-
-        let mut method_count = 0u16;
-        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-            self.consume_optional_semicolons();
-            if self.peek() == &Token::RBrace {
-                break;
-            }
-            let mut is_static = false;
-            let mut is_async = false;
-            if matches!(self.peek(), Token::Ident(ref s) if s == "static")
-                && !matches!(self.peek_at(1), Token::LParen)
-            {
-                is_static = true;
-                self.advance();
-            }
-            if self.peek() == &Token::KeywordAsync {
-                is_async = true;
-                self.advance();
-            }
-            let Token::Ident(m_name) = self.advance() else {
-                self.advance();
-                continue;
-            };
-            let key_label = if is_static {
-                format!("__static::{}", m_name)
-            } else {
-                m_name.clone()
-            };
-            let key_c = self.program.add_const(JsValue::Str(key_label));
-            self.program.instructions.push(OpCode::LoadConst(key_c));
-
-            let fn_idx = self.compile_function_body(Some(m_name), is_async)?;
-            self.program.instructions.push(OpCode::MakeClosure(fn_idx));
-            method_count += 1;
-        }
-        if self.peek() == &Token::RBrace {
-            self.advance();
-        }
-
-        self.program.instructions.push(OpCode::BuildClass {
-            has_parent,
-            method_count,
-        });
-        self.program.instructions.push(OpCode::DeclVar(class_id));
-        self.program.instructions.push(OpCode::Pop);
-        Ok(())
-    }
-
-    fn compile_for_statement(&mut self) -> Result<(), &'static str> {
-        self.advance();
-        if self.peek() == &Token::LParen {
-            self.advance();
-        }
-
-        let is_for_of_or_in = (self.peek() == &Token::KeywordLet
-            && matches!(self.peek_at(1), Token::Ident(_))
-            && matches!(self.peek_at(2), Token::KeywordOf | Token::KeywordIn))
-            || (matches!(self.peek(), Token::Ident(_))
-                && matches!(self.peek_at(1), Token::KeywordOf | Token::KeywordIn));
-
-        if is_for_of_or_in {
-            let is_decl = self.peek() == &Token::KeywordLet;
-            if is_decl {
-                self.advance();
-            }
-            let Token::Ident(item_name) = self.advance() else {
-                return Err("Expected loop variable");
-            };
-            let is_for_in = self.advance() == Token::KeywordIn;
-            self.compile_expr()?;
-            if self.peek() == &Token::RParen {
-                self.advance();
-            }
-            if is_for_in {
-                self.program.instructions.push(OpCode::KeysArray);
-            }
-
-            let arr_tmp_id = self.program.add_ident("__forof_arr");
-            let idx_tmp_id = self.program.add_ident("__forof_idx");
-            let len_prop = self.program.add_ident("length");
-            let item_id = self.program.add_ident(&item_name);
-
-            self.program.instructions.push(OpCode::DeclVar(arr_tmp_id));
-            self.program.instructions.push(OpCode::Pop);
-            let zero_c = self.program.add_const(JsValue::Number(0.0));
-            let one_c = self.program.add_const(JsValue::Number(1.0));
-            self.program.instructions.push(OpCode::LoadConst(zero_c));
-            self.program.instructions.push(OpCode::DeclVar(idx_tmp_id));
-            self.program.instructions.push(OpCode::Pop);
-
-            let loop_cond = self.program.instructions.len();
-            self.program.instructions.push(OpCode::LoadIdent(idx_tmp_id));
-            self.program.instructions.push(OpCode::LoadIdent(arr_tmp_id));
-            self.program.instructions.push(OpCode::GetProp(len_prop));
-            self.program.instructions.push(OpCode::Lt);
-            let exit_jump = self.program.instructions.len();
-            self.program.instructions.push(OpCode::JumpIfFalse(0));
-
-            self.program.instructions.push(OpCode::LoadIdent(arr_tmp_id));
-            self.program.instructions.push(OpCode::LoadIdent(idx_tmp_id));
-            self.program.instructions.push(OpCode::GetIndex);
-            if is_decl {
-                self.program.instructions.push(OpCode::DeclVar(item_id));
-            } else {
-                self.program.instructions.push(OpCode::StoreVar(item_id));
-            }
-            self.program.instructions.push(OpCode::Pop);
-
-            self.loop_stack.push(LoopPatchContext {
-                break_jumps: Vec::new(),
-                continue_jumps: Vec::new(),
-            });
-            self.compile_statement()?;
-            let ctx = self.loop_stack.pop().unwrap();
-
-            let inc_pc = self.program.instructions.len();
-            for cj in ctx.continue_jumps {
-                self.program.instructions[cj] = OpCode::Jump(inc_pc);
-            }
-            self.program.instructions.push(OpCode::LoadIdent(idx_tmp_id));
-            self.program.instructions.push(OpCode::LoadConst(one_c));
-            self.program.instructions.push(OpCode::Add);
-            self.program.instructions.push(OpCode::StoreVar(idx_tmp_id));
-            self.program.instructions.push(OpCode::Pop);
-            self.program.instructions.push(OpCode::Jump(loop_cond));
-
-            let end_pc = self.program.instructions.len();
-            self.program.instructions[exit_jump] = OpCode::JumpIfFalse(end_pc);
-            for bj in ctx.break_jumps {
-                self.program.instructions[bj] = OpCode::Jump(end_pc);
-            }
-            return Ok(());
-        }
-
-        if self.peek() != &Token::Semicolon {
-            if self.peek() == &Token::KeywordLet {
-                self.compile_statement()?;
-            } else {
-                self.compile_expr()?;
-                self.program.instructions.push(OpCode::Pop);
-                self.consume_optional_semicolons();
-            }
-        } else {
-            self.advance();
-        }
-
-        let cond_pc = self.program.instructions.len();
-        let exit_jump = if self.peek() != &Token::Semicolon {
-            self.compile_expr()?;
-            let j = self.program.instructions.len();
-            self.program.instructions.push(OpCode::JumpIfFalse(0));
-            Some(j)
-        } else {
-            None
-        };
-        if self.peek() == &Token::Semicolon {
-            self.advance();
-        }
-
-        let jump_to_body = self.program.instructions.len();
-        self.program.instructions.push(OpCode::Jump(0));
-
-        let step_pc = self.program.instructions.len();
-        if self.peek() != &Token::RParen {
-            self.compile_expr()?;
-            self.program.instructions.push(OpCode::Pop);
-        }
-        if self.peek() == &Token::RParen {
-            self.advance();
-        }
-        self.program.instructions.push(OpCode::Jump(cond_pc));
-
-        let body_pc = self.program.instructions.len();
-        self.program.instructions[jump_to_body] = OpCode::Jump(body_pc);
-
-        self.loop_stack.push(LoopPatchContext {
-            break_jumps: Vec::new(),
-            continue_jumps: Vec::new(),
-        });
-        self.compile_statement()?;
-        let ctx = self.loop_stack.pop().unwrap();
-
-        for cj in ctx.continue_jumps {
-            self.program.instructions[cj] = OpCode::Jump(step_pc);
-        }
-        self.program.instructions.push(OpCode::Jump(step_pc));
-
-        let end_pc = self.program.instructions.len();
-        if let Some(ej) = exit_jump {
-            self.program.instructions[ej] = OpCode::JumpIfFalse(end_pc);
-        }
-        for bj in ctx.break_jumps {
-            self.program.instructions[bj] = OpCode::Jump(end_pc);
-        }
-        Ok(())
-    }
-
-    fn compile_switch_statement(&mut self) -> Result<(), &'static str> {
-        self.advance();
-        if self.peek() == &Token::LParen {
-            self.advance();
-        }
-        self.compile_expr()?;
-        if self.peek() == &Token::RParen {
-            self.advance();
-        }
-        let switch_var = self.program.add_ident("__switch_val");
-        self.program.instructions.push(OpCode::DeclVar(switch_var));
-        self.program.instructions.push(OpCode::Pop);
-
-        if self.peek() == &Token::LBrace {
-            self.advance();
-        }
-
-        self.loop_stack.push(LoopPatchContext {
-            break_jumps: Vec::new(),
-            continue_jumps: Vec::new(),
-        });
-        let mut next_case_patch: Option<usize> = None;
-        let mut fallthrough_patch: Option<usize> = None;
-
-        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-            if self.peek() == &Token::KeywordCase {
-                if let Some(ft) = fallthrough_patch.take() {
-                    let body_skip = self.program.instructions.len();
-                    self.program.instructions.push(OpCode::Jump(0));
-                    let test_pc = self.program.instructions.len();
-                    if let Some(nc) = next_case_patch.take() {
-                        self.program.instructions[nc] = OpCode::JumpIfFalse(test_pc);
-                    }
-                    self.program.instructions[ft] = OpCode::Jump(test_pc);
-                    self.advance();
-                    self.program.instructions.push(OpCode::LoadIdent(switch_var));
-                    self.compile_expr()?;
-                    self.program.instructions.push(OpCode::StrictEq);
-                    if self.peek() == &Token::Colon {
-                        self.advance();
-                    }
-                    next_case_patch = Some(self.program.instructions.len());
-                    self.program.instructions.push(OpCode::JumpIfFalse(0));
-                    let body_pc = self.program.instructions.len();
-                    self.program.instructions[body_skip] = OpCode::Jump(body_pc);
-                } else {
-                    let test_pc = self.program.instructions.len();
-                    if let Some(nc) = next_case_patch.take() {
-                        self.program.instructions[nc] = OpCode::JumpIfFalse(test_pc);
-                    }
-                    self.advance();
-                    self.program.instructions.push(OpCode::LoadIdent(switch_var));
-                    self.compile_expr()?;
-                    self.program.instructions.push(OpCode::StrictEq);
-                    if self.peek() == &Token::Colon {
-                        self.advance();
-                    }
-                    next_case_patch = Some(self.program.instructions.len());
-                    self.program.instructions.push(OpCode::JumpIfFalse(0));
-                }
-
-                while !matches!(
-                    self.peek(),
-                    Token::KeywordCase | Token::KeywordDefault | Token::RBrace | Token::Eof
-                ) {
-                    self.compile_statement()?;
-                }
-                if matches!(self.peek(), Token::KeywordCase | Token::KeywordDefault) {
-                    let j = self.program.instructions.len();
-                    self.program.instructions.push(OpCode::Jump(0));
-                    fallthrough_patch = Some(j);
-                }
-            } else if self.peek() == &Token::KeywordDefault {
-                let def_pc = self.program.instructions.len();
-                if let Some(nc) = next_case_patch.take() {
-                    self.program.instructions[nc] = OpCode::JumpIfFalse(def_pc);
-                }
-                if let Some(ft) = fallthrough_patch.take() {
-                    self.program.instructions[ft] = OpCode::Jump(def_pc);
-                }
-                self.advance();
-                if self.peek() == &Token::Colon {
-                    self.advance();
-                }
-                while !matches!(self.peek(), Token::KeywordCase | Token::RBrace | Token::Eof) {
-                    self.compile_statement()?;
-                }
-            } else {
-                self.advance();
-            }
-        }
-        if self.peek() == &Token::RBrace {
-            self.advance();
-        }
-        let end_pc = self.program.instructions.len();
-        if let Some(nc) = next_case_patch {
-            self.program.instructions[nc] = OpCode::JumpIfFalse(end_pc);
-        }
-        if let Some(ft) = fallthrough_patch {
-            self.program.instructions[ft] = OpCode::Jump(end_pc);
-        }
-        let ctx = self.loop_stack.pop().unwrap();
-        for bj in ctx.break_jumps {
-            self.program.instructions[bj] = OpCode::Jump(end_pc);
-        }
-        Ok(())
-    }
-
-    fn compile_function_body(&mut self, name: Option<String>, is_async: bool) -> Result<u16, &'static str> {
-        if self.peek() == &Token::LParen {
-            self.advance();
-        }
-        let skip_jump_idx = self.program.instructions.len();
-        self.program.instructions.push(OpCode::Jump(0));
-
-        let mut params = Vec::new();
-        while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-            let is_rest = if self.peek() == &Token::Spread {
-                self.advance();
-                true
-            } else {
-                false
-            };
-            if let Token::Ident(p) = self.advance() {
-                let name_id = self.program.add_ident(&p);
-                let default_pc = if self.peek() == &Token::Assign {
-                    self.advance();
-                    let dp = self.program.instructions.len();
-                    self.compile_expr()?;
-                    self.program.instructions.push(OpCode::Return);
-                    Some(dp)
-                } else {
-                    None
-                };
-                params.push(JsParam {
-                    name_id,
-                    default_pc,
-                    is_rest,
-                });
-            }
-            if self.peek() == &Token::Comma {
-                self.advance();
-            }
-        }
-        if self.peek() == &Token::RParen {
-            self.advance();
-        }
-
-        let entry_pc = self.program.instructions.len();
-        let fn_idx = self.program.functions.len() as u16;
-        self.program.functions.push(JsFunctionDef {
-            name,
-            params,
-            entry_pc,
-            is_async,
-        });
-
-        self.compile_statement()?;
-        let undef_c = self.program.add_const(JsValue::Undefined);
-        self.program.instructions.push(OpCode::LoadConst(undef_c));
-        self.program.instructions.push(OpCode::Return);
-
-        let after_fn = self.program.instructions.len();
-        self.program.instructions[skip_jump_idx] = OpCode::Jump(after_fn);
-        Ok(fn_idx)
-    }
-
-    fn compile_expr(&mut self) -> Result<(), &'static str> {
-        self.compile_assignment()
-    }
-
-    fn compile_assignment(&mut self) -> Result<(), &'static str> {
-        if self.is_arrow_function_ahead() {
-            return self.compile_arrow_function();
-        }
-
-        let saved_pos = self.pos;
-        let saved_instr_len = self.program.instructions.len();
-
-        if let Some(lval) = self.try_compile_lvalue()? {
-            if matches!(
-                self.peek(),
-                Token::Assign
-                    | Token::PlusAssign
-                    | Token::MinusAssign
-                    | Token::MulAssign
-                    | Token::DivAssign
-            ) {
-                let op = self.advance();
-                match lval {
-                    LValue::Var(var_id) => {
-                        if op != Token::Assign {
-                            self.program.instructions.push(OpCode::LoadIdent(var_id));
-                            self.compile_assignment()?;
-                            match op {
-                                Token::PlusAssign => self.program.instructions.push(OpCode::Add),
-                                Token::MinusAssign => self.program.instructions.push(OpCode::Sub),
-                                Token::MulAssign => self.program.instructions.push(OpCode::Mul),
-                                Token::DivAssign => self.program.instructions.push(OpCode::Div),
-                                _ => {}
-                            }
-                        } else {
-                            self.compile_assignment()?;
-                        }
-                        self.program.instructions.push(OpCode::StoreVar(var_id));
-                        return Ok(());
-                    }
-                    LValue::Prop { prop_id } => {
-                        if op != Token::Assign {
-                            self.program.instructions.push(OpCode::Dup);
-                            self.program.instructions.push(OpCode::GetProp(prop_id));
-                            self.compile_assignment()?;
-                            match op {
-                                Token::PlusAssign => self.program.instructions.push(OpCode::Add),
-                                Token::MinusAssign => self.program.instructions.push(OpCode::Sub),
-                                Token::MulAssign => self.program.instructions.push(OpCode::Mul),
-                                Token::DivAssign => self.program.instructions.push(OpCode::Div),
-                                _ => {}
-                            }
-                        } else {
-                            self.compile_assignment()?;
-                        }
-                        self.program.instructions.push(OpCode::SetProp(prop_id));
-                        return Ok(());
-                    }
-                    LValue::Index => {
-                        if op == Token::Assign {
-                            self.compile_assignment()?;
-                            self.program.instructions.push(OpCode::SetIndex);
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-
-        self.pos = saved_pos;
-        self.program.instructions.truncate(saved_instr_len);
-        self.compile_ternary()
-    }
-
-    fn is_arrow_function_ahead(&self) -> bool {
-        let mut off = 0usize;
-        if self.peek() == &Token::KeywordAsync {
-            off = 1;
-        }
-        if matches!(self.peek_at(off), Token::Ident(_)) && self.peek_at(off + 1) == &Token::Arrow {
-            return true;
-        }
-        if self.peek_at(off) == &Token::LParen {
-            let mut idx = self.pos + off + 1;
-            let mut depth = 1usize;
-            while idx < self.tokens.len() && depth > 0 {
-                match self.tokens[idx] {
-                    Token::LParen => depth += 1,
-                    Token::RParen => depth -= 1,
-                    Token::Eof => return false,
-                    _ => {}
-                }
-                idx += 1;
-            }
-            return self.tokens.get(idx) == Some(&Token::Arrow);
-        }
-        false
-    }
-
-    fn compile_arrow_function(&mut self) -> Result<(), &'static str> {
-        let is_async = if self.peek() == &Token::KeywordAsync {
-            self.advance();
-            true
-        } else {
-            false
-        };
-        let skip_jump = self.program.instructions.len();
-        self.program.instructions.push(OpCode::Jump(0));
-
-        let mut params = Vec::new();
-        if let Token::Ident(p) = self.peek().clone() {
-            self.advance();
-            params.push(JsParam {
-                name_id: self.program.add_ident(&p),
-                default_pc: None,
-                is_rest: false,
-            });
-        } else if self.peek() == &Token::LParen {
-            self.advance();
-            while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-                let is_rest = if self.peek() == &Token::Spread {
-                    self.advance();
-                    true
-                } else {
-                    false
-                };
-                if let Token::Ident(p) = self.advance() {
-                    let name_id = self.program.add_ident(&p);
-                    let default_pc = if self.peek() == &Token::Assign {
-                        self.advance();
-                        let dp = self.program.instructions.len();
-                        self.compile_expr()?;
-                        self.program.instructions.push(OpCode::Return);
-                        Some(dp)
-                    } else {
-                        None
-                    };
-                    params.push(JsParam {
-                        name_id,
-                        default_pc,
-                        is_rest,
-                    });
-                }
-                if self.peek() == &Token::Comma {
-                    self.advance();
-                }
-            }
-            if self.peek() == &Token::RParen {
-                self.advance();
-            }
-        }
-        if self.peek() == &Token::Arrow {
-            self.advance();
-        }
-
-        let entry_pc = self.program.instructions.len();
-        let fn_idx = self.program.functions.len() as u16;
-        self.program.functions.push(JsFunctionDef {
-            name: None,
-            params,
-            entry_pc,
-            is_async,
-        });
-
-        if self.peek() == &Token::LBrace {
-            self.compile_statement()?;
-            let undef = self.program.add_const(JsValue::Undefined);
-            self.program.instructions.push(OpCode::LoadConst(undef));
-            self.program.instructions.push(OpCode::Return);
-        } else {
-            self.compile_expr()?;
-            self.program.instructions.push(OpCode::Return);
-        }
-
-        let after = self.program.instructions.len();
-        self.program.instructions[skip_jump] = OpCode::Jump(after);
-        self.program.instructions.push(OpCode::MakeClosure(fn_idx));
-        Ok(())
-    }
-
-    fn try_compile_lvalue(&mut self) -> Result<Option<LValue>, &'static str> {
-        let Token::Ident(name) = self.peek().clone() else {
-            return Ok(None);
-        };
-        if matches!(
-            self.peek_at(1),
-            Token::Assign
-                | Token::PlusAssign
-                | Token::MinusAssign
-                | Token::MulAssign
-                | Token::DivAssign
-        ) {
-            self.advance();
-            return Ok(Some(LValue::Var(self.program.add_ident(&name))));
-        }
-
-        if !matches!(self.peek_at(1), Token::Dot | Token::LBracket | Token::LParen) {
-            return Ok(None);
-        }
-
-        self.advance();
-        let root_id = self.program.add_ident(&name);
-        self.program.instructions.push(OpCode::LoadIdent(root_id));
-        let mut current_lval: Option<LValue> = None;
-
-        loop {
-            if self.peek() == &Token::Dot {
-                if let Some(LValue::Prop { prop_id }) = current_lval.take() {
-                    self.program.instructions.push(OpCode::GetProp(prop_id));
-                } else if let Some(LValue::Index) = current_lval.take() {
-                    self.program.instructions.push(OpCode::GetIndex);
-                }
-                self.advance();
-                let Token::Ident(prop) = self.advance() else {
-                    return Ok(None);
-                };
-                let pid = self.program.add_ident(&prop);
-                current_lval = Some(LValue::Prop { prop_id: pid });
-            } else if self.peek() == &Token::LBracket {
-                if let Some(LValue::Prop { prop_id }) = current_lval.take() {
-                    self.program.instructions.push(OpCode::GetProp(prop_id));
-                } else if let Some(LValue::Index) = current_lval.take() {
-                    self.program.instructions.push(OpCode::GetIndex);
-                }
-                self.advance();
-                self.compile_expr()?;
-                if self.peek() == &Token::RBracket {
-                    self.advance();
-                }
-                current_lval = Some(LValue::Index);
-            } else if self.peek() == &Token::LParen {
-                self.advance();
-                let (is_spread, argc) = self.compile_call_args_or_spread()?;
-                match current_lval.take() {
-                    Some(LValue::Prop { prop_id }) => {
-                        self.program.instructions.push(if is_spread {
-                            OpCode::CallMethodArray { prop_id }
-                        } else {
-                            OpCode::CallMethod { prop_id, argc }
-                        });
-                    }
-                    _ => {
-                        self.program.instructions.push(if is_spread {
-                            OpCode::CallValueArray
-                        } else {
-                            OpCode::CallValue { argc }
-                        });
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(current_lval)
-    }
-
-    fn compile_call_args_or_spread(&mut self) -> Result<(bool, u8), &'static str> {
-        let mut has_spread = false;
-        let mut scan = self.pos;
-        let mut depth = 1usize;
-        while scan < self.tokens.len() && depth > 0 {
-            match self.tokens[scan] {
-                Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
-                Token::RParen | Token::RBracket | Token::RBrace => depth -= 1,
-                Token::Spread if depth == 1 => {
-                    has_spread = true;
-                    break;
-                }
-                Token::Eof => break,
-                _ => {}
-            }
-            scan += 1;
-        }
-
-        if has_spread {
-            self.program.instructions.push(OpCode::MakeArray(0));
-            while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-                if self.peek() == &Token::Spread {
-                    self.advance();
-                    self.compile_expr()?;
-                    self.program.instructions.push(OpCode::ArraySpread);
-                } else {
-                    self.compile_expr()?;
-                    self.program.instructions.push(OpCode::ArrayPush);
-                }
-                if self.peek() == &Token::Comma {
-                    self.advance();
-                }
-            }
-            if self.peek() == &Token::RParen {
-                self.advance();
-            }
-            Ok((true, 0))
-        } else {
-            let mut argc = 0u8;
-            while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-                self.compile_expr()?;
-                argc = argc.saturating_add(1);
-                if self.peek() == &Token::Comma {
-                    self.advance();
-                }
-            }
-            if self.peek() == &Token::RParen {
-                self.advance();
-            }
-            Ok((false, argc))
-        }
-    }
-
-    fn compile_ternary(&mut self) -> Result<(), &'static str> {
-        self.compile_nullish()?;
-        if self.peek() == &Token::Question {
-            self.advance();
-            let jf = self.program.instructions.len();
-            self.program.instructions.push(OpCode::JumpIfFalse(0));
-            self.compile_expr()?;
-            if self.peek() == &Token::Colon {
-                self.advance();
-            }
-            let je = self.program.instructions.len();
-            self.program.instructions.push(OpCode::Jump(0));
-            let else_pc = self.program.instructions.len();
-            self.program.instructions[jf] = OpCode::JumpIfFalse(else_pc);
-            self.compile_expr()?;
-            let end_pc = self.program.instructions.len();
-            self.program.instructions[je] = OpCode::Jump(end_pc);
-        }
-        Ok(())
-    }
-
-    fn compile_nullish(&mut self) -> Result<(), &'static str> {
-        self.compile_logical_or()?;
-        while self.peek() == &Token::Nullish {
-            self.advance();
-            self.compile_logical_or()?;
-            self.program.instructions.push(OpCode::Nullish);
-        }
-        Ok(())
-    }
-
-    fn compile_logical_or(&mut self) -> Result<(), &'static str> {
-        self.compile_logical_and()?;
-        while self.peek() == &Token::OrOr {
-            self.advance();
-            self.compile_logical_and()?;
-            self.program.instructions.push(OpCode::Or);
-        }
-        Ok(())
-    }
-
-    fn compile_logical_and(&mut self) -> Result<(), &'static str> {
-        self.compile_bit_or()?;
-        while self.peek() == &Token::AndAnd {
-            self.advance();
-            self.compile_bit_or()?;
-            self.program.instructions.push(OpCode::And);
-        }
-        Ok(())
-    }
-
-    fn compile_bit_or(&mut self) -> Result<(), &'static str> {
-        self.compile_bit_xor()?;
-        while self.peek() == &Token::BitOr {
-            self.advance();
-            self.compile_bit_xor()?;
-            self.program.instructions.push(OpCode::BitOr);
-        }
-        Ok(())
-    }
-
-    fn compile_bit_xor(&mut self) -> Result<(), &'static str> {
-        self.compile_bit_and()?;
-        while self.peek() == &Token::BitXor {
-            self.advance();
-            self.compile_bit_and()?;
-            self.program.instructions.push(OpCode::BitXor);
-        }
-        Ok(())
-    }
-
-    fn compile_bit_and(&mut self) -> Result<(), &'static str> {
-        self.compile_equality()?;
-        while self.peek() == &Token::BitAnd {
-            self.advance();
-            self.compile_equality()?;
-            self.program.instructions.push(OpCode::BitAnd);
-        }
-        Ok(())
-    }
-
-    fn compile_equality(&mut self) -> Result<(), &'static str> {
-        self.compile_comparison()?;
-        while matches!(
-            self.peek(),
-            Token::EqEq | Token::EqEqEq | Token::NotEq | Token::NotEqEq
-        ) {
-            let op = self.advance();
-            self.compile_comparison()?;
-            match op {
-                Token::EqEq => self.program.instructions.push(OpCode::Eq),
-                Token::EqEqEq => self.program.instructions.push(OpCode::StrictEq),
-                Token::NotEq => self.program.instructions.push(OpCode::Neq),
-                Token::NotEqEq => self.program.instructions.push(OpCode::StrictNeq),
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn compile_comparison(&mut self) -> Result<(), &'static str> {
-        self.compile_shift()?;
-        while matches!(
-            self.peek(),
-            Token::Lt
-                | Token::Lte
-                | Token::Gt
-                | Token::Gte
-                | Token::KeywordIn
-                | Token::KeywordInstanceof
-        ) {
-            let op = self.advance();
-            self.compile_shift()?;
-            match op {
-                Token::Lt => self.program.instructions.push(OpCode::Lt),
-                Token::Lte => self.program.instructions.push(OpCode::Lte),
-                Token::Gt => self.program.instructions.push(OpCode::Gt),
-                Token::Gte => self.program.instructions.push(OpCode::Gte),
-                Token::KeywordIn => self.program.instructions.push(OpCode::InOp),
-                Token::KeywordInstanceof => self.program.instructions.push(OpCode::InstanceOf),
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn compile_shift(&mut self) -> Result<(), &'static str> {
-        self.compile_additive()?;
-        while matches!(self.peek(), Token::Shl | Token::Shr | Token::UShr) {
-            let op = self.advance();
-            self.compile_additive()?;
-            match op {
-                Token::Shl => self.program.instructions.push(OpCode::Shl),
-                Token::Shr => self.program.instructions.push(OpCode::Shr),
-                Token::UShr => self.program.instructions.push(OpCode::UShr),
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn compile_additive(&mut self) -> Result<(), &'static str> {
-        self.compile_multiplicative()?;
-        while matches!(self.peek(), Token::Plus | Token::Minus) {
-            let op = self.advance();
-            self.compile_multiplicative()?;
-            match op {
-                Token::Plus => self.program.instructions.push(OpCode::Add),
-                Token::Minus => self.program.instructions.push(OpCode::Sub),
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn compile_multiplicative(&mut self) -> Result<(), &'static str> {
-        self.compile_exponent()?;
-        while matches!(self.peek(), Token::Star | Token::Slash | Token::Percent) {
-            let op = self.advance();
-            self.compile_exponent()?;
-            match op {
-                Token::Star => self.program.instructions.push(OpCode::Mul),
-                Token::Slash => self.program.instructions.push(OpCode::Div),
-                Token::Percent => self.program.instructions.push(OpCode::Mod),
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn compile_exponent(&mut self) -> Result<(), &'static str> {
-        self.compile_unary()?;
-        if self.peek() == &Token::Pow {
-            self.advance();
-            self.compile_exponent()?;
-            self.program.instructions.push(OpCode::Pow);
-        }
-        Ok(())
-    }
-
-    fn compile_unary(&mut self) -> Result<(), &'static str> {
-        match self.peek() {
-            Token::Minus => {
-                self.advance();
-                self.compile_unary()?;
-                self.program.instructions.push(OpCode::Neg);
-                Ok(())
-            }
-            Token::Plus => {
-                self.advance();
-                self.compile_unary()
-            }
-            Token::Bang => {
-                self.advance();
-                self.compile_unary()?;
-                self.program.instructions.push(OpCode::Not);
-                Ok(())
-            }
-            Token::BitNot => {
-                self.advance();
-                self.compile_unary()?;
-                self.program.instructions.push(OpCode::BitNot);
-                Ok(())
-            }
-            Token::KeywordTypeof => {
-                self.advance();
-                self.compile_unary()?;
-                self.program.instructions.push(OpCode::TypeOf);
-                Ok(())
-            }
-            Token::KeywordAwait => {
-                self.advance();
-                self.compile_unary()?;
-                self.program.instructions.push(OpCode::Await);
-                Ok(())
-            }
-            Token::KeywordDelete => {
-                self.advance();
-                if let Token::Ident(root) = self.advance() {
-                    let rid = self.program.add_ident(&root);
-                    self.program.instructions.push(OpCode::LoadIdent(rid));
-                    if self.peek() == &Token::Dot {
-                        self.advance();
-                        if let Token::Ident(prop) = self.advance() {
-                            let pid = self.program.add_ident(&prop);
-                            self.program.instructions.push(OpCode::DeleteProp(pid));
-                            return Ok(());
-                        }
-                    }
-                }
-                let t = self.program.add_const(JsValue::Bool(true));
-                self.program.instructions.push(OpCode::LoadConst(t));
-                Ok(())
-            }
-            Token::KeywordNew => {
-                self.advance();
-                self.compile_primary()?;
-                while self.peek() == &Token::Dot {
-                    self.advance();
-                    if let Token::Ident(p) = self.advance() {
-                        let pid = self.program.add_ident(&p);
-                        self.program.instructions.push(OpCode::GetProp(pid));
-                    }
-                }
-                let argc = if self.peek() == &Token::LParen {
-                    self.advance();
-                    let (_, count) = self.compile_call_args_or_spread()?;
-                    count
-                } else {
-                    0
-                };
-                self.program.instructions.push(OpCode::Construct { argc });
-                Ok(())
-            }
-            Token::PlusPlus | Token::MinusMinus => {
-                let is_inc = self.advance() == Token::PlusPlus;
-                if let Token::Ident(name) = self.advance() {
-                    let id = self.program.add_ident(&name);
-                    let one = self.program.add_const(JsValue::Number(1.0));
-                    self.program.instructions.push(OpCode::LoadIdent(id));
-                    self.program.instructions.push(OpCode::LoadConst(one));
-                    self.program
-                        .instructions
-                        .push(if is_inc { OpCode::Add } else { OpCode::Sub });
-                    self.program.instructions.push(OpCode::StoreVar(id));
-                    Ok(())
-                } else {
-                    Err("Expected identifier after ++/--")
-                }
-            }
-            _ => self.compile_postfix(),
-        }
-    }
-
-    fn compile_postfix(&mut self) -> Result<(), &'static str> {
-        if let Token::Ident(name) = self.peek().clone() {
-            if matches!(self.peek_at(1), Token::PlusPlus | Token::MinusMinus) {
-                self.advance();
-                let is_inc = self.advance() == Token::PlusPlus;
-                let id = self.program.add_ident(&name);
-                let one = self.program.add_const(JsValue::Number(1.0));
-                self.program.instructions.push(OpCode::LoadIdent(id));
-                self.program.instructions.push(OpCode::Dup);
-                self.program.instructions.push(OpCode::LoadConst(one));
-                self.program
-                    .instructions
-                    .push(if is_inc { OpCode::Add } else { OpCode::Sub });
-                self.program.instructions.push(OpCode::StoreVar(id));
-                self.program.instructions.push(OpCode::Pop);
-                return Ok(());
-            }
-        }
-
-        self.compile_primary()?;
-
-        loop {
-            if self.peek() == &Token::Dot || self.peek() == &Token::OptChain {
-                let is_opt = self.advance() == Token::OptChain;
-                if self.peek() == &Token::LBracket {
-                    self.advance();
-                    self.compile_expr()?;
-                    if self.peek() == &Token::RBracket {
-                        self.advance();
-                    }
-                    self.program.instructions.push(OpCode::GetIndex);
-                    continue;
-                }
-                let Token::Ident(prop) = self.advance() else {
-                    return Err("Expected property name after `.`");
-                };
-                let prop_id = self.program.add_ident(&prop);
-                if self.peek() == &Token::LParen {
-                    self.advance();
-                    let (is_spread, argc) = self.compile_call_args_or_spread()?;
-                    self.program.instructions.push(if is_spread {
-                        OpCode::CallMethodArray { prop_id }
-                    } else {
-                        OpCode::CallMethod { prop_id, argc }
-                    });
-                } else {
-                    self.program.instructions.push(if is_opt {
-                        OpCode::GetPropOpt(prop_id)
-                    } else {
-                        OpCode::GetProp(prop_id)
-                    });
-                }
-            } else if self.peek() == &Token::LBracket {
-                self.advance();
-                self.compile_expr()?;
-                if self.peek() == &Token::RBracket {
-                    self.advance();
-                }
-                self.program.instructions.push(OpCode::GetIndex);
-            } else if self.peek() == &Token::LParen {
-                self.advance();
-                let (is_spread, argc) = self.compile_call_args_or_spread()?;
-                self.program.instructions.push(if is_spread {
-                    OpCode::CallValueArray
-                } else {
-                    OpCode::CallValue { argc }
-                });
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn compile_primary(&mut self) -> Result<(), &'static str> {
-        match self.advance() {
-            Token::Number(n) => {
-                let idx = self.program.add_const(JsValue::Number(n));
-                self.program.instructions.push(OpCode::LoadConst(idx));
-                Ok(())
-            }
-            Token::Str(s) => {
-                let idx = self.program.add_const(JsValue::Str(s));
-                self.program.instructions.push(OpCode::LoadConst(idx));
-                Ok(())
-            }
-            Token::Regex(pat, flags) => {
-                let pat_id = self.program.add_ident(&pat);
-                let flags_id = self.program.add_ident(&flags);
-                self.program
-                    .instructions
-                    .push(OpCode::MakeRegex { pat_id, flags_id });
-                Ok(())
-            }
-            Token::KeywordTrue => {
-                let idx = self.program.add_const(JsValue::Bool(true));
-                self.program.instructions.push(OpCode::LoadConst(idx));
-                Ok(())
-            }
-            Token::KeywordFalse => {
-                let idx = self.program.add_const(JsValue::Bool(false));
-                self.program.instructions.push(OpCode::LoadConst(idx));
-                Ok(())
-            }
-            Token::KeywordNull => {
-                let idx = self.program.add_const(JsValue::Null);
-                self.program.instructions.push(OpCode::LoadConst(idx));
-                Ok(())
-            }
-            Token::KeywordUndefined => {
-                let idx = self.program.add_const(JsValue::Undefined);
-                self.program.instructions.push(OpCode::LoadConst(idx));
-                Ok(())
-            }
-            Token::LParen => {
-                self.compile_expr()?;
-                if self.peek() == &Token::RParen {
-                    self.advance();
-                }
-                Ok(())
-            }
-            Token::LBracket => {
-                self.program.instructions.push(OpCode::MakeArray(0));
-                while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
-                    if self.peek() == &Token::Spread {
-                        self.advance();
-                        self.compile_expr()?;
-                        self.program.instructions.push(OpCode::ArraySpread);
-                    } else {
-                        self.compile_expr()?;
-                        self.program.instructions.push(OpCode::ArrayPush);
-                    }
-                    if self.peek() == &Token::Comma {
-                        self.advance();
-                    }
-                }
-                if self.peek() == &Token::RBracket {
-                    self.advance();
-                }
-                Ok(())
-            }
-            Token::LBrace => {
-                self.program.instructions.push(OpCode::MakeObject(0));
-                while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-                    if self.peek() == &Token::Spread {
-                        self.advance();
-                        self.compile_expr()?;
-                        self.program.instructions.push(OpCode::ObjectSpread);
-                    } else {
-                        let key_str = match self.advance() {
-                            Token::Ident(k) | Token::Str(k) => k,
-                            Token::Number(n) => JsValue::Number(n).as_str(),
-                            _ => break,
-                        };
-                        let key_id = self.program.add_ident(&key_str);
-                        self.program.instructions.push(OpCode::Dup);
-                        if self.peek() == &Token::Colon {
-                            self.advance();
-                            self.compile_expr()?;
-                        } else {
-                            self.program.instructions.push(OpCode::LoadIdent(key_id));
-                        }
-                        self.program.instructions.push(OpCode::SetProp(key_id));
-                        self.program.instructions.push(OpCode::Pop);
-                    }
-                    if self.peek() == &Token::Comma {
-                        self.advance();
-                    }
-                }
-                if self.peek() == &Token::RBrace {
-                    self.advance();
-                }
-                Ok(())
-            }
-            Token::KeywordAsync if self.peek() == &Token::KeywordFunction => {
-                self.advance();
-                let name = if let Token::Ident(n) = self.peek().clone() {
-                    self.advance();
-                    Some(n)
-                } else {
-                    None
-                };
-                let fn_idx = self.compile_function_body(name, true)?;
-                self.program.instructions.push(OpCode::MakeClosure(fn_idx));
-                Ok(())
-            }
-            Token::KeywordFunction => {
-                let name = if let Token::Ident(n) = self.peek().clone() {
-                    self.advance();
-                    Some(n)
-                } else {
-                    None
-                };
-                let fn_idx = self.compile_function_body(name, false)?;
-                self.program.instructions.push(OpCode::MakeClosure(fn_idx));
-                Ok(())
-            }
-            Token::Ident(name) => {
-                let id = self.program.add_ident(&name);
-                self.program.instructions.push(OpCode::LoadIdent(id));
-                Ok(())
-            }
-            _ => {
-                let idx = self.program.add_const(JsValue::Undefined);
-                self.program.instructions.push(OpCode::LoadConst(idx));
-                Ok(())
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct ScopeFrame {
@@ -2522,7 +119,7 @@ impl MantaJsSandbox {
         let mut vm = Self {
             scopes: vec![Some(ScopeFrame {
                 parent: None,
-                vars: HashMap::with_capacity(48),
+                vars: HashMap::with_capacity(64),
             })],
             free_scope_slots: Vec::new(),
             objects: Vec::with_capacity(32),
@@ -2620,7 +217,17 @@ impl MantaJsSandbox {
             "decodeURIComponent",
             "btoa",
             "atob",
+            "structuredClone",
             "fetch",
+            "XMLHttpRequest",
+            "AbortController",
+            "Headers",
+            "FormData",
+            "Event",
+            "CustomEvent",
+            "MutationObserver",
+            "ResizeObserver",
+            "IntersectionObserver",
             "Map",
             "Set",
             "RegExp",
@@ -2644,6 +251,7 @@ impl MantaJsSandbox {
             "location",
             "console",
             "performance",
+            "crypto",
             "localStorage",
             "sessionStorage",
             "indexedDB",
@@ -2663,7 +271,7 @@ impl MantaJsSandbox {
                 map.insert("cookieEnabled".to_string(), JsValue::Bool(true));
                 map.insert(
                     "userAgent".to_string(),
-                    JsValue::Str("Manta/3.1 (Native Rust+C++ Engine; W3C Standard)".to_string()),
+                    JsValue::Str("Manta/4.0 (Native Rust+C++ Engine; W3C Standard)".to_string()),
                 );
                 let clip_id = self.alloc_obj_map({
                     let mut cm = HashMap::new();
@@ -2676,6 +284,13 @@ impl MantaJsSandbox {
                 map.insert("innerWidth".to_string(), JsValue::Number(390.0));
                 map.insert("innerHeight".to_string(), JsValue::Number(844.0));
                 map.insert("scrollY".to_string(), JsValue::Number(0.0));
+            } else if ns == "crypto" {
+                let subtle_id = self.alloc_obj_map({
+                    let mut sm = HashMap::new();
+                    sm.insert("__manta_ns".to_string(), JsValue::Str("crypto_subtle".to_string()));
+                    sm
+                });
+                map.insert("subtle".to_string(), JsValue::Object(subtle_id));
             }
             let oid = self.alloc_obj_map(map);
             if let Some(global) = self.scope_mut(0) {
@@ -4683,6 +2298,11 @@ impl MantaJsSandbox {
             "Boolean" => Ok(JsValue::Bool(
                 args.first().map(|a| a.is_truthy()).unwrap_or(false),
             )),
+            "structuredClone" => {
+                let val = args.first().unwrap_or(&JsValue::Undefined);
+                let json = self.json_stringify(val);
+                Ok(self.json_parse(&json).unwrap_or_else(|_| val.clone()))
+            }
             "encodeURIComponent" => {
                 let raw = args.first().map(|a| a.as_str()).unwrap_or_default();
                 Ok(JsValue::Str(percent_encode(&raw)))
@@ -4731,6 +2351,64 @@ impl MantaJsSandbox {
                 Ok(JsValue::Number(self.timer_seq as f64))
             }
             "clearTimeout" => Ok(JsValue::Undefined),
+            "AbortController" => {
+                let mut sig = HashMap::new();
+                sig.insert("aborted".to_string(), JsValue::Bool(false));
+                let sig_oid = self.alloc_obj_map(sig);
+                let mut ctrl = HashMap::new();
+                ctrl.insert("__manta_ns".to_string(), JsValue::Str("abort_ctrl".to_string()));
+                ctrl.insert("signal".to_string(), JsValue::Object(sig_oid));
+                Ok(JsValue::Object(self.alloc_obj_map(ctrl)))
+            }
+            "Headers" | "FormData" => {
+                let ns = if name == "Headers" { "headers" } else { "formdata" };
+                let mut m = HashMap::new();
+                m.insert("__manta_ns".to_string(), JsValue::Str(ns.to_string()));
+                if let Some(JsValue::Object(init_oid)) = args.first() {
+                    if let Some(init_map) = self.obj_map(*init_oid).cloned() {
+                        for (k, v) in init_map {
+                            if !k.starts_with("__") {
+                                m.insert(k.to_ascii_lowercase(), v);
+                            }
+                        }
+                    }
+                }
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "Event" | "CustomEvent" => {
+                let mut m = HashMap::new();
+                m.insert("__manta_ns".to_string(), JsValue::Str("dom_event".to_string()));
+                m.insert(
+                    "type".to_string(),
+                    JsValue::Str(args.first().map(|a| a.as_str()).unwrap_or_default()),
+                );
+                m.insert("defaultPrevented".to_string(), JsValue::Bool(false));
+                if let Some(JsValue::Object(opt_oid)) = args.get(1) {
+                    if let Some(detail) = self.obj_map(*opt_oid).and_then(|o| o.get("detail")).cloned()
+                    {
+                        m.insert("detail".to_string(), detail);
+                    }
+                }
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "MutationObserver" | "ResizeObserver" | "IntersectionObserver" => {
+                let mut m = HashMap::new();
+                m.insert("__manta_ns".to_string(), JsValue::Str("observer".to_string()));
+                if let Some(cb) = args.first().cloned() {
+                    m.insert("__cb".to_string(), cb);
+                }
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
+            "XMLHttpRequest" => {
+                let mut m = HashMap::new();
+                m.insert("__manta_ns".to_string(), JsValue::Str("xhr".to_string()));
+                m.insert("readyState".to_string(), JsValue::Number(0.0));
+                m.insert("status".to_string(), JsValue::Number(0.0));
+                m.insert("responseText".to_string(), JsValue::Str(String::new()));
+                let hdr_oid = self.alloc_obj()?;
+                m.insert("__req_headers".to_string(), JsValue::Object(hdr_oid));
+                Ok(JsValue::Object(self.alloc_obj_map(m)))
+            }
             "Map" => {
                 let mid = self.maps.len() as u32;
                 let mut entries = Vec::new();
@@ -4880,6 +2558,7 @@ impl MantaJsSandbox {
                 let url = args.first().map(|a| a.as_str()).unwrap_or_default();
                 let mut method = String::from("GET");
                 let mut headers = HashMap::new();
+                let mut req_body: Option<Vec<u8>> = None;
                 if !origin_url.is_empty() {
                     headers.insert("Origin".to_string(), origin_url.to_string());
                 }
@@ -4887,6 +2566,11 @@ impl MantaJsSandbox {
                     if let Some(opts) = self.obj_map(*opt_oid).cloned() {
                         if let Some(m) = opts.get("method") {
                             method = m.as_str().to_ascii_uppercase();
+                        }
+                        if let Some(b_val) = opts.get("body") {
+                            if !matches!(b_val, JsValue::Undefined | JsValue::Null) {
+                                req_body = Some(b_val.as_str().into_bytes());
+                            }
                         }
                         if let Some(JsValue::Object(h_oid)) = opts.get("headers") {
                             if let Some(hm) = self.obj_map(*h_oid) {
@@ -4903,10 +2587,11 @@ impl MantaJsSandbox {
                 let mut modules = ModuleBus::new();
                 modules.register(Box::new(SiteIsolationModule::new()));
                 let mut body = Vec::new();
-                match StreamingNetworkPipe::stream_http(
+                match StreamingNetworkPipe::stream_http_with_body(
                     &method,
                     &url,
                     headers,
+                    req_body.as_deref(),
                     &modules,
                     4 * 1024 * 1024,
                     |chunk, _| body.extend_from_slice(chunk),
@@ -5906,10 +3591,16 @@ impl MantaJsSandbox {
                     Ok(JsValue::Undefined)
                 }
                 "dispatchEvent" => {
-                    let ev_type = args
-                        .first()
-                        .map(|a| a.as_str())
-                        .unwrap_or_else(|| "click".to_string());
+                    let ev_type = match args.first() {
+                        Some(JsValue::Object(eoid)) => self
+                            .obj_map(*eoid)
+                            .and_then(|m| m.get("type"))
+                            .map(|v| v.as_str())
+                            .unwrap_or_else(|| "click".to_string()),
+                        Some(other) => other.as_str(),
+                        None => "click".to_string(),
+                    };
+                    let ev_arg = args.first().cloned().unwrap_or(JsValue::DomNode(*nid));
                     for target in dom.event_bubbling_path(*nid) {
                         for handler in dom.get_event_listeners(target, &ev_type) {
                             if let Some(cid_str) = handler.strip_prefix("__manta_fn:") {
@@ -5917,7 +3608,7 @@ impl MantaJsSandbox {
                                     let _ = self.invoke_callable_val(
                                         program,
                                         &JsValue::Fn(cid),
-                                        &[JsValue::DomNode(*nid)],
+                                        &[ev_arg.clone()],
                                         None,
                                         origin_url,
                                         dom,
@@ -5959,6 +3650,186 @@ impl MantaJsSandbox {
                     .unwrap_or_default();
 
                 match (ns.as_str(), method) {
+                    ("crypto", "randomUUID") => {
+                        let mut r = generate_volatile_entropy_32();
+                        r[6] = (r[6] & 0x0F) | 0x40;
+                        r[8] = (r[8] & 0x3F) | 0x80;
+                        let uuid = format!(
+                            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                            r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+                        );
+                        Ok(JsValue::Str(uuid))
+                    }
+                    ("crypto_subtle", "digest") => {
+                        let payload = args.get(1).map(|a| a.as_str()).unwrap_or_default();
+                        let hash = sha256(payload.as_bytes());
+                        let mut hex = String::with_capacity(64);
+                        for b in hash {
+                            hex.push_str(&format!("{:02x}", b));
+                        }
+                        let p = self.alloc_promise(Some(true), JsValue::Str(hex))?;
+                        Ok(JsValue::Object(p))
+                    }
+                    ("abort_ctrl", "abort") => {
+                        if let Some(JsValue::Object(sig_oid)) =
+                            self.obj_map(*oid).and_then(|m| m.get("signal")).cloned()
+                        {
+                            if let Some(sm) = self.obj_map_mut(sig_oid) {
+                                sm.insert("aborted".to_string(), JsValue::Bool(true));
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }
+                    ("headers" | "formdata", "set" | "append") => {
+                        if args.len() >= 2 {
+                            let k = if ns == "headers" {
+                                args[0].as_str().to_ascii_lowercase()
+                            } else {
+                                args[0].as_str()
+                            };
+                            if let Some(m) = self.obj_map_mut(*oid) {
+                                m.insert(k, args[1].clone());
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }
+                    ("headers" | "formdata", "get") => {
+                        let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                        let lookup = if ns == "headers" {
+                            k.to_ascii_lowercase()
+                        } else {
+                            k
+                        };
+                        Ok(self
+                            .obj_map(*oid)
+                            .and_then(|m| m.get(&lookup))
+                            .cloned()
+                            .unwrap_or(JsValue::Null))
+                    }
+                    ("headers" | "formdata", "has") => {
+                        let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                        let lookup = if ns == "headers" {
+                            k.to_ascii_lowercase()
+                        } else {
+                            k
+                        };
+                        Ok(JsValue::Bool(
+                            self.obj_map(*oid)
+                                .map(|m| m.contains_key(&lookup))
+                                .unwrap_or(false),
+                        ))
+                    }
+                    ("headers" | "formdata", "delete") => {
+                        let k = args.first().map(|a| a.as_str()).unwrap_or_default();
+                        let lookup = if ns == "headers" {
+                            k.to_ascii_lowercase()
+                        } else {
+                            k
+                        };
+                        if let Some(m) = self.obj_map_mut(*oid) {
+                            m.remove(&lookup);
+                        }
+                        Ok(JsValue::Undefined)
+                    }
+                    ("dom_event", "preventDefault") => {
+                        if let Some(m) = self.obj_map_mut(*oid) {
+                            m.insert("defaultPrevented".to_string(), JsValue::Bool(true));
+                        }
+                        Ok(JsValue::Undefined)
+                    }
+                    ("dom_event", "stopPropagation") => Ok(JsValue::Undefined),
+                    ("observer", "observe" | "unobserve" | "disconnect") => Ok(JsValue::Undefined),
+                    ("xhr", "open") => {
+                        let m_str = args
+                            .first()
+                            .map(|a| a.as_str().to_ascii_uppercase())
+                            .unwrap_or_else(|| "GET".to_string());
+                        let url_str = args.get(1).map(|a| a.as_str()).unwrap_or_default();
+                        if let Some(m) = self.obj_map_mut(*oid) {
+                            m.insert("__method".to_string(), JsValue::Str(m_str));
+                            m.insert("__url".to_string(), JsValue::Str(url_str));
+                            m.insert("readyState".to_string(), JsValue::Number(1.0));
+                        }
+                        Ok(JsValue::Undefined)
+                    }
+                    ("xhr", "setRequestHeader") => {
+                        if args.len() >= 2 {
+                            if let Some(JsValue::Object(h_oid)) = self
+                                .obj_map(*oid)
+                                .and_then(|m| m.get("__req_headers"))
+                                .cloned()
+                            {
+                                if let Some(hm) = self.obj_map_mut(h_oid) {
+                                    hm.insert(args[0].as_str(), args[1].clone());
+                                }
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }
+                    ("xhr", "send") => {
+                        let req_body = args
+                            .first()
+                            .filter(|v| !matches!(v, JsValue::Undefined | JsValue::Null))
+                            .map(|v| v.as_str().into_bytes());
+                        let (m_str, url_str, hdrs, onload_cb) = {
+                            let map = self.obj_map(*oid).cloned().unwrap_or_default();
+                            let method = map
+                                .get("__method")
+                                .map(|v| v.as_str())
+                                .unwrap_or_else(|| "GET".to_string());
+                            let url = map.get("__url").map(|v| v.as_str()).unwrap_or_default();
+                            let mut h = HashMap::new();
+                            if !origin_url.is_empty() {
+                                h.insert("Origin".to_string(), origin_url.to_string());
+                            }
+                            if let Some(JsValue::Object(h_oid)) = map.get("__req_headers") {
+                                if let Some(hm) = self.obj_map(*h_oid) {
+                                    for (k, v) in hm {
+                                        if !k.starts_with("__") {
+                                            h.insert(k.clone(), v.as_str());
+                                        }
+                                    }
+                                }
+                            }
+                            (method, url, h, map.get("onload").cloned())
+                        };
+                        let mut modules = ModuleBus::new();
+                        modules.register(Box::new(SiteIsolationModule::new()));
+                        let mut body = Vec::new();
+                        if let Ok(out) = StreamingNetworkPipe::stream_http_with_body(
+                            &m_str,
+                            &url_str,
+                            hdrs,
+                            req_body.as_deref(),
+                            &modules,
+                            4 * 1024 * 1024,
+                            |c, _| body.extend_from_slice(c),
+                        ) {
+                            if let Some(m) = self.obj_map_mut(*oid) {
+                                m.insert("status".to_string(), JsValue::Number(out.status_code as f64));
+                                m.insert("readyState".to_string(), JsValue::Number(4.0));
+                                m.insert(
+                                    "responseText".to_string(),
+                                    JsValue::Str(String::from_utf8_lossy(&body).into_owned()),
+                                );
+                            }
+                            if let Some(cb) = onload_cb {
+                                let _ = self.invoke_callable_val(
+                                    program,
+                                    &cb,
+                                    &[JsValue::Object(*oid)],
+                                    Some(JsValue::Object(*oid)),
+                                    origin_url,
+                                    dom,
+                                    clipboard,
+                                    storage,
+                                    downloads,
+                                );
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }
                     ("performance", "now") => {
                         let ms = now_us().saturating_sub(self.vm_boot_us) as f64 / 1000.0;
                         Ok(JsValue::Number(ms))
@@ -6662,7 +4533,7 @@ impl MantaJsSandbox {
         self.free_scope_slots.clear();
         self.scopes.push(Some(ScopeFrame {
             parent: None,
-            vars: HashMap::with_capacity(48),
+            vars: HashMap::with_capacity(64),
         }));
         self.objects.clear();
         self.free_obj_slots.clear();
@@ -6689,20 +4560,6 @@ fn next_utf8_boundary(s: &str, byte_idx: usize) -> usize {
         i += 1;
     }
     i
-}
-
-fn abstract_eq(a: &JsValue, b: &JsValue) -> bool {
-    if std::mem::discriminant(a) == std::mem::discriminant(b) {
-        return a == b;
-    }
-    match (a, b) {
-        (JsValue::Null, JsValue::Undefined) | (JsValue::Undefined, JsValue::Null) => true,
-        (JsValue::Number(n), JsValue::Str(_)) | (JsValue::Str(_), JsValue::Number(n)) => {
-            *n == b.as_number() && *n == a.as_number()
-        }
-        (JsValue::Bool(_), _) | (_, JsValue::Bool(_)) => a.as_number() == b.as_number(),
-        _ => false,
-    }
 }
 
 fn skip_ws(b: &[u8], cur: &mut usize) {
@@ -6789,154 +4646,4 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&bytes).into_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::html_tokenizer::StreamingHtmlTokenizer;
-
-    #[test]
-    fn test_full_js_classes_async_spread_sort_gc_innerhtml_and_budget() {
-        let mut dom = ZeroCopyDomArena::new(128 * 1024);
-        let mut tokenizer = StreamingHtmlTokenizer::new();
-        tokenizer.feed_chunk(
-            b"<body><div id=\"status\">Idle</div><div id=\"mount\"></div><input id=\"email\" type=\"email\" value=\"\" /><button id=\"btn\">Go</button></body>",
-            true,
-            |tok| dom.ingest_token(tok),
-        );
-
-        let mut vm = MantaJsSandbox::new(200_000);
-        let mut clip = ClipboardSandbox::new(1024);
-        let mut storage = MantaStorageEngine::new(128 * 1024, 512 * 1024);
-        let mut downloads = MantaDownloadManager::new("", 1024 * 1024);
-
-        let script = r#"
-            class Engine {
-                constructor(name) { this.name = name; }
-                tag() { return `[${this.name}]`; }
-            }
-            class MantaCore extends Engine {
-                constructor(name, ver) {
-                    super(name);
-                    this.ver = ver;
-                }
-                describe() { return `${this.tag()} v${this.ver}`; }
-            }
-            const core = new MantaCore("Manta", 3);
-            let clsOut = core.describe();
-
-            const { ver, missing = 10 } = core;
-            const [first, ...rest] = [10, 20, 30];
-
-            // Multi-property object literal & spread verification
-            const mergedObj = { a: 1, b: 2, ...{ c: 3 } };
-            let objLitSum = mergedObj.a + mergedObj.b + mergedObj.c;
-
-            function sumThree(a, b, c) { return a + b + c; }
-            let spreadSum = sumThree(5, ...[15, 30]);
-            let foldedConst = 2 + 3 * 4 + 10;
-
-            let sortedArr = [42, 5, 19, 1, 99, 3].toSorted();
-            let firstSorted = sortedArr.at(0);
-            let lastSorted = sortedArr.at(-1);
-
-            let fm = [1, 2].flatMap((x) => [x, x * 10]);
-            let fmLen = fm.length;
-
-            let objFrom = Object.fromEntries([["a", 7], ["b", 8]]);
-            let fromVal = objFrom.a + objFrom.b;
-
-            let reOk = /manta\d+/i.test("Powered by MANTA3000!");
-            let nums = new Float64Array([1.5, 2.5, 3.0, 3.0]);
-            let vecSum = nums.sum();
-            let dotVal = nums.dot(new Float64Array([2.0, 2.0, 1.0, 1.0]));
-            let encodedB64 = btoa("Manta");
-            let decodedB64 = atob(encodedB64);
-
-            // Real innerHTML fragment parsing into DOM
-            document.getElementById("mount").innerHTML = "<span id=\"injected\">Live DOM</span>";
-            let injectedTxt = document.getElementById("injected").textContent;
-
-            // Scope GC stress loop
-            function inc(x) { return x + 1; }
-            let loopTotal = 0;
-            for (let i = 0; i < 600; i++) {
-                loopTotal = inc(loopTotal);
-            }
-
-            let asyncRes = 0;
-            async function computeAsync(base) {
-                let added = await Promise.resolve(15);
-                return base + added;
-            }
-            computeAsync(35).then((v) => { asyncRes = v; });
-
-            let btn = document.getElementById("btn");
-            let clicked = 0;
-            btn.addEventListener("click", () => { clicked += 1; });
-            btn.dispatchEvent("click");
-
-            document.getElementById("email").value = "dev@manta.browser";
-            document.cookie = "session_id=manta_999; Path=/";
-            indexedDB.putObject("users", "u1", JSON.stringify({ email: "dev@manta.browser" }));
-            MantaFS.writeFile("/config/profile.json", "{\"active\":true}");
-            MantaDownloads.save("export.txt", "Exported: " + loopTotal);
-        "#;
-
-        vm.execute_script_full(
-            script,
-            "https://app.manta.dev/index.html",
-            &mut dom,
-            &mut clip,
-            &mut storage,
-            &mut downloads,
-        )
-        .unwrap();
-
-        assert_eq!(vm.get_global("objLitSum"), Some(&JsValue::Number(6.0)));
-        assert_eq!(vm.get_global("spreadSum"), Some(&JsValue::Number(50.0)));
-        assert_eq!(vm.get_global("foldedConst"), Some(&JsValue::Number(24.0)));
-        assert_eq!(vm.get_global("firstSorted"), Some(&JsValue::Number(1.0)));
-        assert_eq!(vm.get_global("lastSorted"), Some(&JsValue::Number(99.0)));
-        assert_eq!(vm.get_global("fmLen"), Some(&JsValue::Number(4.0)));
-        assert_eq!(vm.get_global("fromVal"), Some(&JsValue::Number(15.0)));
-        assert_eq!(vm.get_global("dotVal"), Some(&JsValue::Number(14.0)));
-        assert_eq!(vm.get_global("loopTotal"), Some(&JsValue::Number(600.0)));
-        assert_eq!(
-            vm.get_global("injectedTxt"),
-            Some(&JsValue::Str("Live DOM".to_string()))
-        );
-        assert_eq!(
-            vm.get_global("decodedB64"),
-            Some(&JsValue::Str("Manta".to_string()))
-        );
-        assert_eq!(vm.get_global("clicked"), Some(&JsValue::Number(1.0)));
-        assert_eq!(vm.get_global("asyncRes"), Some(&JsValue::Number(50.0)));
-        assert_eq!(
-            vm.get_global("clsOut"),
-            Some(&JsValue::Str("[Manta] v3".to_string()))
-        );
-        assert_eq!(vm.get_global("ver"), Some(&JsValue::Number(3.0)));
-        assert_eq!(vm.get_global("missing"), Some(&JsValue::Number(10.0)));
-        assert_eq!(vm.get_global("first"), Some(&JsValue::Number(10.0)));
-        assert_eq!(vm.get_global("reOk"), Some(&JsValue::Bool(true)));
-        assert_eq!(vm.get_global("vecSum"), Some(&JsValue::Number(10.0)));
-        assert_eq!(
-            storage.get_idb_object("https://app.manta.dev", "users", "u1"),
-            Some("{\"email\":\"dev@manta.browser\"}".to_string())
-        );
-
-        // Verify fixed-latency infinite loop guard never hangs or crashes
-        vm.set_time_budget_us(2_000);
-        let res = vm.execute_script_full(
-            "while (true) {}",
-            "https://app.manta.dev",
-            &mut dom,
-            &mut clip,
-            &mut storage,
-            &mut downloads,
-        );
-        assert!(res.is_err());
-    }
 }

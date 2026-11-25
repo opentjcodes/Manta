@@ -113,12 +113,51 @@ pub unsafe extern "C" fn manta_abi_compile_kernel_script(origin_url: *const c_ch
     let Ok(engine) = MantaEngine::global().lock() else {
         return rust_to_cstr("");
     };
-    let script = PageRuntimeCompiler::compile_runtime_script_with_settings(
+    let script = PageRuntimeCompiler::compile_runtime_script_full(
         &orig,
         &engine.storage,
         &engine.controls.settings,
+        Some(&engine.extensions),
     );
     rust_to_cstr(&script)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_ext_install_dir(ext_dir_path: *const c_char) -> *mut c_char {
+    let dir = unsafe { cstr_to_rust(ext_dir_path) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("");
+    };
+    match engine.extensions.install_from_dir(&dir) {
+        Ok(id) => rust_to_cstr(&id),
+        Err(e) => rust_to_cstr(&format!("ERR:{}", e)),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_ext_set_enabled(ext_id: *const c_char, enabled: bool) -> bool {
+    let id = unsafe { cstr_to_rust(ext_id) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    engine.extensions.set_enabled(&id, enabled)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manta_abi_ext_uninstall(ext_id: *const c_char) -> bool {
+    let id = unsafe { cstr_to_rust(ext_id) };
+    let Ok(mut engine) = MantaEngine::global().lock() else {
+        return false;
+    };
+    engine.extensions.uninstall(&id)
+}
+
+#[no_mangle]
+pub extern "C" fn manta_abi_ext_list_json() -> *mut c_char {
+    let Ok(engine) = MantaEngine::global().lock() else {
+        return rust_to_cstr("[]");
+    };
+    rust_to_cstr(&engine.extensions.list_extensions_json())
 }
 
 #[no_mangle]
@@ -127,17 +166,23 @@ pub unsafe extern "C" fn manta_abi_navigate_url(
     url: *const c_char,
 ) -> *mut c_char {
     let raw_url = unsafe { cstr_to_rust(url) };
-    let (resolved_url, cookie_hdr, max_bytes) = {
+    let (resolved_url, cookie_hdr, max_bytes, ext_net_mod) = {
         let Ok(engine) = MantaEngine::global().lock() else {
             return rust_to_cstr("MANTA_ERR|Engine Lock Poisoned");
         };
         let resolved = engine.controls.settings.resolve_omnibox_input(&raw_url);
         let cookies = engine.storage.get_cookie_header_for_url(&resolved, true);
-        (resolved, cookies, engine.config.per_tab_ram_ceiling_bytes)
+        (
+            resolved,
+            cookies,
+            engine.config.per_tab_ram_ceiling_bytes,
+            engine.extensions.create_net_module(),
+        )
     };
 
     let mut standalone_modules = ModuleBus::new();
     standalone_modules.register(Box::new(SiteIsolationModule::new()));
+    standalone_modules.register(ext_net_mod);
 
     let bundle = match TabManager::fetch_page_bundle(
         &resolved_url,
@@ -161,6 +206,7 @@ pub unsafe extern "C" fn manta_abi_navigate_url(
         &mut engine_ref.vault,
         &mut engine_ref.storage,
         &mut engine_ref.downloads,
+        Some(&engine_ref.extensions),
     ) {
         Ok(frame) => {
             engine_ref
@@ -192,15 +238,18 @@ pub unsafe extern "C" fn manta_abi_stream_html_chunk(
             .ensure_tab_state(tab_id)
             .record_navigation(&url_str, "");
     }
-    match engine_ref.tabs.load_stream_chunk(
+    match engine_ref.tabs.load_stream_chunk_full(
         tab_id,
         &url_str,
         chunk_str.as_bytes(),
         is_eof,
+        &[],
+        &[],
         &mut engine_ref.modules,
         &mut engine_ref.vault,
         &mut engine_ref.storage,
         &mut engine_ref.downloads,
+        Some(&engine_ref.extensions),
     ) {
         Ok(frame) => {
             if is_eof {
